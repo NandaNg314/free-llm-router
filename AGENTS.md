@@ -21,8 +21,11 @@
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
   OpenAI 兼容流式/非流式网关 + **Responses API**、**13 家供应商**、
   **聚合路由**（跨渠道临期优先）、用量四窗口、面板 + 安全头。
-- **588 条单测通过**（`npm test`）；`npm run typecheck` 通过。
-- **最新一轮（2026-10-15）**：修复「限流不换号」（SSE `data:` 前缀致 6004 误判为
+- **605 条单测通过**（`npm test`）；`npm run typecheck` 通过。
+- **最新一轮（2026-10-18）**：新增 **VPS 生产形态**（`dist/server.mjs` + `node:sqlite`，
+  与 Workers 并存）；移植上游子密钥 / 裸名别名 / 计费倍率；修「配置页能改但不生效」4 项、
+  面板「查进度被藏掉」与「网格隐式行塌陷」两个功能不可达缺陷，见 §9.19。
+- **2026-10-15**：修复「限流不换号」（SSE `data:` 前缀致 6004 误判为
   `unknown` 而 break）+ 国内版↔国际版跨渠道容灾（含 4 个自引入的死循环/body 复用缺陷，
   见 §9.17）。
 
@@ -3077,7 +3080,92 @@ Workers CPU 超限是两类故障，必须分开判断。
 
 ---
 
+### 9.19 VPS 生产形态 + 上游功能同步 + 面板真实缺陷（2026-10-18）
+
+**测试基线：605 条单测通过；`tsc` 0 错误；VPS 线上实测。**
+
+#### 一、VPS 生产形态（新增，与 Workers 并存）
+
+| 项 | 值 |
+|---|---|
+| 入口 | `src/server/index.ts`（`npm run build:node` → `dist/server.mjs`） |
+| 存储 | `node:sqlite`（`src/server/storage.ts` 适配 `DurableObjectStorage` 接口） |
+| DO 模拟 | `src/server/namespace.ts`（进程内实例池 + `pruneIdle` 回收 + alarm 落盘恢复） |
+| 部署 | Docker 容器，**只 bind mount `dist/server.mjs` 与 `data/`** |
+
+⚠️ **面板资源已作为 Text 模块打进 `server.mjs`** ⇒ 更新只替换一个文件。
+⚠️ 升级前必须备份 `data/router.db`（含加密凭据）。
+
+#### 二、从上游 fork 移植（UI 未移植）
+
+| 项 | 关键点 |
+|---|---|
+| **子密钥** | `store/apikeys.ts`（纯函数）+ `gateway/authz.ts`（守卫）；DO 9 个方法；5 个 `/admin/apikeys*` 端点 |
+| **裸名别名** | `BARE_MODEL_ALIASES`；⚠️ **必须在 `splitModelName` 之前判定**，否则 `aggregate` 被当成未知供应商 |
+| **计费倍率** | buddy `credits` / lobsterai `costMultiplier`+`limitedFreeActive` / trae `display_contact_config`（**字符串化 JSON**，需 `JSON.parse`） |
+| **opencode** | 冷启动必须主动 `await refreshCapabilities()`；`isFree` 取兜底表与 models.dev 并集 |
+| **`/v1/models`** | 补 `priceFactor` / `providerName` / `realm`（含聚合条目） |
+
+⚠️ **VPS 专属改动（上游没有）**：`clientIpOf` 回退 `x-forwarded-for` **最后一跳**。
+取第一跳可被客户端伪造 ⇒ IP 白名单形同虚设。
+
+⚠️ **`priceFactor` 语义铁律**：出口统一 `priceFactorOrNull()` ——
+**有限数字或 `null`**。`JSON.stringify(Infinity)` 得到 `null`，字段还在但语义含混，
+客户端无法区分「未标注」与「字段坏了」；而 `null` 明确表示未标注（**不等于免费**），`0` 才是免费。
+
+#### 三、修复「配置页能改但不生效」（4 项，全部是静默失效）
+
+| 字段 | 缺陷 |
+|---|---|
+| `strategy` | **`expiry` 分支从未实现**；且 `cachedRoutingConfig` 只在读配置时赋值 ⇒ VPS 重启后恒用硬编码默认值 |
+| `maxRetries` | 网关两条路径都写死 `MAX_ROTATE = 3`，无消费方 |
+| `softCooldownSeconds` | `applyFailure` 写死 60s |
+| `autoTaskCron` / `autoRefreshCredential` | `scheduled()` 从不读它们，关掉照跑 |
+
+修法：`AccountPoolDO` 构造时 `blockConcurrencyWhile` 预加载配置；补 `expiry` 实现；
+网关从配置读换号预算；`scheduled()` 读两个开关（并与 `AUTO_*` 环境变量 AND）。
+
+#### 四、面板两个真实缺陷（都不是「样式不好看」，是**功能不可达**）
+
+**a. `.panel:has(> .out:empty) { display: none }` 把标题与按钮一起藏掉**
+
+用户原话「我们前端没有这个查进度」。实测：任务中心「每日任务进度」面板首次进入必然为空
+（`#task-status` 还没内容）⇒ 整块面板（含标题、**查进度按钮**、账号下拉）`display: none`、高度 `0`。
+而任务恰恰要跑完才来这里看结果 ⇒ **最该用的时刻它不在**。
+
+⇒ 改为 `.panel:not(:has(> .panel-head)):has(> .out:empty)`：只收掉「既无标题也无工具行」的空面板。
+
+**b. `section.view` 隐式网格行塌成 0 高**
+
+`display: grid` + `align-content: start` 时**隐式行**是 `auto` —— 在 Grid 里 `auto` 表示**可压缩到 0**。
+`.task-cards` 用 `repeat(auto-fit)` 一行撑出 3 列后，后续 `.panel` 落入隐式行被压成 0 高。
+
+⇒ 显式声明 `grid-auto-rows: max-content`。
+⚠️ 这是本项目**第三次**踩「新网格容器没考虑子项尺寸」的坑（前两次是 `main > *`、`.count`）。
+
+#### 五、任务进度的可用性改造
+
+- 支持「**全部账号**」下拉（`__all__` 哨兵；真实 uid 白名单是 `[A-Za-z0-9_-]`，不会撞）
+- 执行每日任务后**自动轮询**（2 秒后开始；仅在 `finished === false` 时续期）
+- 切换视图 / 换账号时 `stopTaskPolling()`（否则旧轮询会把结果写进新账号的框）
+- 失败原因**去重归类**（38 步全 401 刷屏的问题）
+- 显示「本次运行：MM-DD HH:MM → MM-DD HH:MM（N 分钟前结束）」
+
+⚠️ **「一键签到」是同步执行的，不写 TaskRunner 记录**（它不走 DO alarm）。
+界面已明确标注两栏区别 —— 此前用户把「签到成功」与「每日任务旧记录里的 401」当成同一件事，
+误判为「签到成功了但账号是坏的」。
+
+#### 六、部署记录
+
+- 产物 `dist/server.mjs`，经 `scp` 上传 + `docker restart`
+- 每次升级保留 `server.mjs.bak-<日期>` 与 `router.db.bak-<日期>`
+- 线上验证：`/v1/models` 90 个模型（60 个有真实倍率、30 个 `null` 未标注、`Infinity` 零泄漏）；
+  SSE 210 帧 + `[DONE]` 零错误帧；5 路并发流式零串帧；客户端断开 `clientGone=true` 不记失败
+
+---
+
 ## 十、参考文件
+
 
 | 用途 | 路径 |
 |---|---|
