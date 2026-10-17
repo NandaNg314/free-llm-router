@@ -1,0 +1,126 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  /*
+   * Worker 名 —— **必须与 Cloudflare 上的实际名字一致**。
+   *
+   * ## ⚠️ 改名的代价（2026-10-04 实测）
+   *
+   * 我在网页端把 Worker 从 `workbuddy-gateway` 改成了 `free-llm-router`，
+   * 但**忘了同步这一行**。后果是 `wrangler deploy` 试图**新建**一个叫
+   * `workbuddy-gateway` 的 Worker，而 DO 命名空间名是
+   * `<worker名>_<类名>` ⇒ 报：
+   *
+   * ```
+   * Durable Object namespace name 'workbuddy-gateway_AccountPoolDO'
+   * already in use. Please use a different name and try again. [code: 10065]
+   * ```
+   *
+   * ⚠️ **那个报错与「DO 真的重名」毫无关系** —— 它只是「worker 名对不上」的
+   * 副产物。排查时别往 DO 配置上找。
+   *
+   * ## 好消息：Cloudflare 改名**保留数据**
+   *
+   * 实测该 Worker 的 `created_on` 仍是 `2026-10-03T07:25`（改名前的创建时间），
+   * 两个 secret 也都在。故**改名本身不丢账号** —— 只要把这一行同步过来即可。
+   *
+   * ⚠️ 反过来**不要**靠改这一行来给 Worker 改名：那只会在 CF 上新建一个空
+   * Worker（新 DO 存储 ⇒ 账号全「消失」）。改名请在网页端做，然后同步这里。
+   */
+  "name": "free-llm-router",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+
+  // ⚠️ 不启用 nodejs_compat：本项目按「纯 Web 标准」实现，不依赖任何 node 内置。
+  // 这是刻意的纪律——一旦引入 node:fs / node:child_process 之类，在 Workers 上
+  // 要么不可用、要么只是 stub，问题会推迟到运行时才暴露。
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "ACCOUNT_POOL", "class_name": "AccountPoolDO" },
+      { "name": "TASK_RUNNER", "class_name": "TaskRunnerDO" }
+    ]
+  },
+
+  // ⚠️ Free 计划只支持 SQLite 后端的 DO，必须用 new_sqlite_classes。
+  // 用 new_classes（KV 后端）在 Free 计划上会部署失败。
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AccountPoolDO", "TaskRunnerDO"]
+    }
+  ],
+
+  // ⚠️ **只占 1 个 cron 配额**（账户 Free 上限 5 个，实测已被其他 Worker 占 4 个）。
+  // 用「每小时触发一次 + Worker 内按时点分发」而不是「每个时点一条 cron」：
+  //   - 省配额（1 条 vs 3 条）；
+  //   - 改时点不用重新部署（改常量即可）。
+  // 分发逻辑见 src/index.ts 的 scheduled()。
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+
+  "observability": {
+    "enabled": true
+  },
+
+  // ⚠️ **必须显式保留 workers.dev**：一旦配置里出现 `routes`，
+  // wrangler 会**默认关闭** workers.dev（本次实测踩到）——
+  // 若此时自定义域的 DNS 还没建好，服务就**完全不可达**了（404 / 解析失败）。
+  // 显式写 true 作为兜底入口。
+  "workers_dev": true,
+
+  /*
+   * ⚠️ **`routes` 默认注释掉了 —— 这是脱敏与可部署性的取舍**（2026-10-04 实测）。
+   *
+   * ## 为什么注释掉
+   *
+   * 本仓库是**公开**的，故真实域名与 zone 名被替换成占位符
+   *（`<你的域名>` / `<你的 zone>`）。但 `wrangler deploy` 会拿 `routes`
+   * 里的 pattern 去 Cloudflare **查 zone** —— 占位符查不到，于是报：
+   *
+   * ```
+   * Error Occurred: Unable to fetch bindings, routes, or services metadata
+   * from the dashboard. Please try again later.
+   * ```
+   *
+   * ⚠️ **那个报错极具误导性**：它说「稍后重试」，但重试一百次都一样 ——
+   * 真实原因是**配置里的域名是占位符**。我在这上面浪费了 5 轮部署。
+   *
+   * ## 怎么就对了
+   *
+   * 自定义域**只需在 Cloudflare 上绑一次**（网页端 Dashboard，
+   * 或用 `PUT /accounts/<id>/workers/domains`，见 `DEPLOY.md`）。
+   * 绑好之后，**每次 `wrangler deploy` 都不需要再带 `routes`** ——
+   * 部署脚本与域名绑定是两件事。
+   *
+   * 故这里默认**留空**：克隆本仓库的人能直接 `npm run deploy`（会拿到
+   * `*.workers.dev` 地址），想绑自有域名的按 `DEPLOY.md` 做一次即可。
+   *
+   * ## 想在这里管理 route
+   *
+   * 把下面这段取消注释、填**真实**域名与 zone 名即可
+   *（⚠️ 但那样就**不能**把这个文件提交到公开仓库了）：
+   *
+   * "routes": [
+   *   { "pattern": "你的域名/*", "zone_name": "你的 zone" }
+   * ],
+   *
+   * ⚠️ route 与 DNS 是两回事：创建 route **不会**自动建 DNS 记录，
+   * 故域名必须已有一条同 zone 的 DNS 记录，否则 route 不生效
+   *（表现为「域名解析不了」，与 Worker 本身无关）。
+   */
+
+  // 面板静态资源以**字符串**形式 import（见 src/panel/index.ts 的说明）。
+  // 用 Text 模块规则而不是 Workers Static Assets：本项目只有 3 个文件，
+  // 且必须挂在 /panel/* 下并统一加安全头 —— Text import 更直接。
+  "rules": [
+    { "type": "Text", "fallthrough": true, "globs": ["src/panel/assets/*.js.txt", "src/panel/assets/*.css.txt"] }
+  ],
+
+  "vars": {
+    // 上游域名（CN 域）。global 域留作后续扩展。
+    "UPSTREAM_CHAT_BASE": "https://copilot.tencent.com",
+    "UPSTREAM_BILLING_BASE": "https://www.codebuddy.cn",
+    "UPSTREAM_WEB_BASE": "https://www.workbuddy.cn"
+  }
+}

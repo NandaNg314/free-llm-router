@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>free-llm-router 管理面板</title>
+<link rel="stylesheet" href="/panel/style.css">
+</head>
+<body>
+<header class="app-header">
+  <div class="header-left">
+    <div class="brand">
+      <svg class="brand-logo" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="2" />
+        <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14" />
+      </svg>
+      <h1>free-llm-router</h1>
+      <span class="version-badge">v0.1.0</span>
+      <span id="auth-status" class="pill" hidden></span>
+    </div>
+  </div>
+
+  <div class="header-center">
+    <nav id="nav" class="nav-segmented" role="tablist">
+      <button class="nav-item active" data-view="providers">供应商与账号</button>
+      <button class="nav-item" data-view="tasks">任务中心</button>
+      <button class="nav-item" data-view="usage">用量</button>
+      <button class="nav-item" data-view="apikeys">API Key</button>
+      <button class="nav-item" data-view="models">模型</button>
+      <button class="nav-item" data-view="config">配置</button>
+      <button class="nav-item" data-view="logs">日志</button>
+    </nav>
+  </div>
+
+  <div class="header-right auth">
+    <button id="toggle-theme" class="ghost icon-btn" title="切换主题（自动/浅色/深色）" aria-label="切换主题">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+           stroke-width="1.75" stroke-linecap="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none" />
+      </svg>
+    </button>
+    <button id="logout" class="ghost icon-btn" title="退出登录" aria-label="退出登录">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+           stroke-width="1.75" stroke-linecap="round" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+        <path d="M12 3v9" />
+        <path d="M6.5 6.8a8 8 0 1 0 11 0" />
+      </svg>
+    </button>
+  </div>
+</header>
+
+<main class="app-main">
+  <div id="waf-banner" class="banner" hidden>
+    <strong>⚠️ 出口 IP 疑似被上游 WAF 拦截</strong>
+    <span id="waf-detail"></span>
+    <button id="clear-waf" class="ghost">立即解除</button>
+  </div>
+
+  <!-- ───────── 任务中心 ───────── -->
+  <section class="view" id="view-tasks" hidden>
+    <div class="page-head">
+      <h2>任务中心</h2>
+    </div>
+    <p class="hint">点一下就跑完，不用选。所有任务都是幂等的，重复点安全。</p>
+
+    <div class="task-cards">
+      <div class="task-card">
+        <h3>全部供应商一键签到</h3>
+        <p class="hint">对所有账号逐个签到（串行，避免触发风控）。
+        不支持的供应商会说明原因，不会静默跳过。</p>
+        <button id="run-checkin-all">一键签到</button>
+      </div>
+
+      <div class="task-card">
+        <h3>Buddy 每日任务</h3>
+        <p class="hint">对国内版（buddy）全部账号执行：签到 → 全部成长任务 →
+        真实对话任务（专家召唤 / 技能加载 / 夜猫子，这些才给积分）→ 自动领奖。</p>
+        <p class="hint">真实对话会消耗极少量配额（每次都是最短对话，且已达标的任务自动跳过，
+        不会重复消耗）。重复点按钮安全。</p>
+        <button id="run-daily-all">执行每日任务</button>
+      </div>
+    </div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h3>签到结果</h3>
+        <span class="hint">同步执行 · 立即出结果</span>
+      </div>
+      <div id="task-result" class="out"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h3>每日任务进度</h3>
+        <div class="row">
+          <label>账号 <select id="task-uid"></select></label>
+          <button id="refresh-status" class="ghost">查进度</button>
+        </div>
+      </div>
+      <pre id="task-status" class="out"></pre>
+    </section>
+  </section>
+
+  <!-- ───────── 用量 ───────── -->
+  <section class="view" id="view-usage" hidden>
+    <!-- 工具行：标题 + 时间窗 + 操作 -->
+    <div class="page-head">
+      <h2>用量</h2>
+      <div class="page-tools">
+        <div id="usage-range" class="seg" role="tablist" aria-label="时间范围"></div>
+        <button class="ghost" id="refresh-usage">刷新</button>
+      </div>
+    </div>
+
+    <!-- 6 个核心 KPI 指标卡片网格单行对齐 -->
+    <div id="usage-summary" class="kpi-grid"></div>
+
+    <!-- 按天趋势 -->
+    <section class="panel" id="usage-trend-panel">
+      <div class="panel-head">
+        <h3 id="usage-trend-title">按天趋势</h3>
+        <span class="hint" id="usage-trend-note"></span>
+      </div>
+      <div id="usage-trend" class="trend"></div>
+    </section>
+
+    <!-- 按小时 -->
+    <section class="panel" id="usage-hours-panel">
+      <div class="panel-head">
+        <h3 id="usage-hours-title">按小时</h3>
+        <span class="hint" id="usage-hours-note"></span>
+      </div>
+      <div id="usage-hours" class="bars"></div>
+    </section>
+
+    <div class="bento-grid">
+      <section class="panel">
+        <div class="panel-head"><h3>按模型用量排行</h3></div>
+        <div id="usage-models"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h3>按账号用量排行</h3></div>
+        <div id="usage-accounts"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ───────── API Key（子密钥） ───────── -->
+  <section class="view" id="view-apikeys" hidden>
+    <div class="page-head">
+      <h2>API Key</h2>
+      <div class="page-tools">
+        <button class="ghost" id="refresh-apikeys">刷新</button>
+        <button class="primary-btn" id="new-apikey">新建密钥</button>
+      </div>
+    </div>
+    <p class="hint">这些是发给外部应用的受限子密钥：只能调 /v1/*，可按请求数 / Token / 模型 / 来源 IP / 有效期逐把限制。
+    与登录面板用的主密钥刻意分开 —— 这样把密钥给第三方时，不必连管理权限一起交出去。</p>
+    <div id="apikeys" class="out"></div>
+  </section>
+
+  <!-- ───────── 模型 ───────── -->
+  <section class="view" id="view-models" hidden>
+    <div class="page-head">
+      <h2>模型目录</h2>
+      <div class="page-tools">
+        <button class="ghost" id="load-models">刷新目录</button>
+        <button id="probe-models-free" class="primary-btn">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+          </svg>
+          一键检测免费模型
+        </button>
+      </div>
+    </div>
+    <div class="model-filter-bar">
+      <div class="seg" role="tablist">
+        <button class="seg-btn active" id="filter-models-all">全部模型</button>
+        <button class="seg-btn" id="filter-models-free">仅看免费模型</button>
+      </div>
+      <button class="ghost small" id="clear-model-cache">清除检测缓存</button>
+      <span id="probe-status-text" class="hint"></span>
+    </div>
+    <section class="panel"><div id="models" class="out"></div></section>
+  </section>
+
+  <!-- ───────── 供应商 ───────── -->
+  <section class="view" id="view-providers" hidden>
+    <div class="page-head">
+      <h2>供应商与账号</h2>
+    </div>
+    <div id="pool-counts" class="counts"></div>
+    <p class="hint">点击任意供应商卡片管理其账号凭据与可用模型。</p>
+    <div id="providers" class="prov-grid"></div>
+  </section>
+
+  <!-- ───────── 配置 ───────── -->
+  <section class="view" id="view-config" hidden>
+    <div class="page-head"><h2>配置与接入指南</h2></div>
+    <section class="panel"><div id="config"></div></section>
+  </section>
+
+  <!-- ───────── 日志 ───────── -->
+  <section class="view" id="view-logs" hidden>
+    <div class="page-head">
+      <h2>请求与任务日志</h2>
+      <div class="page-tools">
+        <div id="log-filter-seg" class="seg" role="tablist" aria-label="日志类型">
+          <button class="seg-btn active" data-filter="all">全部</button>
+          <button class="seg-btn" data-filter="api">API 请求</button>
+          <button class="seg-btn" data-filter="task">任务操作</button>
+          <button class="seg-btn" data-filter="error">异常错误</button>
+        </div>
+        <button class="ghost" id="refresh-logs">刷新</button>
+        <button class="ghost" id="clear-logs">清空</button>
+      </div>
+    </div>
+    <section class="panel"><div id="logs" class="out"></div></section>
+  </section>
+</main>
+
+<!-- ───────── 供应商详情弹窗 ───────── -->
+<div id="info-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="info-title" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="info-title"></h3>
+      <button id="info-close" class="ghost icon-btn" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M5 5l14 14M19 5L5 19" />
+        </svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div id="info-body"></div>
+    </div>
+  </div>
+</div>
+
+<div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="modal-title"></h3>
+      <button id="modal-close" class="ghost icon-btn" title="关闭" aria-label="关闭">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M5 5l14 14M19 5L5 19" />
+        </svg>
+      </button>
+    </div>
+    <div id="modal-tabs" class="modal-tabs">
+      <button class="mtab active" data-mtab="accounts">账号</button>
+      <button class="mtab" data-mtab="models">模型</button>
+      <button class="mtab" data-mtab="add">添加账号</button>
+    </div>
+    <div class="modal-body">
+      <div id="modal-accounts" class="mtab-panel"></div>
+      <div id="modal-models" class="mtab-panel" hidden></div>
+      <div id="modal-add" class="mtab-panel" hidden>
+        <div id="modal-add-body"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="/panel/app.js"></script>
+</body>
+</html>
