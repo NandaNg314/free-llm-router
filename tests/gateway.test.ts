@@ -840,6 +840,13 @@ test('⚠️ 6004 必须判为**模型级**限流，不是账号级', () => {
   assert.equal(got.code, 6004)
 })
 
+test('⚠️ 14003 必须判为模型级限流（WorkBuddy 国际版实测）', () => {
+  const body = '{"code":14003,"msg":"too many requests","requestId":"1791a042-7c39-4636-9dfa-2b9a3a8a153b","displayMsg":{"en":"Model busy. Please switch models or retry later"}}'
+  const got = refineModelScoped('rate_limited', body)
+  assert.equal(got.dimension, 'model', '14003 必须罚模型维度')
+  assert.equal(got.code, 14003)
+})
+
 test('⚠️ 14017 等其它限流码仍是账号级（不能一律都罚模型）', () => {
   // ⚠️ 配对的**反向**用例：若把「凡 rate_limited 都判 model」写进去，
   // 账号级限流就永远不会冷却账号 —— 那会让坏号被反复使用。

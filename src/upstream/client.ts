@@ -90,6 +90,7 @@ export class UpstreamError extends Error {
 const CODE_KIND: Record<number, ErrorKind> = {
   6004: 'rate_limited',
   11102: 'model_unavailable',
+  14003: 'rate_limited',
   14018: 'credit_exhausted',
   14017: 'rate_limited',
   11140: 'request_illegal',

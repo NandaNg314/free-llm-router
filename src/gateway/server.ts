@@ -258,7 +258,7 @@ export function clientStatusFor(upstreamStatus: number, kind: ErrorKind | string
 }
 
 /**
- * 从业务码里再细分限流维度：6004 是**模型级**，14017 是**账号级**。
+ * 从业务码里再细分限流维度：6004 与 14003 是**模型级**，14017 是**账号级**。
  *
  * ## ⚠️ 为什么必须细分（实测缺陷）
  *
@@ -266,10 +266,13 @@ export function clientStatusFor(upstreamStatus: number, kind: ErrorKind | string
  * > usage exceeds frequency limit, but don't worry, your usage will reset at
  * > 2026-10-05 14:47:23 UTC+8, **alternatively, you can switch to the other** …
  *
- * 「你可以换用**其它模型**」—— 这明确是**模型级**限流。若把它当成账号级
- * 冷却，后果是：**单个账号的供应商**（如只有 1 个 global 账号的 workbuddy）
- * 会在冷却期内**完全不可用**，而真实情况是「换个模型立刻就能用」。
- * 用户看到的现象正是「一会能用一会不能用」。
+ * 上游 14003（WorkBuddy 国际版实测）的原话是：
+ * > {"code":14003,"msg":"too many requests",..."displayMsg":{"en":"Model busy. Please switch models or retry later"}}
+ *
+ * 「你可以换用**其它模型**」/「Model busy. Please switch models」—— 这明确是**模型级**限流。
+ * 若把它们当成账号级冷却，后果是：**单个账号的供应商**（或池内所有账号）会在冷却期内
+ * **完全不可用**，连带连累其他所有模型，且连续失败会触发 30 分钟账号熔断。
+ * 真实情况是「换个模型立刻就能用」。
  */
 export function refineModelScoped(
   kind: ErrorKind,
@@ -278,8 +281,15 @@ export function refineModelScoped(
   const code = parseBusinessCode(bodyText)
   const resetAt = parseResetAt(bodyText)
   if (kind !== 'rate_limited') return { dimension: 'soft', code, resetAt }
-  // 6004 = 模型级限流（切模型即可用，不该罚整个账号）
-  if (code === 6004) return { dimension: 'model', code, resetAt }
+  // 6004 与 14003 = 模型级限流（切模型即可用，不该罚整个账号）
+  // 也可以通过文案包含 "model busy"、"switch models" 或 "switch to the other" 兜底
+  if (
+    code === 6004 ||
+    code === 14003 ||
+    /model busy|switch models|switch to the other/i.test(bodyText)
+  ) {
+    return { dimension: 'model', code, resetAt }
+  }
   return { dimension: 'soft', code, resetAt }
 }
 
