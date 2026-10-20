@@ -206,6 +206,7 @@ export function intlDeviceHeaders(input: {
  * 四段 FNV-1a 用不同盐跑，避免「不同种子撞在同一段前缀」。
  */
 export function deriveUuidLike(seed: string, salt = ''): string {
+  /** FNV-1a 32 位 → 8 位 hex（分段用不同后缀，避免各段高度相关）。 */
   const chunk = (suffix: string): string => {
     let h = 0x811c9dc5
     const text = `${salt}${seed}#${suffix}`
@@ -213,18 +214,22 @@ export function deriveUuidLike(seed: string, salt = ''): string {
       h ^= text.charCodeAt(i)
       h = Math.imul(h, 0x01000193) >>> 0
     }
-    // 再搅一轮，避免相邻种子的高位几乎不变
-    h ^= h >>> 15
+    // ⚠️ 搅动必须写成 `h = (h ^ (h >>> 15)) >>> 0`。
+    // 这里曾误写成 `h ^= h >>> 15` —— 复合赋值把「右移结果」**赋回** h，
+    // 等价于 `h = h >>> 15`，高位全丢、尾部变短。
+    h = (h ^ (h >>> 15)) >>> 0
     h = Math.imul(h, 0x2545f491) >>> 0
-    h ^= h >>> 13
+    h = (h ^ (h >>> 13)) >>> 0
     return h.toString(16).padStart(8, '0')
   }
-  const a = chunk('a')
-  const b = chunk('b')
-  const c = chunk('c')
-  const d = chunk('d')
-  // 版本位 4 / 变体位 8（与真实客户端抓包一致）
-  return `${a}-${b.slice(0, 4)}-4${c.slice(0, 3)}-8${d.slice(0, 3)}-${(b + c + d).slice(0, 12)}`
+  // ⚠️ 每个字段必须**精确按段宽**取字符（8-4-4-4-12）。
+  // 曾写过「把某个数组元素改成 `'4'`」的版本 —— 那会丢掉该字节的高半字节，
+  // 整串少一位，产出一个**不报错**的「假 UUID」。这里用纯字符串切片，长度天然守恒。
+  const hex = `${chunk('a')}${chunk('b')}${chunk('c')}${chunk('d')}`.slice(0, 32)
+  const versioned = `${hex.slice(0, 12)}4${hex.slice(13)}`
+  const variant = (Number.parseInt(versioned.slice(16, 18), 16) & 0x3f) | 0x80
+  const v = `${versioned.slice(0, 16)}${variant.toString(16).padStart(2, '0')}${versioned.slice(18)}`
+  return [v.slice(0, 8), v.slice(8, 12), v.slice(12, 16), v.slice(16, 20), v.slice(20)].join('-')
 }
 
 /** 桌面端 UA（`desktop.go:43`）。 */
