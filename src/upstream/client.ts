@@ -86,6 +86,18 @@ export class UpstreamError extends Error {
   }
 }
 
+/**
+ * 渠道校验失败（`"11-128"`）的归一化业务码。
+ *
+ * ⚠️ 上游原码是**带连字符的字符串**，不是数字。JS 里没有「非数字但可比较」的码，
+ * 故归一成一个**不可能与真实业务码冲突**的负值，让 `CODE_KIND` 能正常查表。
+ *
+ * ⚠️ 取值必须是**字面量负数**：写成 `-11-128` 会被 JS 求值成算术表达式 `-11 - 128`（= `-139`），
+ * 而 `-139` 是「看起来像业务码」的普通负值，日后极易与真码撞车且难以肉眼发现。
+ * 现用 `-108128`（把连字符两侧原样拼接）——上游业务码全为正整数，负值永不冲突。
+ */
+export const CHANNEL_BLOCKED_CODE = -108128
+
 /** 已知业务码 → 错误类别。数值来自 Go 侧实测。 */
 const CODE_KIND: Record<number, ErrorKind> = {
   6004: 'rate_limited',
@@ -113,7 +125,7 @@ const CODE_KIND: Record<number, ErrorKind> = {
   // 两者都要「软冷却 + 不换号」，但 `waf_blocked` 还会触发**IP 级判定**
   //（`noteWaf`）—— 而 11128 与出口 IP **无关**，用它触发 IP 判定会**误报全局封锁**。
   // 这正是「有的软件能用、有的不能」的原因：凑够 2 个账号就整体停服 60 秒。
-  11128: 'channel_blocked',
+  [CHANNEL_BLOCKED_CODE]: 'channel_blocked',
   // 幂等命中：签到已领（视为成功）
   10001: 'already_done',
   1001: 'already_done',
@@ -146,6 +158,20 @@ export function parseEnvelope(text: string): Envelope | undefined {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
     const obj = value as Record<string, unknown>
     const raw = obj.code
+    // ⚠️ 上游有两种码形态：数字（`6004`）与**带连字符的字符串**（`"11-128"`）。
+    // 后者是渠道校验失败的真实形态，`Number("11-128")` = NaN，
+    // 原实现直接 `return undefined` ⇒ 整条响应被当成「无信封的裸 400/429」，
+    // 分类与错误文案全部丢失（实测：网关只回一个含糊的 400）。
+    // 这里把 `NN-NNN` 归一成一个稳定的负值，让 `classify` 能认出来。
+    // ⚠️ 不能放宽成「任何字符串码都归一」：只有 `数字-数字` 形态才是 11-128 这一类；
+    // 其他字符串（如 `"6004"`）仍交给下面按数字解析，否则会把可识别的码误判成渠道拦截。
+    if (typeof raw === 'string' && /^\d+-\d+$/.test(raw.trim())) {
+      return {
+        code: CHANNEL_BLOCKED_CODE,
+        msg: typeof obj.msg === 'string' && obj.msg !== '' ? obj.msg : raw.trim(),
+        data: obj.data,
+      }
+    }
     const code = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : Number.NaN
     if (!Number.isFinite(code)) return undefined
     return {
@@ -201,6 +227,11 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
     if (mapped !== undefined) {
       return { kind: mapped, code: envelope.code, msg: envelope.msg }
     }
+    // ── 3b. 码已归一但仍落在表外的兜底 ──
+    //
+    // ⚠️ 字符串形态的 `{"code":"11-128"}` 已在 `parseEnvelope` 里归一成 `CHANNEL_BLOCKED_CODE`，
+    // 走上面的 `CODE_KIND` 查表，**不需要**再嗅原始文本。我曾在此处按 `"11-128"` 正则兜底，
+    // 结果同一个码有两条判据（一条查表、一条正则），改一处漏一处；现已删除，保持单一来源。
     if (envelope.code === 0) {
       return { kind: 'unknown', code: 0, msg: envelope.msg }
     }

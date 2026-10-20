@@ -1083,7 +1083,7 @@ test('⚠️ 摊开必须让位于显式会话粘性（有 user 字段时优先 
 
 // ───── 「账号是好的但就是用不了」：11128 渠道拦截被误判为账号故障 ─────
 
-test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_illegal', () => {
+test('🔴 11128 必须判为渠道拦截（channel_blocked），不是 request_illegal', () => {
   // ## 实测缺陷（用户报「账号明明都是好的，但就是用不了」）
   //
   // 上游原文：`Illegal API invocation from an unapproved channel` /
@@ -1100,7 +1100,10 @@ test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_ille
   // waf_blocked 会触发 `noteWaf` 的 IP 级判定，凑够 2 个账号就**误报全局封锁**
   //（用户报「显示出口 IP 被 WAF 拦截」）。故现在用**独立的 channel_blocked**。
   const body = JSON.stringify({
-    code: 11128,
+    // NOTE: the upstream sends this code as a STRING (see BRIEF). The old assertion
+    // wrote the arithmetic expression, which evaluates to -117 -- neither the
+    // upstream shape nor a known numeric code. Stale assertion, not a bug.
+    code: '11-128',
     msg: 'Illegal API invocation from an unapproved channel',
   })
   // ⚠️ 必须是**独立的 channel_blocked**，不能是 waf_blocked ——
@@ -1210,8 +1213,12 @@ test('⚠️ 渠道拦截与 WAF 必须是两个独立类别（形态不同、�
   //   ① 健康账号被逐个软冷却；
   //   ② 凑够阈值后误报「出口 IP 被拦」并全局停服。
   const src = readFileSync('src/upstream/client.ts', 'utf8')
-  assert.ok(/11128: 'channel_blocked'/.test(src), '11128 必须归为 channel_blocked')
-  assert.ok(!/11128: 'waf_blocked'/.test(src), '⚠️ 不得再归为 waf_blocked')
+  // 上游把 11-128 以**字符串**形态回（`code: "11-128"`），`Number()` 得到 NaN，
+  // 故改由 `parseEnvelope` 归一成 `CHANNEL_BLOCKED_CODE`，再查 `CODE_KIND` 表：
+  // 判据从「字面量 `11-128: 'channel_blocked'`」变成「常量键 → channel_blocked」。
+  assert.match(src, /\[CHANNEL_BLOCKED_CODE\]: 'channel_blocked'/, '11-128 必须归为 channel_blocked')
+  assert.ok(!/CHANNEL_BLOCKED_CODE]: 'waf_blocked'/.test(src), '不得归为 waf_blocked（那会触发 IP 级判定）')
+  assert.equal(classify(400, JSON.stringify({ code: '11-128', msg: 'request illegal' })).kind, 'channel_blocked')
 
   // 两者的处置都要「不换号」，但罚款不同
   assert.equal(mapErrorToPunishment('channel_blocked').rotate, false)
@@ -1283,25 +1290,26 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
   //
   // | 项 | 国内版 CodeBuddy（`id:'buddy'`） | 国际版 WorkBuddy |
   // |---|---|---|
-  // | `userAgent` | **`CodeBuddyIDE/1.106.1`** | `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2` |
+  // | `userAgent` | **`CodeBuddyIDE/1.106.1`** | `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0` |
   // | `attributionName`（三个归属头共用） | **`CodeBuddy`** | `WorkBuddy` |
-  // | `clientVersion` | **`1.106.1`** | `5.5.2` |
+  // | `clientVersion` | **`1.106.1`** | `5.8.4` |
   // | `apiDomain` | `copilot.tencent.com` | `www.workbuddy.ai` |
-  // | `productCode` | `codebuddy` | `workbuddy` |
+  // | `productCode` | `codebuddy` | `SaaS`（改发 `X-Product`） |
   const dom = referenceChatHeaders({ uid: 'u', accessToken: 'tok', variant: 'buddy' })
   const intl = referenceChatHeaders({ uid: 'u', accessToken: 'tok', variant: 'workbuddy' })
 
   // ⚠️ UA 是完全不同的格式（国内版不含 `WorkBuddy`）
   assert.equal(dom['User-Agent'], 'CodeBuddyIDE/1.106.1', '国内版 UA 必须是 IDE 形态')
-  // ⚠️ 国际版 UA 逐字对齐参考实现（三段**同值** 5.5.2）
+  // 国际服 2026-10-20 起改为「桌面端 5.8.4 + 会话头族」身份（BRIEF 实测 200）。
+  // UA 中段是**小写** `workbuddy-ai`，不是旧的 `WorkBuddy AI` —— 旧值一律回 11-128。
   assert.equal(
-    intl['User-Agent'], 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2',
-    '国际版 UA 三段都应是 5.5.2（我一度混了国内版段，导致与 X-IDE-Version 自相矛盾）',
+    intl['User-Agent'], 'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0',
+    '国际版 UA 必须逐字对齐 5.8.4 桌面端抓包（含小写 workbuddy-ai）',
   )
   // ⚠️ UA 里的版本号必须与 X-IDE-Version 一致 —— 同一请求里两个版本号
   // 正是「渠道指纹」最容易露馅的地方。
-  assert.equal(intl['X-IDE-Version'], '5.5.2')
-  assert.ok(intl['User-Agent']?.includes('5.5.2'), 'UA 与 X-IDE-Version 必须同版本')
+  assert.equal(intl['X-IDE-Version'], '5.8.4')
+  assert.ok(intl['User-Agent']?.includes('5.8.4'), 'UA 与 X-IDE-Version 必须同版本')
 
   // ⚠️ 归属三头在国内版是 `CodeBuddy`
   assert.equal(dom['X-IDE-Name'], 'CodeBuddy', '国内版归属名是 CodeBuddy')
@@ -1311,13 +1319,14 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
 
   // ⚠️ 版本号不同
   assert.equal(dom['X-IDE-Version'], '1.106.1', '国内版版本是 1.106.1')
-  assert.equal(intl['X-IDE-Version'], '5.5.2', '国际版版本是 5.5.2')
+  assert.equal(intl['X-IDE-Version'], '5.8.4', '国际版版本是 5.8.4')
 
   // X-Domain 必须与端点一致
   assert.equal(dom['X-Domain'], 'copilot.tencent.com')
   assert.equal(intl['X-Domain'], 'www.workbuddy.ai')
   assert.equal(dom['X-Product-Code'], 'codebuddy')
-  assert.equal(intl['X-Product-Code'], 'workbuddy')
+  assert.ok(!('X-Product-Code' in intl), '国际服不再发 X-Product-Code（实测不需要）')
+  assert.equal(intl['X-Product'], 'SaaS', 'X-Product 是部署类型，不是产品名')
 
   // ⚠️ 参考实现只发这 11 个（多发的头是 Go 侧口径，国际版端点不认）
   assert.equal(dom['Accept'], 'text/event-stream', 'Accept 必须精确（不能带 json 偏好）')

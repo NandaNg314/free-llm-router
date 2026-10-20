@@ -27,6 +27,7 @@
 import { resolveUpstream, type Env } from '../env.js'
 import { classify, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
+import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
 import { prepareChatBody, sanitizeChatBody } from './payload.js'
 import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
@@ -260,6 +261,11 @@ export function clientStatusFor(upstreamStatus: number, kind: ErrorKind | string
 /**
  * 从业务码里再细分限流维度：6004 与 14003 是**模型级**，14017 是**账号级**。
  *
+ * ⚠️ **渠道校验失败（11-128）永远不是限流**：即使它的 `displayMsg` 里
+ * 恰好含 `switch models`（实测真有这种文案），也必须回落账号维度 ——
+ * 否则一次渠道校验失败会被记成「这个模型这个号坏了」，凭空制造模型级冷却。
+ * 判据走 `kind`（由 `classify` 判出的 `channel_blocked`），**不靠字符串**。
+ *
  * ## ⚠️ 为什么必须细分（实测缺陷）
  *
  * 上游 6004 的原话是：
@@ -281,6 +287,12 @@ export function refineModelScoped(
   const code = parseBusinessCode(bodyText)
   const resetAt = parseResetAt(bodyText)
   if (kind !== 'rate_limited') return { dimension: 'soft', code, resetAt }
+  /**
+   * ⚠️ 字符串形态的业务码（`{"code":"11-128"}`）解析不出数字，
+   * 此时**不得**使用文案正则（`switch models`）判模型维度 —— 见上方的说明。
+   */
+  const isChannelBlockedText = /"code"\s*:\s*"11-128"/.test(bodyText)
+  if (isChannelBlockedText) return { dimension: 'soft', code, resetAt }
   // 6004 与 14003 = 模型级限流（切模型即可用，不该罚整个账号）
   // 也可以通过文案包含 "model busy"、"switch models" 或 "switch to the other" 兜底
   if (
@@ -646,6 +658,15 @@ export async function handleChatCompletions(
     }
   }
 
+  // ⚠️ **会话/轮级 id 在重试循环外算一次**（实测语义）。
+  //
+  // 官方客户端：`X-Conversation-ID` 在同一对话里恒定，`X-Conversation-Request-ID`
+  // 在一轮用户发送里恒定（重试复用），只有消息级 id 每请求新生成。
+  // 放在循环内会让每次重试都变成「另一个会话 / 另一轮」，正是上游画像里最显眼的
+  // 非人类特征。
+  const turnRequestId = newTurnRequestId()
+  let conversationId = sessionKey === '' ? crypto.randomUUID() : ''
+
   for (let attempt = 0; attempt <= rotateBudget; attempt += 1) {
     const now = Date.now()
     // ⚠️ 限定默认供应商：池里可能同时有 cline 等家的账号，
@@ -676,6 +697,12 @@ export async function handleChatCompletions(
     tried.push(candidate.uid)
     console.log(`[pick:buddy] 选中账号 uid=${candidate.uid} nickname=${candidate.credential.nickname || ''} tried=${tried.length}`)
 
+    // ⚠️ `X-Conversation-ID` 按「账号 + 会话」派生：换号**必须**换 id
+    //（同一段会话 id 发给两个账号就是跨账号关联键）。
+    if (conversationId === '') {
+      conversationId = await deriveIntlConversationId(candidate.uid, sessionKey)
+    }
+
     // ② 构造出站请求
     const machineId = await deriveDeviceId(candidate.uid, 'machine')
     const sessionId = await deriveDeviceId(candidate.uid, 'session')
@@ -691,6 +718,11 @@ export async function handleChatCompletions(
           uid: candidate.uid,
           accessToken: candidate.credential.accessToken,
           variant: DEFAULT_PROVIDER === 'workbuddy' ? 'workbuddy' : 'buddy',
+          // ⚠️ 会话/轮级 id 必须传进来：国际服强校验会话头族（缺了就 11-128），
+          // 且**同一会话必须复用同一个 id**（每请求现生成等于伪造上千个一次性会话）。
+          // 两者都在重试循环**第 0 轮**算一次（见函数开头的说明）。
+          conversationId,
+          turnRequestId,
         }),
         body: prepared,
         signal: request.signal,
@@ -756,6 +788,12 @@ export async function handleChatCompletions(
       // 账号失败，立即解绑该会话粘性，防止下次请求死锁在坏账号上
       clearSessionBinding(pool, sessionKey, ctx)
 
+      // ⚠️ **渠道校验失败必须立刻停止轮换**（实测：5 个国际版账号全回 11-128）。
+      //
+      // `mapErrorToPunishment('channel_blocked').rotate` 已经是 false，
+      // 但显式 break 能说清原因：11-128 判的是**我方请求指纹**，
+      // 与账号无关 ⇒ 换号只会把同一份指纹再打 4 次，既浪费时间又刷风控。
+      if (kind === 'channel_blocked') break
       if (!mapped.rotate) break // 不该换号（参数错/WAF/网络已单独处理）
       continue // 换号重试
     }
@@ -796,6 +834,16 @@ export async function handleChatCompletions(
         kind,
       }
 
+      // ⚠️ 渠道校验失败必须立刻停止轮换，**不能**落到下面的 `mapped.rotate` 再换号。
+      //
+      // 11-128 判的是**我方请求指纹**（头部身份 + 会话头族），与账号无关：
+      // 实测 5 个国际版账号用同一套头发出去，全部回 11-128。
+      // 换号只是把同一份指纹再打 N 次 —— 既拖长客户端等待（每次都等首帧超时），
+      // 又白白给上游刷失败次数、抬高风控权重。
+      //
+      // 与 HTTP 非 2xx 分支同口径：那一路已经显式 break，两条路径必须一致，
+      // 否则「上游用 400 报」和「上游用 SSE 帧报」会表现不同（同一个 bug 只修一半）。
+      if (kind === 'channel_blocked') break
       if (mapped.rotate) continue // 换号重试！
       break
     }
@@ -1359,6 +1407,12 @@ async function handleProviderChat(input: {
   const tried = input.tried
   let lastError: { status: number; message: string } | undefined
 
+  // ⚠️ 会话 / 轮级 id 在重试循环**外**算一次（实测语义）：
+  // `X-Conversation-Request-ID` 在一轮用户发送里恒定（重试复用），
+  // 放在循环内会让每次重试都变成「另一轮」。
+  const providerTurnRequestId = newTurnRequestId()
+  let providerConversationId = sessionKey === '' ? crypto.randomUUID() : ''
+
   for (let attempt = 0; attempt <= rotateBudget; attempt += 1) {
     const now = Date.now()
     // ⚠️ 供应商过滤交给 `pick()` 做（`provider` 字段），
@@ -1372,6 +1426,10 @@ async function handleProviderChat(input: {
     if (picked === undefined) break
     tried.push(picked.uid)
     console.log(`[pick:${providerId}] 选中账号 uid=${picked.uid} realm=${activeRealm} tried=${tried.length}`)
+    // ⚠️ 换号必须换会话 id（同一段会话发给两个账号就是跨账号关联键）
+    if (providerConversationId === '') {
+      providerConversationId = await deriveIntlConversationId(picked.uid, sessionKey)
+    }
 
     const credential = (await pool.getCredential(picked.uid)) as ProviderCredential | undefined
     if (credential === undefined) {
@@ -1392,7 +1450,10 @@ async function handleProviderChat(input: {
     let refreshFailure = ''
     let upstream: Response
     try {
-      upstream = await provider.chat(credential, { model, body, signal: request.signal })
+      upstream = await provider.chat(credential, {
+        model, body, signal: request.signal,
+        conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
+      })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
 
@@ -1410,7 +1471,10 @@ async function handleProviderChat(input: {
           const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
           await pool.putCredential(picked.uid, fresh, Date.now())
           console.warn(`[refresh] ${providerId} 续期成功（catch 分支），已回写凭据`)
-          const retry = await provider.chat(fresh, { model, body, signal: request.signal })
+          const retry = await provider.chat(fresh, {
+            model, body, signal: request.signal,
+            conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
+          })
           if (retry.ok && retry.body !== null) {
             const startedAt2 = Date.now()
             return {
@@ -1511,7 +1575,10 @@ async function handleProviderChat(input: {
           await pool.putCredential(picked.uid, fresh, Date.now())
           // ⚠️ 重放请求（用新凭据）。这里直接用 continue 会重新选号，
           // 但我们要的是**同一个号**换新令牌重试 —— 故显式再发一次。
-          const retry = await provider.chat(fresh, { model, body, signal: request.signal })
+          const retry = await provider.chat(fresh, {
+            model, body, signal: request.signal,
+            conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
+          })
           if (retry.ok && retry.body !== null) {
             const startedAt2 = Date.now()
             return {
@@ -1596,7 +1663,28 @@ async function handleProviderChat(input: {
         }
       }
 
-      const rotate = provider.shouldRotate?.(upstream.status, text) ?? (upstream.status === 429 || upstream.status === 402)
+      // ⚠️ **先按响应体分类，再决定怎么罚**（实测缺陷：provider 路径只看状态码）。
+      //
+      // 原实现固定按 `upstream.status === 429 ? 'rate_limited' : 'unknown'` 分类，
+      // 于是上游用 400 回的渠道校验失败（`{"code":"11-128"}`）会被当成 `unknown`
+      // ⇒ `failureKind` 落到 `breaker` ⇒ **连续 3 次就把健康账号熔断 30 分钟**
+      //（实测：5 个国际版账号全 11-128，几分钟内整池进熔断）。
+      // 改用共享的 `classify()` 后，11-128 会被认成 `channel_blocked`，
+      // 走「不罚号 + 不换号 + 直出真实原因」的分支，与 buddy 路径口径一致。
+      const classified = classify(upstream.status, text)
+      const isChannelBlocked = classified.kind === 'channel_blocked'
+      const rotate = isChannelBlocked
+        ? false
+        : (provider.shouldRotate?.(upstream.status, text) ?? (upstream.status === 429 || upstream.status === 402))
+      // ⚠️ 不换号 ⇒ 也不该记冷却（判的是我方请求指纹，账号是健康的）
+      if (isChannelBlocked) {
+        lastError = {
+          status: clientStatusFor(upstream.status, 'channel_blocked'),
+          message: `渠道校验失败（11-128）：${text.slice(0, 200)}`,
+        }
+        clearSessionBinding(pool, sessionKey, ctx)
+        break
+      }
 
       // ⚠️ **429 不能一律当账号级冷却**（实测缺陷，用户报「一会能用一会不能用」）。
       //
@@ -1697,6 +1785,8 @@ async function handleProviderChat(input: {
         message: `${providerId} sse: ${msg || errText.slice(0, 160)}`,
       }
 
+      // ⚠️ 与 HTTP 非 2xx 分支同口径：渠道校验失败不换号（判的是我方指纹）
+      if (kind === 'channel_blocked') break
       if (mapped.rotate) continue // 换号重试！
       break
     }
@@ -1779,13 +1869,15 @@ async function handleProviderChat(input: {
   }
 
   // ⚠️ 严格隔离：不自动跨渠道容灾，各渠道配额完全独立，严禁将国际版流量切到国内版
+  //
+  // ⚠️ **有 `lastError` 时必须回放真实原因**（实测踩到的误导）：
+  // 5 个国际版账号因上游 11-128 被逐个记了软冷却后，下一次请求 `pick()` 直接返回空，
+  // 用户看到的竟是「没有可用账号（请先登录/导入凭据）」—— 而账号一个都没坏。
+  // 真实原因（渠道校验失败）只存在于 `lastError` 里，必须优先露出来。
   return {
     response: jsonError(
       lastError?.status ?? 503,
       lastError === undefined
-        // ⚠️ 区分「真的没账号」与「有账号但全在冷却/熔断」。
-        // 实测踩到：账号因连续失败进了熔断，报的却是「请先导入凭据」——
-        // 用户会去重新导入一份好凭据，而真实原因是**等几分钟就好**。
         ? (await describeNoAccount(env, activeRealm, providerId))
         : `供应商「${provider.name}」请求失败：${lastError.message}`,
       'provider_error',
