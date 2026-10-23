@@ -40,7 +40,7 @@ function webSources(): Map<string, string> {
     for (const name of readdirSync(dir)) {
       const p = path.join(dir, name)
       if (statSync(p).isDirectory()) walk(p)
-      else if (/\.tsx?$/.test(name)) out.set(path.relative('web/src', p), stripComments(readFileSync(p, 'utf8')))
+      else if (/\.tsx?$/.test(name)) out.set(path.relative('web/src', p).replaceAll('\\', '/'), stripComments(readFileSync(p, 'utf8')))
     }
   }
   walk('web/src')

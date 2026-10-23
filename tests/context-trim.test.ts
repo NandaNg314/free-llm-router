@@ -327,7 +327,7 @@ function stripComments(code: string): string {
   return code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 }
 
-const SOURCE_FILES = (readdirSync('src', { recursive: true }) as string[]).filter((p) => p.endsWith('.ts'))
+const SOURCE_FILES = (readdirSync('src', { recursive: true }) as string[]).filter((p) => p.endsWith('.ts')).map((p) => p.replaceAll('\\', '/'))
 
 test('🔴 裁剪只在 handleChatCompletions 接线一次（本项目吃过「同一个 bug 只修一半」的亏）', () => {
   // 除定义所在的 payload.ts 外，全仓库只能有一处调用点。
