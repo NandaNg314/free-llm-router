@@ -24,6 +24,7 @@ import { resolveUpstream, type Env } from '../env.js'
 import { billingHeaders, desktopHeaders, mpHeaders, webHeaders, deriveDeviceId, MP_MACHINE_ID } from '../upstream/headers.js'
 import { callUpstream, UpstreamError } from '../upstream/client.js'
 import { dailyCheckin, fetchBalance } from '../upstream/checkin.js'
+import { runWebDailyChat } from '../upstream/webagent.js'
 import { acceptTasks, isMpTask, listTasks, mergeTaskLists } from '../upstream/tasks.js'
 import {
   drawAllLottery,
@@ -140,7 +141,13 @@ const ACTIONS: Record<string, ActionHandler> = {
     }
   },
 
-  /** 查询余额（只读，用于签到后解冻冷却账号）。 */
+  /**
+   * 查询余额（**只读**，结果只用于展示）。
+   *
+   * ⚠️ 原文写「用于签到后解冻冷却账号」—— 那是假的：这里既不写 `credits`，
+   * 也不调 `clearHardIfRecovered`。解冻只发生在两条余额刷新入口
+   *（`/admin/accounts/balance` 与整点 cron），见 `src/index.ts`。
+   */
   async balance(ctx, _step, env): Promise<ActionResult> {
     try {
       const result = await fetchBalance({ uid: ctx.uid, accessToken: ctx.accessToken }, env, ctx.now)
@@ -200,6 +207,28 @@ const ACTIONS: Record<string, ActionHandler> = {
     } catch (error) {
       return { ok: false, detail: describeError(error, '接受任务') }
     }
+  },
+
+  /**
+   * 国际版（workbuddy.ai）每日活跃打卡：跑完一条网页端 agent 会话
+   *（官方每日活跃积分；国际版没有签到接口，见 `upstream/webagent.ts`）。
+   *
+   * ⚠️ 会消耗极少量配额（`session/set_model` 钉到免费模型 `deepseek-v4.1-flash`，
+   * 可用 env `WORKBUDDY_DAILY_CHAT_MODEL` 改）。成功后记签到日，
+   * 调度器据此当天不再重复打卡。
+   */
+  async webDailyChat(ctx, _step, env): Promise<ActionResult> {
+    if (ctx.accessToken === '') return { ok: false, detail: '网页端打卡：账号缺少 accessToken' }
+    const r = await runWebDailyChat(
+      { uid: ctx.uid, accessToken: ctx.accessToken },
+      env.WORKBUDDY_DAILY_CHAT_MODEL === undefined ? {} : { model: env.WORKBUDDY_DAILY_CHAT_MODEL },
+    )
+    if (r.ok) {
+      await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(ctx.realm))
+        .noteCheckinDone(ctx.uid, ctx.now)
+        .catch(() => {})
+    }
+    return { ok: r.ok, detail: r.conversationId === '' ? r.detail : `${r.detail}（会话 ${r.conversationId}）` }
   },
 
   async listTasks(ctx, _step, env): Promise<ActionResult> {

@@ -30,7 +30,7 @@
  * - 模型 id 是裸的（无 `provider/` 前缀），与既有用户兼容。
  */
 
-import { type Env } from '../env.js'
+import { type Env, parseString } from '../env.js'
 import { cliChatHeaders, deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { extractModels, type OpenAiModel } from '../gateway/models.js'
 import { prepareChatBody, sanitizeChatBody } from '../gateway/payload.js'
@@ -167,8 +167,8 @@ export const WORKBUDDY_INTL: VariantConfig = {
   requiresSystemFirst: true,
   checkin: false,
   checkinBlockedReason:
-    '国际版没有每日签到积分接口（积分领取在 CodeBuddy 侧完成）——'
-    + '这是上游产品形态，不是本服务的缺失。',
+    '国际版没有签到接口；每日活跃积分改由「网页端活跃打卡」获得'
+    + '（跑完一条网页端 agent 会话，定时任务 9/21 点自动入队，也可 POST /admin/checkin/all 手动入队）。',
 }
 
 /**
@@ -236,11 +236,16 @@ export function toProviderModels(models: OpenAiModel[]): ProviderModel[] {
     // 官方下发 x0.00 则标为免费，其余收费或未知
     isFree: m.credits === 'x0.00' || m.credits === 'x0',
     ...(m.credits ? { credits: m.credits } : {}),
-    // ⚠️ 倍率取**上游真实字段** `credits`（如 `"x0.21"`），不再从模型名正则抠 ——
-    // 名字里通常根本不写倍率（46 个模型里 39 个抠不到）。
+    // ⚠️ `priceFactor` 是**面板与聚合排序**用的数值形倍率（与上面 `credits`
+    // 的字符串形态并存：面板要展示原文、排序要比较大小）。
+    // 解析不出时**不带该字段**（`undefined` = 上游没给，不等于免费）。
     ...(parseCreditsFactor(m.credits) === undefined
       ? {}
       : { priceFactor: parseCreditsFactor(m.credits) as number }),
+    // 思考档位：上游列出的优先，缺字段时按内置快照回落（见 `resolveReasoning`）
+    ...(m.reasoningEfforts === undefined ? {} : { reasoningEfforts: m.reasoningEfforts }),
+    ...(m.defaultEffort === undefined ? {} : { defaultEffort: m.defaultEffort }),
+    ...(m.canDisableThinking === undefined ? {} : { canDisableThinking: m.canDisableThinking }),
   }))
 }
 
@@ -250,9 +255,24 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
   const bases =
     config.id === BUDDY_CN.id && env !== undefined
       ? {
-          chat: env.UPSTREAM_CHAT_BASE || config.chatBase,
-          billing: env.UPSTREAM_BILLING_BASE || config.billingBase,
-          web: env.UPSTREAM_WEB_BASE || config.webBase,
+          /**
+           * ⚠️ **必须走 `parseString`（trim 后空串回落），不能用 `||`**
+           *（2026-10-21 审查补，配置健壮性专项）。
+           *
+           * `||` 只挡「假值」，挡不住**纯空白**：`.env` 里写
+           * `UPSTREAM_CHAT_BASE= `（只有空格）时，`'  '` 是**真值**，
+           * base 就变成了 `'  '`，拼出的 URL 是 `'  /v3/config'`
+           * ⇒ `fetch` 抛 `Failed to parse URL`。
+           *
+           * 而另外 15 处（任务/签到/余额…）都走 `resolveUpstream` → `parseString`，
+           * 于是表现为「**网关 500、任务侧一切正常**」的半侧故障 —— 极难定位。
+           *
+           * 默认值仍用**本变体**的 `config.*Base`（不是 `DEFAULT_UPSTREAM`）：
+           * 两者内容相同，但这里要的是「这个变体的域名」。
+           */
+          chat: parseString(env.UPSTREAM_CHAT_BASE, config.chatBase),
+          billing: parseString(env.UPSTREAM_BILLING_BASE, config.billingBase),
+          web: parseString(env.UPSTREAM_WEB_BASE, config.webBase),
         }
       : { chat: config.chatBase, billing: config.billingBase, web: config.webBase }
 
@@ -286,7 +306,10 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
     return toProviderModels(extractModels(payload))
   }
 
-  async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
+  /** 「发出请求 → 收到响应头」的预算。超时即中止并交给网关换号（见 `chat()` 的说明）。 */
+const FIRST_FRAME_TIMEOUT_MS = 120_000
+
+async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
     // 复用网关的请求体准备逻辑（4 处必改 + 工具配对清理）
     let body: string
     try {
@@ -307,7 +330,34 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
       })
     }
 
-    return await fetch(`${bases.chat}/v2/chat/completions`, {
+    /**
+     * 🔴 **首帧超时**（2026-10-21 审查补，M3 指出：buddy.chat 此前**完全没有**超时）。
+     *
+     * 原来直接把 `request.signal` 交给 `fetch` —— 而那个信号只在**客户端断开**时触发。
+     * 于是上游「接了连接但永不回响应头」时（黑洞 / 半开连接 / 网关卡死），
+     * 这条请求会**无限挂起**：客户端等不到任何字节，网关也不会换号。
+     *
+     * ## 为什么计时器必须「首帧到了就撤掉」
+     * qoder 踩过同一个坑（见其 `chat()` 注释）：`AbortSignal.timeout()` 直接挂在
+     * `fetch` 上时，它**同样管着响应体** ⇒ 任何超过阈值的回答都会被**拦腰截断**。
+     * 故这里用 `AbortController` + `setTimeout`，并在 `finally` 里 `clearTimeout`。
+     *
+     * ## 只覆盖「到响应头」这一段
+     * buddy 的首帧错误由网关的 `peekStreamForError` 识别，这里不必再窥探；
+     * 拿到 `Response` 即撤计时器，后续流只受客户端取消约束。
+     */
+    const controller = new AbortController()
+    const onClientAbort = (): void => controller.abort(request.signal.reason)
+    if (request.signal.aborted) controller.abort(request.signal.reason)
+    else request.signal.addEventListener('abort', onClientAbort, { once: true })
+    const timer = setTimeout(() => {
+      const timeout = new Error(`buddy first frame timeout after ${FIRST_FRAME_TIMEOUT_MS}ms`)
+      timeout.name = 'TimeoutError'
+      controller.abort(timeout)
+    }, FIRST_FRAME_TIMEOUT_MS)
+    let gotResponse = false
+    try {
+      const response = await fetch(`${bases.chat}/v2/chat/completions`, {
       method: 'POST',
       // ⚠️ **chat 用参考实现口径的头**（11 个），不是 Go 侧那套。
       //
@@ -331,8 +381,16 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
             }),
       }),
       body,
-      signal: request.signal,
-    })
+      signal: controller.signal,
+      })
+      gotResponse = true
+      return response
+    } finally {
+      // 计时器只管到「拿到响应头」；拿到就撤，否则会掐断正在进行的流。
+      clearTimeout(timer)
+      // 失败路径摘掉客户端取消监听；成功路径**保留**（客户端中途取消仍要能掐断上游）。
+      if (!gotResponse) request.signal.removeEventListener('abort', onClientAbort)
+    }
   }
 
   async function balance(credential: ProviderCredential): Promise<ProviderBalance> {
@@ -360,7 +418,7 @@ export function buildBuddyProvider(config: VariantConfig, env?: Env): Provider {
    * 每日签到。
    *
    * ⚠️ 只有**国内版**会走到这里（国际版的 `capabilities.checkin` 是 false，
-   * 上游本就没有该接口）。
+   * 上游本就没有该接口；它的每日活跃积分走 `upstream/webagent.ts` 的网页端打卡）。
    *
    * 幂等由上游业务码保证（已签到返回 `10001`/`1001`，映射为 `alreadyDone`）——
    * 故重复点击是安全的。

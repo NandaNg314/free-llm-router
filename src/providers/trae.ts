@@ -533,11 +533,33 @@ function unwrapCredentialRoot(input: unknown): Record<string, unknown> {
   return merged
 }
 
-/** 按候选键名顺序取第一个非空字符串。 */
+/**
+ * 按候选键名顺序取第一个非空值，**数字也接受**（统一转成字符串）。
+ *
+ * ## 🔴 为什么必须接受数字（实测缺陷，2026-10-18）
+ *
+ * 原实现只认 `typeof value === 'string'`。而桌面端导出的 TRAE 凭据里
+ * `expires_at` 通常是**数字**（Unix 秒，如 `1792300000`），不是字符串 ——
+ * 于是被这一层静默丢弃 ⇒ `pickExpiresAt` 拿到 `''` ⇒ 返回 `0`（= 未知）。
+ *
+ * ⚠️ 后果是**静默**的：凭据能导入、也能用，但 `expiresAt` 永远是 0，
+ * 主动续期那条逻辑会把它当「未知」而跳过（`AccountPoolDO` 的续期判据里
+ * `expiresAt === 0` 明确不续期）⇒ 用户只能等令牌真的过期、请求 401 之后
+ * 才被动续期。这与「提前 1 小时续期」的设计目标完全相反，且没有任何报错。
+ *
+ * ⚠️ 这也是**同型缺陷**：`codearts.ts:343`、`lobsterai.ts:197`、`cline.ts:244`
+ * 都显式处理了数字，只有 TRAE 漏了。
+ *
+ * ⚠️ 只接受**有限数字**：`typeof NaN === 'number'`，而 `String(NaN)` 得到
+ * `'NaN'`，会被 `pickExpiresAt` 当成日期字符串去 `Date.parse` ⇒ 得到 NaN
+ * 后再被 `Number.isNaN` 兜成 0。虽然最终结果也是 0，但多绕一圈且丢掉可读性，
+ * 故这里直接排除非有限值。
+ */
 function pickString(source: Record<string, unknown>, keys: readonly string[]): string {
   for (const key of keys) {
     const value = source[key]
     if (typeof value === 'string' && value.length > 0) return value
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value)
   }
   return ''
 }
@@ -1027,12 +1049,13 @@ export function traeStreamErrorMessage(code: number, message: string, model: str
  * OpenAI 客户端（客户端只会看到一堆无法解析的帧）。转换必须**流式**完成
  * —— 见 {@link createSoloToOpenAiTransform}。
  *
- * ⚠️ 通道选择：`traeChannels` 里记录了该模型所属的通道
+ * ⚠️ 通道选择：`cachedModelChannels` 里记录了该模型所属的通道
  * （**同一模型只在列出它的通道里可调用**，发错通道 → 流内 `4001`）。
- * 由 `listModels` 缓存下来，找不到时回退默认通道。
+ * 映射**未知**时（冷启动、或该账号从未列过模型）会先做一次惰性补齐
+ * —— 见 {@link resolveChannel}；补齐仍拿不到才回退 `TRAE_FUNCTION`。
  */
 async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
-  const channel = cachedModelChannels.get(request.model) ?? TRAE_FUNCTION
+  const channel = await resolveChannel(credential, request.model, request.signal)
   const body: Record<string, unknown> = transformToSOLOBody(request.body, channel)
   // 输出额度收敛到安全上限（见 TRAE_MAX_COMPLETION_TOKENS 的说明）。
   const requested = readNumber(body, 'max_tokens')
@@ -1042,13 +1065,20 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
 
   let upstream: Response
   try {
-    upstream = await fetch(`${TRAE_AGENT_HOST}${TRAE_CHAT_PATH}`, {
-      method: 'POST',
-      headers: traeSOLOHeaders(credential, true),
-      body: JSON.stringify(body),
-      signal: request.signal,
-    })
+    upstream = await withFirstFrameTimeout('TRAE', request.signal, (signal) =>
+      fetch(`${TRAE_AGENT_HOST}${TRAE_CHAT_PATH}`, {
+        method: 'POST',
+        headers: traeSOLOHeaders(credential, true),
+        body: JSON.stringify(body),
+        signal,
+      }),
+    )
   } catch (error) {
+    // ⚠️ 首帧超时**原样抛**（普通 `Error`，见 {@link withFirstFrameTimeout}）。
+    // 若在这里包成 `ProviderError`，网关会先问 `shouldRotate(0, …)` —— 本家只认
+    // 4xx ⇒ 判成「不换号」⇒ 可恢复的超时变成终态失败。普通 Error 走网关的
+    // 传输层分支：**换号且不惩罚账号**。
+    if (isFirstFrameTimeout(error)) throw error
     throw new ProviderError({
       provider: 'trae',
       message: `TRAE 请求失败（网络层）：${error instanceof Error ? error.message : String(error)}`,
@@ -1073,10 +1103,162 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
   })
 }
 
+// ── 首帧超时 ──
+
+/**
+ * 「发出请求 → 收到响应头」的预算（毫秒）。超时即中止，交给网关换号。
+ *
+ * 与 `buddy.ts` 的同名常量、`qoder.ts` 的 `INFER_TIMEOUT_MS` 同一口径。
+ */
+const FIRST_FRAME_TIMEOUT_MS = 120_000
+
+/**
+ * 在「首帧超时」守卫下发起请求，返回上游响应。
+ *
+ * ## 为什么需要它（缺陷）
+ *
+ * 原先 `chat()` 把 `request.signal` **直接**交给 `fetch`，而那个信号只在
+ * **客户端断开**时触发 ⇒ 上游「接了连接但永不回响应头」（黑洞 / 半开连接 /
+ * 网关侧卡死）时，这条请求会**一直挂着**：用户看到「一直转圈」，而网关这边
+ * 既不换号也不报错。`buddy.chat` 早已用 `AbortController + setTimeout` 修过
+ * 同一形态，本家（以及 cline / minimax / opencode）漏了。
+ *
+ * ## 为什么计时器必须「拿到响应头就撤掉」
+ *
+ * ⚠️ **不能**改成把 `AbortSignal.timeout()` 直接挂在 `fetch` 上：那个信号
+ * **同样管着响应体**，会把超过阈值的**长回答拦腰截断**（`qoder.ts:1305` 有
+ * 本地实测记录）。故这里用 `AbortController` + `setTimeout`，且在
+ * `finally` 里 `clearTimeout` —— 只覆盖「到响应头」这一段。
+ *
+ * ## 为什么超时抛**普通 `Error`** 而不是 `ProviderError`
+ *
+ * 网关对「非 `ProviderError`」走**传输层失败**分支（`server.ts` 的
+ * `lastError = {status: 502, message}` + `continue`）⇒ **换号**且**不惩罚账号**，
+ * 正是这里要的语义（上游不响应不是某个账号的错）。
+ * 若包成 `ProviderError`，网关会先问 `provider.shouldRotate(0, …)`，而本家的
+ * 判据只认 4xx ⇒ 判成「不换号」，反而把可恢复的超时变成终态失败
+ * （`chat()` 的 catch 里为此显式放行，见 {@link isFirstFrameTimeout}）。
+ *
+ * ## 客户端取消
+ *
+ * 客户端信号仍然**穿透**到上游（组合信号），且成功路径**保留**监听 ——
+ * 用户点停止时上游流照样被掐断。
+ */
+function withFirstFrameTimeout(
+  label: string,
+  clientSignal: AbortSignal,
+  send: (signal: AbortSignal) => Promise<Response>,
+): Promise<Response> {
+  const controller = new AbortController()
+  const onClientAbort = (): void => controller.abort(clientSignal.reason)
+  if (clientSignal.aborted) controller.abort(clientSignal.reason)
+  else clientSignal.addEventListener('abort', onClientAbort, { once: true })
+  const timer = setTimeout(() => {
+    const timeout = new Error(
+      `${label} 首帧超时：${Math.round(FIRST_FRAME_TIMEOUT_MS / 1000)} 秒内没有收到响应头`
+      + '（上游不响应或连接半开，已中止本次请求）。',
+    )
+    timeout.name = 'TimeoutError'
+    controller.abort(timeout)
+  }, FIRST_FRAME_TIMEOUT_MS)
+  let gotResponse = false
+  return send(controller.signal)
+    .then((response) => {
+      gotResponse = true
+      return response
+    })
+    .finally(() => {
+      // 计时器只管到「拿到响应头」；拿到就撤，否则会掐断正在进行的流。
+      clearTimeout(timer)
+      // 失败路径摘掉客户端监听；成功路径保留（客户端中途取消仍要能掐断上游）。
+      if (!gotResponse) clientSignal.removeEventListener('abort', onClientAbort)
+    })
+}
+
+/**
+ * 该错误是不是 {@link withFirstFrameTimeout} 抛出的首帧超时。
+ *
+ * ⚠️ 只认 `name === 'TimeoutError'`（上面显式设置）。**不能**按消息文本
+ * 模糊匹配 —— 客户端取消抛的是 `AbortError`，两者处置完全不同：
+ * 超时要换号重试，客户端取消不该重发。
+ */
+function isFirstFrameTimeout(error: unknown): boolean {
+  return error instanceof Error && error.name === 'TimeoutError'
+}
+
 // ── 模型目录 ──
 
-/** 模型 id → 所属通道（`chat` 时用它选对 `function`）。 */
+/**
+ * 「该模型存在，但所属通道未知」的占位值。
+ *
+ * ⚠️ 必须与「通道就是 `TRAE_FUNCTION`」区分开：兜底表（{@link fallbackModels}）
+ * 里的 id **没有通道归属信息**（归属只能从 `batch_get_detail_param` 的
+ * `function_configs[].function` 拿到），把兜底一律当成 `solo_work_lite`
+ * 会让不属于该通道的模型全部回 `4001`（见 {@link resolveChannel}）。
+ */
+const UNKNOWN_CHANNEL = 'unknown'
+
+/** 模型 id → 所属通道（`chat` 时用它选对 `function`）。值是真实通道或 {@link UNKNOWN_CHANNEL}。 */
 const cachedModelChannels = new Map<string, string>()
+
+/**
+ * 上次「惰性补齐通道映射」的时刻。
+ *
+ * ⚠️ 用途是**限流**：目录端点持续故障时，不能让每个 chat 都白等一次
+ * （`listModels` 的请求带 30 秒超时）。故两次补齐之间至少间隔
+ * {@link CHANNEL_BACKFILL_INTERVAL_MS}。
+ */
+let channelBackfillAt = 0
+const CHANNEL_BACKFILL_INTERVAL_MS = 60_000
+
+/**
+ * 解析该模型该发哪个对话通道。
+ *
+ * ## 🔴 为什么必须惰性补齐（缺陷，B5）
+ *
+ * 原先 `chat()` 直接 `cachedModelChannels.get(model) ?? TRAE_FUNCTION`，而这张
+ * 映射表的**唯一写点**在 `listModels()` 里（且 `fallbackModels()` 不填表）。
+ * ⇒ 没跑过 `listModels` 的进程（冷启动、或该账号从未列过模型）走 chat 时，
+ * **所有模型都被当成同一个通道**（`solo_work_lite`）⇒ 凡不属于该通道的模型
+ * 一律回 `4001 param is invalid`，多模型路由直接失效，且**不会自愈**
+ * （只有某次 `/v1/models` 成功才把表填上）。
+ *
+ * ## 做法
+ * 1. 映射命中且不是 {@link UNKNOWN_CHANNEL} ⇒ 直接用；
+ * 2. 未知 ⇒ 先补一次 `listModels`（30 分钟缓存，成功后就不再是冷启动），
+ *    再读一次映射；
+ * 3. 仍未知（目录拉不到 / 模型不在目录里）⇒ 回退 `TRAE_FUNCTION`。
+ *
+ * ⚠️ 第 3 步是**最后兜底**，不是「默认值」：它仍然可能回 `4001`，但此时我们
+ * 确实没有任何依据选别的通道。`traeStreamErrorMessage` 对 4001 的提示
+ * （「通常是该模型不属于当前对话通道」）正是为这种情况准备的。
+ *
+ * ⚠️ 补齐失败**不能让对话失败**：目录只是补充信息（与 minimax 的 `lookupModel`
+ * 同一纪律），故这里吞掉异常并回退。
+ */
+async function resolveChannel(
+  credential: ProviderCredential,
+  model: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const known = cachedModelChannels.get(model)
+  if (known !== undefined && known !== UNKNOWN_CHANNEL) return known
+
+  const now = Date.now()
+  if (now - channelBackfillAt >= CHANNEL_BACKFILL_INTERVAL_MS) {
+    channelBackfillAt = now
+    try {
+      await listModels(credential, signal)
+    } catch {
+      // 目录只是补充信息：拉不到（含 401/403）就回退默认通道。
+      // ⚠️ 这里刻意不把 401/403 透出去：chat 自己发出去时同样会 401，
+      // 那时网关的续期分支才会用正确的方式处置（带上真实的上游原文）。
+    }
+    const learned = cachedModelChannels.get(model)
+    if (learned !== undefined && learned !== UNKNOWN_CHANNEL) return learned
+  }
+  return TRAE_FUNCTION
+}
 
 /** 目录缓存（isolate 内存；Workers 没有持久磁盘）。 */
 let cachedModels: ProviderModel[] | undefined
@@ -1171,16 +1353,30 @@ async function listModels(credential: ProviderCredential, signal: AbortSignal): 
   return providerModels
 }
 
-/** 兜底模型目录。 */
+/**
+ * 兜底模型目录。
+ *
+ * ⚠️ 同时把兜底 id 记进 {@link cachedModelChannels}（值为 {@link UNKNOWN_CHANNEL}）。
+ * 原来这里**不填表**，于是「目录拉不到 ⇒ 用兜底表」之后，`chat()` 只能靠
+ * `?? TRAE_FUNCTION` 猜通道 —— 凡不属于该通道的模型全部回 `4001`（B5）。
+ * 记成「未知」而不是记成 `solo_work_lite`：这样才能区分「我们不知道」与
+ * 「上游说它就在这个通道」，`chat()` 据此做一次惰性补齐（{@link resolveChannel}）。
+ *
+ * ⚠️ 只在**没有已知值**时写入：万一先前已经从目录学到过真实通道，
+ * 一次目录抖动不该把它覆盖成「未知」。
+ */
 function fallbackModels(): ProviderModel[] {
-  return FALLBACK_MODELS.map((model) => ({
-    id: model.id,
-    name: model.name,
-    contextWindow: model.contextWindow,
-    maxOutput: 0,
-    supportsImage: false,
-    isFree: false,
-  }))
+  return FALLBACK_MODELS.map((model) => {
+    if (!cachedModelChannels.has(model.id)) cachedModelChannels.set(model.id, UNKNOWN_CHANNEL)
+    return {
+      id: model.id,
+      name: model.name,
+      contextWindow: model.contextWindow,
+      maxOutput: 0,
+      supportsImage: false,
+      isFree: false,
+    }
+  })
 }
 
 /** 解析出的远端模型条目。 */
@@ -1198,8 +1394,8 @@ interface TraeRemoteModel {
   /**
    * **计费倍率**（上游 `display_contact_config.consumption_rate.data.rate`，实测 `0.06`）。
    *
-   * ⚠️ 上游把这块信息塞在一个**字符串化的 JSON** 里（`display_contact_config`），
-   * 不是对象 —— 必须 `JSON.parse` 才拿得到（直接当对象取恒为 `undefined`）。
+   * ⚠️ 上游把这块信息塞在**一个 JSON 字符串**里（`display_contact_config`），
+   * 不是对象 —— 必须 `JSON.parse` 才拿得到（实测见诊断 dump）。
    */
   priceFactor?: number
   hasReasoningOptions: boolean
@@ -1320,7 +1516,8 @@ function parseConfigEntry(
       ? {}
       : { isHidden: readBoolean(entry, 'is_invisible_to_user') }),
     ...(readString(entry, 'usage').length > 0 ? { usage: readString(entry, 'usage') } : {}),
-    // ⚠️ 只在**真的解析出正数**时才带上（0/缺失 = 上游没提供，不是「免费」）
+    // ⚠️ 只在**真的解析出正数**时才带上（0/缺失 = 上游没提供，
+    // 不是「免费」）——`undefined` 与 `0` 在面板上是两种完全不同的展示。
     ...(priceFactor === undefined ? {} : { priceFactor }),
     hasReasoningOptions,
   }
@@ -1331,9 +1528,14 @@ function parseConfigEntry(
  *
  * ## ⚠️ 它藏在一个 JSON **字符串**里
  *
- * 实测：上游条目有个 `display_contact_config`，值是**字符串化的 JSON**：
- * `{"access":{...},"consumption_rate":{"enable":true,"data":{"rate":0.06}}}`
- * ⇒ 必须 `JSON.parse` 才能读到 `rate`；直接当对象取会得到 `undefined`，
+ * 实测（只读诊断 dump，2026-10-11）：上游条目有个
+ * `display_contact_config`，值是**字符串化的 JSON**：
+ *
+ * ```json
+ * {"access":{"data":{...}},"consumption_rate":{"enable":true,"data":{"rate":0.06}}}
+ * ```
+ *
+ * ⚠️ 必须 `JSON.parse` 才能读到 `rate` —— 直接当对象取会得到 `undefined`，
  * 表现就是「倍率列一直空着」。
  *
  * ⚠️ `enable !== true` 时**不采信** `rate`：那是「这条计费规则未启用」，
@@ -2396,32 +2598,69 @@ export const traeProvider: Provider = {
   name: 'TRAE（字节跳动）',
   capabilities: {
     /**
-     * ❌ **不可用**：TRAE **强制回调 `127.0.0.1`**，Worker 接不住。
+     * ❌ **当前不可用**：授权页对回调地址有**硬编码正则校验**（2026-10-19 定位）
      *
-     * ## 实测结论（用户报障「TRAE 登录显示网络错误，请刷新页面重试」）
+     * ## 真凶：不是「网络错误」，是参数没通过页面内的一条正则
      *
-     * 我一度以为 `auth_callback_url` 是通用参数、可以指向本服务的 URL
-     *（codearts 就是这么做的，且能通）。**对 TRAE 不成立**：
+     * 页面 chunk（`page.*.js`，已逐字节核对）里有：
      *
-     * 1. 参考实现的文件头明写 **「TRAE 强制回调 `127.0.0.1`」**
-     *    （`trae-oauth.ts:4-11`），端口固定 18080；
-     * 2. 它的登录流程是 `startCallbackServer(18080)` +
-     *    `auth_callback_url = 'http://127.0.0.1:<port>/authorize'`
-     *    （`trae-oauth.ts:555-566`）—— 回调是**浏览器直连用户本机端口**；
-     * 3. 登录 URL 里的 `auth_type=local` 也在字面上说明这一点
-     *    （`local` = 本机回调）。
+     * ```js
+     * if (W) V(!1), eA();                       // W = parseInt(redirect)
+     * else {
+     *   if (!$ || !Z || !/^http:\/\/127\.0\.0\.1:(\d+)\/authorize$/.test(Z)) {
+     *     V(!1), ew("invalidUrl"), ep(3); return;   // ← 远程回调必然命中这里
+     *   }
+     *   eT()
+     * }
+     * ```
      *
-     * 故用户看到的是 **TRAE 页面自己报的「网络错误」**（它去连
-     * `127.0.0.1:18080` 但那里没有服务在监听），
-     * 而不是我们的回调页 —— 这也解释了为什么那条文案在本仓库里搜不到。
+     * `Z = auth_callback_url`。**只认 `http://127.0.0.1:<端口>/authorize`
+     * 这个精确形态** —— 我们的 HTTPS 域名必然不匹配 ⇒ 直接 `invalidUrl`
+     * ⇒ 显示那句硬编码兜底文案「网络错误，请刷新页面重试。」。
      *
-     * ⚠️ **不要靠「把地址换成本服务 URL」来修**：这条路在架构上不成立。
-     * 除非 TRAE 将来支持设备码或远程回调，否则只能「粘贴凭据导入」。
+     * ⚠️ 页面自己的埋点也自证了这一点：`module_id: "solo.auth.invalidUrl"`
+     *（从 `mcs.zijieapi.com` 上报体里抓到）。**那不是网络错误。**
+     *
+     * ## 六组对照实验（同一套参数，只改一处）
+     *
+     * | # | `auth_callback_url` | `redirect` | 结果 |
+     * |---|---|---|---|
+     * | A | 我们的 HTTPS 域名 | 0 | 登录失败/网络错误 |
+     * | B | `http://127.0.0.1:18080/authorize` | 0 | 正常登录页 |
+     * | C | `http://127.0.0.1:63521/authorize` | 0 | 正常登录页 |
+     * | D | `http://127.0.0.1:18080/authorize-other` | 0 | 失败（卡在 `\/authorize$`） |
+     * | E | 我们的 HTTPS 域名 | **1** | **登录成功/此窗口可关闭** |
+     * | F | 我们的 HTTPS 域名 | 0 | 失败（同 A） |
+     *
+     * ⇒ A vs E/F 同 URL 仅 `redirect` 不同 → 与域名/可达性**无关**；
+     *   D vs B 仅尾路径不同 → 判定精确卡在 `\/authorize$`。
+     *
+     * ⚠️ **另一个反直觉事实**：即使给合法回环地址，页面**也不会真的去请求它**
+     *（实测 0 条回环请求）—— 它只拿来做正则校验，真正投递由
+     * `u(Z, {isRedirect:!0, …})` + `location.href = …` 完成。
+     *
+     * ## 为什么仍然关掉（`redirect=1` 这条路的未验证项）
+     *
+     * `redirect=1` 能让页面显示「登录成功」，但**凭证是否真的送达我们的
+     * 回调 URL 尚未验证**。上一个子代理测的是**未登录态**
+     *（`CheckLogin` 返回 `IsLogin:false`），那种情况下根本走不到取 token
+     * 那一步，故「0 请求到回调域名」**不能**作为投递不通的证据。
+     *
+     * ⇒ 保留 `login: false`。等「已登录账号 + redirect=1」的投递被真机验证
+     *   之后再考虑打开；那时只需改这一个开关，URL 构造无需改动。
+     *
+     * ## 登录原语全部保留
+     *
+     * `buildTraeLoginURL` / `parseTraeCallback` / `pollTraeLogin` 都是对的
+     * （回调地址由调用方传入、我们如实使用）。它们是**将来**接回这条路的
+     * 基础，且 `parseTraeCallback` 的解析逻辑与「粘贴导入」共用同一套。
      */
     login: false,
     loginBlockedReason:
-      'TRAE 强制回调 127.0.0.1（本机端口），Worker 收不到 —— 这是上游的协议限制，'
-      + '不是本服务的缺失。请从 TRAE 客户端导出凭据后粘贴导入。',
+      'TRAE 授权页对 auth_callback_url 有**硬编码正则**（只认 '
+      + '`http://127.0.0.1:<端口>/authorize`），远程回调必须改用 '
+      + '`redirect=1` 绕过该校验 —— 而那条路的凭证投递尚未验证。'
+      + '请先用「粘贴凭据导入」（machine_id / device_id 也在那份凭据里）。',
     listModels: true,
     chat: true,
     balance: true,

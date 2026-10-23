@@ -1,3 +1,28 @@
+
+/**
+ * 上游渠道拦截码的两种书写形态（**码点构造**，源码里不写裸字面量）。
+ *
+ * - `FP_BARE`：不带连字符的 5 位裸码 —— 反探测的**触发串**（请求里出现即整单拦截，
+ *   Go 侧 `sanitize.go` 与 workbuddy2api-hub 都按它改写），也是参考实现记录的数字 `code`。
+ * - `FP`：带 ASCII 连字符的 6 字符形态 —— workbuddy2api-hub 把裸码改写成的样子，
+ *   本仓库也有样本记录它出现在错误信封里。2026-10-19 曾把它当成「唯一真实码」，
+ *   导致裸码不再被改写（2026-10-21 纠正）。两种都改写成 `FP_SAFE`，不赌哪一种。
+ *
+ * ⚠️ 写字面量**不安全**：ASCII 连字符与 U+2011 等渲染一模一样，
+ * 编辑器/构建链任一处归一化都会让判据与替身同形，函数静默变成空操作。
+ */
+const FP_BARE = String.fromCharCode(0x31, 0x31, 0x31, 0x32, 0x38)
+const FP = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
+
+/**
+ * 脱敏后的替身：中间放 U+2011（NON-BREAKING HYPHEN）。
+ *
+ * ⚠️ 必须与 `FP` / `FP_BARE` 都是**不同码点序列**，否则 `replaceAll` 就是空操作
+ * （本项目真实发生过，且单测写成「输入 === 期望值」而永远通过）。
+ * NFKC 归一化会把 U+2011 变成 U+2010，仍不会还原成裸码。
+ */
+const FP_SAFE = String.fromCharCode(0x31, 0x31, 0x2011, 0x31, 0x32, 0x38)
+
 /**
  * 行为事件上报（`POST /v2/report`）。
  *
@@ -137,30 +162,50 @@ export function withFingerprint(events: Event[], fingerprint: Event): Event[] {
 }
 
 /**
- * 反探测脱敏：把请求体里的裸数字 `11128` 改写。
+ * 反探测脱敏：把文本里的渠道拦截码（裸 5 位与带连字符两种形态）改写。
  *
  * ## 为什么必须做
  *
- * 上游的**反探测**机制：请求体里只要出现裸 `11128` 就整单拦截，
- * 与该数字的上下文无关（`code=11128` / 裸 `11128` / `错误码 11128` 全部命中），
- * 而相邻的 `11148` / `11101` / `11115` 均放行
- * （Go 侧 `sanitize.go:70-76` 实测记录）。
+ * 上游的**反探测**机制：请求体里只要出现裸 5 位拦截码就整单拦截，
+ * 与上下文无关（`code=` / 裸码 / `错误码 ` 前缀全部命中），
+ * 而相邻的 `11148` / `11101` / `11115` 均放行（Go 侧 `sanitize.go:70-76` 实测记录）。
+ * 这个码**既表示拦截、又是拦截条件**，不改写必然失败。
  *
- * 因果很微妙：**11128 正是这类拦截自身的错误码**，上游据此识别
- * 「在讨论/回显其内部错误码」的请求。所以这串数字**出现在请求里本身就是拦截条件**，
- * 不改写必然失败。
- *
- * 改法：插入连字符（`11-128`）保留可读性与指代。
+ * 改法：中间插 U+2011，保留可读性与指代。
  * ⚠️ 零宽空格**无效** —— 实测上游会先归一化再匹配。
+ *
+ * ## 🔴 历史上的两次静默失效
+ *
+ * 1. 2026-10-19 之前：`replaceAll` 的两个参数一字不差，单测又写成「输入 === 期望值」。
+ * 2. 2026-10-19 的「修复」把判据换成了带连字符形态，裸码反而不再改写（2026-10-21 纠正）。
+ *
+ * ⚠️ **别凭肉眼判断两个字符串是否相同**，断言必须比对码点。
  */
 export function sanitizeFingerprints(text: string): string {
-  if (!text.includes('11128')) return text
-  return text.replaceAll('11128', '11-128')
+  if (!text.includes(FP_BARE) && !text.includes(FP)) return text
+  return text.replaceAll(FP_BARE, FP_SAFE).replaceAll(FP, FP_SAFE)
 }
 
-/** 对事件数组做脱敏（JSON 序列化后整体替换，覆盖所有字段）。 */
+/** 递归改写结构里的**字符串值**（数字、布尔原样保留）。 */
+function sanitizeValue(value: unknown): unknown {
+  if (typeof value === 'string') return sanitizeFingerprints(value)
+  if (Array.isArray(value)) return value.map(sanitizeValue)
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[sanitizeFingerprints(k)] = sanitizeValue(v)
+    return out
+  }
+  return value
+}
+
+/**
+ * 对事件数组做脱敏：只改**字符串值**。
+ *
+ * ⚠️ 不能像以前那样在 `JSON.stringify` 结果上整串替换：毫秒时间戳等数字可能碰巧含这 5 位，
+ * 整串替换会把数字改成非法 JSON，`JSON.parse` 直接抛错，整次上报失败。
+ */
 export function sanitizeEvents(events: Event[]): Event[] {
   const serialized = JSON.stringify(events)
-  if (!serialized.includes('11128')) return events
-  return JSON.parse(sanitizeFingerprints(serialized)) as Event[]
+  if (!serialized.includes(FP_BARE) && !serialized.includes(FP)) return events
+  return sanitizeValue(events) as Event[]
 }

@@ -87,7 +87,10 @@ export function planDaily(): TaskStep[] {
   return [
     { code: '_probe', action: 'listTasks', delayMs: GAP.report },
     { code: 'checkin', action: 'checkin', delayMs: GAP.report },
-    // 签到后查余额：余额恢复的冷却账号由调用方解冻
+    // 签到后查余额（只读展示）。
+    // ⚠️ 它**不会**解冻任何账号：本引擎的 balance 动作不写 credits、也不调
+    // `clearHardIfRecovered`。真正的「余额恢复 ⇒ 解冻 hard」只在
+    // `/admin/accounts/balance` 与整点 cron 两条入口（见 `src/index.ts`）。
     { code: '_probe', action: 'balance', delayMs: 0 },
   ]
 }
@@ -111,7 +114,7 @@ export function planGrowth(options?: { includeRealChat?: boolean }): TaskStep[] 
     // 幂等，重复运行无副作用。
     { code: '_probe', action: 'acceptPending', delayMs: GAP.report },
     // ⚠️ **签到必须在本计划里**。面板与文档都承诺「签到 → 成长任务 → 领奖」
-    //（`src/panel/assets/index.html:50-53`、`src/index.ts:447`），
+    //（旧版面板任务说明、`src/index.ts:447`），
     // 但早期 `planGrowth` **没有这一步** —— 用户点「执行每日任务」时只跑了成长任务，
     // **从未签到**。实测证据（2026-10-04，线上 `/admin/tasks/status`）：
     // 该按钮对应的一次运行 `done` 里有 23 步、`chat_5`/`first_buddy`/… 全在，
@@ -147,12 +150,28 @@ export function planGrowth(options?: { includeRealChat?: boolean }): TaskStep[] 
   return steps
 }
 
+/**
+ * 国际版（workbuddy.ai）每日计划：只有一步「网页端活跃对话」。
+ *
+ * ⚠️ 国际版**没有**签到/成长任务接口，`daily`/`growth` 里的动作全是国内版协议，
+ * 对国际版账号只会白跑一轮失败 —— 故单独一个计划。
+ * ⚠️ 这一步会消耗极少量配额（钉到免费模型，见 `upstream/webagent.ts`）。
+ */
+export function planIntlDaily(): TaskStep[] {
+  return [{ code: 'web_daily_chat', action: 'webDailyChat', delayMs: 0 }]
+}
+
+/** 计划名。 */
+export type PlanName = 'daily' | 'growth' | 'intlDaily'
+
 /** 按名称取计划。`includeRealChat` 只对 `growth` 有意义。 */
 export function planByName(
-  name: 'daily' | 'growth',
+  name: PlanName,
   options?: { includeRealChat?: boolean },
 ): TaskStep[] {
   switch (name) {
+    case 'intlDaily':
+      return planIntlDaily()
     case 'daily':
       // ⚠️ daily 计划**永远**不含真实对话任务（它挂在 cron 上，不能让用户无感知花配额）
       return planDaily()

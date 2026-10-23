@@ -187,10 +187,28 @@ test('startServer：HTTP 服务端启动、健康检查与面板可访问性', a
     const html = await panelRes.text()
     assert.ok(html.includes('free-llm-router'))
 
-    // 3. /panel/style.css 正常返回 CSS
-    const cssRes = await fetch(`${baseUrl}/panel/style.css`)
+    // 3. 入口引用的样式表正常返回 CSS（文件名带哈希，从 HTML 里取）
+    const cssPath = /href="(\/panel\/assets\/[^"]+\.css)"/.exec(html)?.[1]
+    assert.ok(cssPath, '入口 HTML 应引用样式表')
+    const cssRes = await fetch(`${baseUrl}${cssPath}`)
     assert.equal(cssRes.status, 200)
     assert.ok(cssRes.headers.get('content-type')?.includes('text/css'))
+    // ⚠️ 2026-10-21 改：面板产物文件名**不随内容变**（预构建后提交进仓库），
+    // 所以 `immutable` 会让浏览器永久缓存旧产物 ⇒ 用户升级后界面显示旧版本
+    //（实测：服务端 0.9.5、界面 0.9.2）。改为 `no-cache` + ETag 回源校验。
+    assert.match(cssRes.headers.get('cache-control') ?? '', /no-cache/)
+    assert.ok(cssRes.headers.get('etag'), '静态资源必须带 ETag（否则 no-cache 等于每次全量重下）')
+    // 3b. 旧登录页地址跳到面板；/panel/ 下不存在的文件 404（不是 401）
+    const loginRes = await fetch(`${baseUrl}/login`, { redirect: 'manual' })
+    assert.equal(loginRes.status, 302)
+    assert.equal(loginRes.headers.get('location'), '/panel/')
+    assert.equal((await fetch(`${baseUrl}/panel/nope.js`)).status, 404)
+    // 3c. 面板资源在 Node 直连时也要 gzip（Workers 由边缘压缩）；fetch 会自动解压，内容不变
+    assert.equal(panelRes.headers.get('content-encoding'), 'gzip')
+    assert.equal(cssRes.headers.get('content-encoding'), 'gzip')
+    const plain = await fetch(`${baseUrl}${cssPath}`, { headers: { 'accept-encoding': 'identity' } })
+    assert.equal(plain.headers.get('content-encoding'), null, '不接受 gzip 的客户端拿原文')
+    assert.equal((await plain.text()).length > 1000, true)
 
     // 4. /v1/models 无 Authorization 应返回 401
     const unauthRes = await fetch(`${baseUrl}/v1/models`)
@@ -201,6 +219,7 @@ test('startServer：HTTP 服务端启动、健康检查与面板可访问性', a
       headers: { authorization: 'Bearer test-secret-key-12345' },
     })
     assert.equal(authRes.status, 200)
+    assert.equal(authRes.headers.get('content-encoding'), null, 'API 响应不压缩（SSE 不能被缓冲）')
     const modelsJson = (await authRes.json()) as any
     assert.ok(Array.isArray(modelsJson?.data))
   } finally {
@@ -215,4 +234,107 @@ test('startServer：HTTP 服务端启动、健康检查与面板可访问性', a
     runtime.db.close()
     if (fs.existsSync(tmpDbPath)) fs.unlinkSync(tmpDbPath)
   }
+})
+
+test('🔴 Node 下 AccountPoolDO 并发「读-改-写」不丢更新（串行队列）', async () => {
+  // 复现：没有串行队列时，50 个并发 recordApiKeyUse 只记下 1 次。
+  const originalLog = console.log
+  console.log = () => {}
+  const rt = createNodeRuntime(':memory:')
+  console.log = originalLog
+  const pool = rt.env.ACCOUNT_POOL.get(rt.env.ACCOUNT_POOL.idFromName('cn')) as any
+  const rec = await pool.addApiKey({ name: 'race', hash: 'hash-race', prefix: 'sk-race' })
+  await Promise.all(
+    Array.from({ length: 50 }, () =>
+      pool.recordApiKeyUse({ id: rec.id, ip: '203.0.113.9', model: 'm', input: 0, output: 0 }),
+    ),
+  )
+  const usage = await pool.getApiKeyUsage(rec.id)
+  assert.equal(usage.requests, 50)
+})
+
+test('串行队列：前一个调用抛错不会卡住后续调用', async () => {
+  const { serializeCalls } = await import('../src/server/namespace.js')
+  const order: string[] = []
+  const obj = serializeCalls({
+    async boom(): Promise<void> {
+      order.push('boom')
+      throw new Error('x')
+    },
+    async ok(v: string): Promise<string> {
+      order.push(v)
+      return v
+    },
+  })
+  const a = obj.boom().catch(() => 'caught')
+  const b = obj.ok('after')
+  assert.equal(await a, 'caught')
+  assert.equal(await b, 'after')
+  assert.deepEqual(order, ['boom', 'after'])
+})
+
+test('🔴 Node 客户端 IP：默认只认 TCP 对端，客户端伪造的头无效', async () => {
+  const { resolveClientIp } = await import('../src/server/index.js')
+  // 未开 TRUST_PROXY：X-Forwarded-For 不可信，取对端地址
+  assert.equal(resolveClientIp('198.51.100.7', '1.2.3.4', false), '198.51.100.7')
+  // IPv4 映射地址去掉 ::ffff: 前缀，白名单才能匹配
+  assert.equal(resolveClientIp('::ffff:198.51.100.7', undefined, false), '198.51.100.7')
+  // 开了 TRUST_PROXY：取最右一项（反代追加的），左边客户端自填的不算
+  assert.equal(resolveClientIp('127.0.0.1', '6.6.6.6, 203.0.113.5', true), '203.0.113.5')
+  // 开了但没有 X-Forwarded-For：回落对端地址
+  assert.equal(resolveClientIp('127.0.0.1', undefined, true), '127.0.0.1')
+})
+
+test('🔴 Node 服务：客户端自带的 CF-Connecting-IP 被丢弃并按对端地址重写', async () => {
+  const tmp = path.join(process.cwd(), '.build', `ip-test-${Date.now()}.db`)
+  const originalApiKey = process.env.API_KEY
+  process.env.API_KEY = 'ip-test-key'
+  // ⚠️ 静音启动横幅：node:test 子进程的 stdout 同时承载测试协议帧，
+  // 大段 console 输出与协议帧交错时偶发「Unable to deserialize cloned data」。
+  const originalLog = console.log
+  console.log = () => {}
+  const { server, runtime } = startServer({ port: 0, host: '127.0.0.1', databasePath: tmp, autoCron: false })
+  await new Promise<void>((resolve) => {
+    if (server.listening) resolve()
+    else server.once('listening', () => resolve())
+  })
+  const addr = server.address()
+  assert.ok(addr && typeof addr === 'object')
+  const base = `http://127.0.0.1:${addr.port}`
+  try {
+    const auth = { authorization: 'Bearer ip-test-key', 'content-type': 'application/json' }
+    // 建两把子密钥：一把只允许 10.9.9.9，一把只允许本机
+    const mk = async (ips: string[]): Promise<string> => {
+      const r = (await (await fetch(`${base}/admin/apikeys`, {
+        method: 'POST', headers: auth, body: JSON.stringify({ name: 'ip', limits: { allowedIps: ips } }),
+      })).json()) as { key?: string }
+      assert.ok(typeof r.key === 'string' && r.key !== '')
+      return r.key
+    }
+    const remoteOnly = await mk(['10.9.9.9'])
+    const localOnly = await mk(['127.0.0.1'])
+    // 伪造白名单 IP：必须被拒（真实对端是 127.0.0.1）
+    const forged = await fetch(`${base}/v1/models`, {
+      headers: { authorization: `Bearer ${remoteOnly}`, 'cf-connecting-ip': '10.9.9.9' },
+    })
+    assert.equal(forged.status, 403)
+    // 真实对端在白名单内：放行
+    const ok = await fetch(`${base}/v1/models`, { headers: { authorization: `Bearer ${localOnly}` } })
+    assert.equal(ok.status, 200)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    runtime.db.close()
+    console.log = originalLog
+    if (originalApiKey === undefined) delete process.env.API_KEY
+    else process.env.API_KEY = originalApiKey
+    for (const f of [tmp, `${tmp}-wal`, `${tmp}-shm`]) fs.rmSync(f, { force: true })
+  }
+})
+
+test('envFlag：常见的「关」写法都能关掉', async () => {
+  const { envFlag } = await import('../src/server/index.js')
+  for (const v of ['false', 'FALSE', '0', 'no', 'off', ' False ']) assert.equal(envFlag(v, true), false, v)
+  for (const v of ['true', '1', 'yes', 'on']) assert.equal(envFlag(v, false), true, v)
+  assert.equal(envFlag(undefined, true), true)
+  assert.equal(envFlag('乱写', false), false)
 })

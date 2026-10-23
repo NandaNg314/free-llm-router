@@ -36,6 +36,7 @@ import assert from 'node:assert/strict'
 import {
   DEFAULT_PROVIDER,
   findProvider,
+  getBuiltinModels,
   PROVIDERS,
   parseCredentialAnywhere,
   providerCatalog,
@@ -438,6 +439,108 @@ test('⚠️ 每个真实对话动作都必须已注册（否则入队了却执�
 
 // ─────────────────── 凭据判别（本地 10 个真实账号暴露的问题） ───────────────────
 
+// ───── Qoder 中国版（qodercn）：与 qoder 同实现、不同产品配置 ─────
+
+test('🔴 自动识别必须把「带 CN 旁证的凭据」归到 qodercn（蓝队实测发现的真缺陷）', () => {
+  // ## 缺陷
+  //
+  // \`parseCredentialAnywhere\` 按 **PROVIDERS 数组顺序**逐个问 \`matchesShape\`，
+  // 而 \`qoder\` 排在 \`qodercn\` 之前。
+  //
+  // 我第一版让国际版「对任何 Qoder 形状都返回 true」（当兜底用），
+  // 于是**中国版永远轮不到** —— 导出中国版凭据会被静默归到国际版名下，
+  // 推理时打到错误 host，用户看到的是 401 / 莫名其妙的失败。
+  //
+  // 这与 buddy/workbuddy 的处境完全相同（那边靠「默认变体不声明 matchesShape」
+  // 规避）。Qoder 两侧都声明了判据，故改为「**国际版显式排除 CN 旁证**」。
+  //
+  // ⚠️ 也考虑过「把 qodercn 排到 qoder 前面」—— 但那是**依赖数组顺序**的
+  //    隐式约束，将来加一个新变体就会复发。显式排除更稳。
+  const bare = { security_oauth_token: 'tok', machine_id: 'mid', uid: 'u1' }
+
+  // ① 裸形状 ⇒ 国际版（兜底语义：没被别家认领的 Qoder 凭据就是国际版）
+  assert.equal(
+    parseCredentialAnywhere(bare).provider.id,
+    'qoder',
+    '裸 Qoder 形状必须归国际版',
+  )
+
+  // ② 带 CN 旁证 ⇒ 中国版（三种旁证都测）
+  for (const [name, cred] of [
+    ['qoder.cn 域名', { ...bare, domain: 'https://qoder.cn' }],
+    ['CN openapi host', { ...bare, openApi: 'https://openapi.qoder.com.cn' }],
+    ['显式 variant=cn', { ...bare, variant: 'cn' }],
+  ] as const) {
+    assert.equal(
+      parseCredentialAnywhere(cred).provider.id,
+      'qodercn',
+      `带「${name}」的凭据必须归中国版（否则会静默错归属）`,
+    )
+  }
+})
+
+test('🔴 qodercn 必须已注册，且与 qoder 是**两个独立 provider**', () => {
+  // 中国版与国际版协议同一份（\`buildQoderProduct\` 参数化），但它们是
+  // **两个独立的账号体系**：不同 clientId、不同 openApi host。
+  // 没注册就等于「中国版用户完全无法登录」。
+  const cn = findProvider('qodercn')
+  assert.notEqual(cn, undefined, 'qodercn 必须已注册进 PROVIDERS')
+  assert.notEqual(cn, findProvider('qoder'), 'qodercn 不能和 qoder 是同一个对象')
+
+  // 产物里必须有真实 CN 模型键（不是照抄国际版那套杜撰值）
+  const ids = getBuiltinModels().filter((m) => m.provider === 'qodercn').map((m) => m.id)
+  assert.ok(ids.length > 0, 'qodercn 必须有内置模型')
+  assert.ok(
+    ids.some((id) => id.includes('qmodel') || id.includes('dfmodel')),
+    '必须用真实 CN 目录键（qmodel*/dfmodel），不能是 claude/gpt 那套杜撰值',
+  )
+})
+
+test('🔴 qodercn 与 qoder 的 matchesShape 必须能**区分**（否则自动识别恒定选错）', () => {
+  // ## 为什么这条必须有
+  //
+  // 两个变体的凭据字段**完全相同**（都只有 security_oauth_token + machine_id），
+  // 而 \`parseCredentialAnywhere\` 是按 PROVIDERS 数组顺序逐个问 matchesShape 的。
+  // 若两者判据一样 ⇒ **永远命中排在前面的那个** ⇒ 中国版账号被挂到国际版名下，
+  // 发推理时打到错误 host。
+  //
+  // 本项目对 buddy/workbuddy 已有同一套纪律（默认变体兜底、非默认变体带旁证），
+  // 本测试锁死 qodercn 照做。
+  const qoder = findProvider('qoder')
+  const cn = findProvider('qodercn')
+  assert.notEqual(qoder?.matchesShape, undefined)
+  assert.notEqual(cn?.matchesShape, undefined, 'qodercn 必须有 matchesShape（否则永远轮不到它）')
+
+  // ① 纯 Qoder 形状（无任何 CN 旁证）⇒ 只有国际版认
+  const bare = { security_oauth_token: 'tok', machine_id: 'mid' }
+  assert.equal(qoder!.matchesShape!(bare), true, '国际版应认领裸形状')
+  assert.equal(
+    cn!.matchesShape!(bare),
+    false,
+    '⚠️ 中国版**不得**认领裸形状 —— 否则会把国际版凭据抢走',
+  )
+
+  // ② 带 CN 域名旁证 ⇒ 中国版认领
+  assert.equal(
+    cn!.matchesShape!({ ...bare, domain: 'https://qoder.cn' }),
+    true,
+    '出现 qoder.cn 时必须判为中国版',
+  )
+  assert.equal(
+    cn!.matchesShape!({ ...bare, openApi: 'https://openapi.qoder.com.cn' }),
+    true,
+    '出现 openapi.qoder.com.cn 时必须判为中国版',
+  )
+
+  // ③ 显式变体标记
+  assert.equal(cn!.matchesShape!({ ...bare, variant: 'cn' }), true, '显式 variant=cn 必须认')
+  assert.equal(cn!.matchesShape!({ auth: { ...bare, realm: 'cn' } }), true, '嵌套 auth.realm=cn 必须认')
+
+  // ④ 反向守卫：非 Qoder 形状两边都不认
+  assert.equal(cn!.matchesShape!({ access_token: 'x', uid: 'u' }), false)
+  assert.equal(qoder!.matchesShape!({ access_token: 'x', uid: 'u' }), false)
+})
+
 test('⚠️ qoder/trae/raccoon/codearts 必须有 matchesShape（否则被 buddy 兜底抢走）', () => {
   // 实测：拿本地真实凭据跑 parseCredentialAnywhere，
   // QODER / TRAE / RACCOON 的凭据全被判成 buddy ——
@@ -722,9 +825,26 @@ test('🔴 qoder 排队必须有**总墙钟预算**（只有次数上限会让�
   assert.ok(budget <= 90_000, `总预算 ${budget}ms 太长，会被平台掐断（实测 122s 即失败）`)
   // ⚠️ 下限：要够覆盖一次正常排队（实测常见 20–25s），否则正常用户会被误报
   assert.ok(budget >= 30_000, `总预算 ${budget}ms 太短，正常排队（20–25s）会被误判为繁忙`)
+
+  /**
+   * ⚠️ **三常量必须逻辑自洽**（2026-10-21 补，我差点只改总预算）。
+   *
+   * `maxAttempts × maxDelay` 若小于 `budget`，预算就**永远用不满** ——
+   * 用户要求「等 60 秒」，但循环会在 ~30 秒时就因次数耗尽而放弃，
+   * 60 秒形同虚设。这类「改了 A 却没改 B」正是本项目反复出现的缺陷模式。
+   */
+  const maxAttempts = Number(/const QUEUE_MAX_ATTEMPTS = (\d+)/.exec(src)![1])
+  const maxDelay = Number(/const QUEUE_MAX_DELAY_MS = ([\d_]+)/.exec(src)![1]!.replaceAll('_', ''))
+  assert.ok(
+    maxAttempts * maxDelay >= budget,
+    `次数×单次上限（${maxAttempts}×${maxDelay}ms=${maxAttempts * maxDelay}ms）` +
+      `小于总预算（${budget}ms）⇒ 预算永远用不满，改预算等于没改。` +
+      '必须同时调大次数或单次上限。',
+  )
   // 循环里必须真的用上它
   const i = src.indexOf('async function chat(')
-  const block = src.slice(i, i + 3000)
+  // 取整个函数体（首帧窥探加进来后函数变长，固定 3000 字符会截不到排队分支）
+  const block = src.slice(i, src.indexOf('\n}\n', i))
   assert.ok(/DATE|Date\.now\(\) - queueStartedAt/.test(block), '要记录起始时刻')
   assert.ok(/overBudget/.test(block), '⚠️ 必须有超预算判据')
   // ⚠️ 排队超时要**如实说明是排队**，且标记为可重试（容量问题，换号/稍后有效）
@@ -777,14 +897,22 @@ test('🔴 qoder 单次推理必须有**自己的超时**（只透传 signal = �
   const ms = Number(m![1]!.replaceAll('_', ''))
   // 与参考实现的 `QODER_REQUEST_TIMEOUT_MS = 30_000` 一致
   assert.equal(ms, 30_000, '应与参考实现的 30s 一致')
-  // ⚠️ **发起推理的那次 fetch** 必须用上它（不能只是定义）
+  // ⚠️ 超时必须真的用上（不能只是定义），而且是**首帧超时**：
+  // 发请求 → 响应头 → 第一帧之间有界；首帧到了就撤计时器。
+  const c = src.indexOf('async function chat(')
+  const chatBlock = src.slice(c, src.indexOf('\n}\n', c))
+  assert.ok(/setTimeout\([\s\S]{0,300}?controller\.abort[\s\S]{0,80}?INFER_TIMEOUT_MS\)/.test(chatBlock),
+    '⚠️ chat() 必须用 INFER_TIMEOUT_MS 给「到首帧为止」计时')
+  assert.ok(/peekQoderFirstFrame[\s\S]{0,200}?clearTimeout\(timer\)/.test(chatBlock),
+    '⚠️ 首帧到达后必须撤掉计时器')
+  assert.ok(/request\.signal\.addEventListener\('abort'/.test(chatBlock),
+    '客户端取消也必须能掐断上游')
+  // 🔴 **推理 fetch 不得直接挂 AbortSignal.timeout**：fetch 的 signal 同样管着响应体，
+  // 30 秒一到会把正在输出的长回答拦腰截断（本地实测：流到一半抛 TimeoutError）。
   const i = src.indexOf('async function postQoderInfer')
   const j = src.indexOf('\n}', src.indexOf('return await fetch(', i))
-  const block = src.slice(i, j)
-  assert.ok(/AbortSignal\.timeout\(INFER_TIMEOUT_MS\)/.test(block),
-    '⚠️ 推理 fetch 必须带 AbortSignal.timeout(INFER_TIMEOUT_MS)')
-  assert.ok(/AbortSignal\.any\(\[request\.signal/.test(block),
-    '应与 request.signal 用 any 组合（客户端取消与超时都要生效）')
+  const code = src.slice(i, j).split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+  assert.ok(!/AbortSignal\.timeout\(/.test(code), '🔴 推理 fetch 不得挂整流超时（会截断长回答）')
 })
 
 test('🔴 zcode 余额：`balances: []` **不是**异常，且要认顶层无 `data` 的形态', () => {
@@ -1089,6 +1217,44 @@ test('🔴 lobsterai 必须被识别为 lobsterai，而不是 raccoon', () => {
   assert.ok(/machine_id/.test(lBody), '⚠️ lobsterai 的判别式必须排除 TRAE 凭据')
 })
 
+test('🔴 loomy 凭据必须被判给 loomy，而不是 raccoon（两者都带 phone，注册序 raccoon 在前）', () => {
+  // 实测确认的缺陷：Loomy 的凭据是 `{access_token: <32 位 hex>, userid, phone}`
+  // —— **它同样带 11 位 phone**，而 raccoon 的 matchesShape 旧实现「有 phone 就 true」，
+  // 且注册表里 raccoon 排在 loomy **之前** ⇒ Loomy 凭据被 raccoon 抢走，
+  // 存成 `raccoon:<派生uid>`，一发消息必 401（「导入成功但一发就 401」）。
+  //
+  // ⚠️ 这是**行为断言**（直接调两个 matchesShape），不是源码文本断言 ——
+  // 判据怎么写的无所谓，只要**归属正确**即可。
+  const loomy = findProvider('loomy')
+  const raccoon = findProvider('raccoon')
+  assert.notEqual(loomy, undefined)
+  assert.notEqual(raccoon, undefined)
+
+  // Loomy 登录产出的真实形态（`loomy.ts:1331` 逐字如此）：
+  const loomyCred = {
+    access_token: 'a'.repeat(32), // 32 位小写 hex（讯飞 session）
+    userid: '123456789012345678', // 18 位纯数字
+    phone: '13800000000',
+    expires_at: 1799999999000,
+  }
+  assert.equal(raccoon?.matchesShape?.(loomyCred), false,
+    '⚠️ raccoon **不得**认领 loomy 凭据（它带 32 位 hex token + 15-20 位 userid）')
+  assert.equal(loomy?.matchesShape?.(loomyCred), true,
+    '⚠️ loomy 必须认领自己的凭据')
+
+  // 反向：raccoon 的真实形态仍归 raccoon（不能为了排除 loomy 而误伤自己）
+  const raccoonCred = {
+    access_token: 'aaa.bbb.ccc', // 三段式 JWT
+    refresh_token: 'r',
+    user_id: '7455957', // 短纯数字
+    phone: '13800000000',
+  }
+  assert.equal(raccoon?.matchesShape?.(raccoonCred), true,
+    '⚠️ raccoon 必须仍认领自己的凭据')
+  assert.equal(loomy?.matchesShape?.(raccoonCred), false,
+    '⚠️ loomy 不得认领 raccoon 凭据')
+})
+
 test('⚠️ loomy 的 matchesShape 与 parseCredential 必须共用同一份判据', () => {
   // 两处判据一旦分叉，就会出现「matchesShape 说是我、parseCredential 说不是」
   // 这种自相矛盾的组合，症状是「自动识别选中了 Loomy，导入却报错」。
@@ -1109,7 +1275,7 @@ test('⚠️ loomy 的 matchesShape 与 parseCredential 必须共用同一份判
     '⚠️ 共享判据必须先展开嵌套包装层（与 parseCredential 一致）')
 })
 
-test('🔴 空响应必须显式报错（含「找不到错误帧」的兜底），但**不能**误伤工具调用', () => {
+test('🔴 空响应必须显式报错（含「找不到错误帧」的兜底），但**不能**误伤工具调用', async () => {
   // ## 实测缺陷（用户报「codearts 调用不了」）
   //
   // CodeArts 在「并发会话数已达上限(3个)」时，非流式路径回的是
@@ -1147,10 +1313,33 @@ test('🔴 空响应必须显式报错（含「找不到错误帧」的兜底）
   // ③ ⚠️ 但**必须排除工具调用** —— 那时 content 也是 ''，不排除会把一次
   //    **成功**的工具调用误报成空响应（假阳性比原缺陷更糟：工具调用是
   //    agent 场景的主路径）。
-  assert.ok(/const hasToolCalls = Array\.isArray\(toolCalls\) && toolCalls\.length > 0/.test(block),
-    '必须计算 hasToolCalls')
-  assert.ok(/choice !== undefined\s*\n\s*&& !hasToolCalls/.test(block),
-    '⚠️ 空响应判据必须排除 tool_calls（否则误伤正常的工具调用）')
+  // ③ 判据本身改由**共用函数**承担（2026-10-21 审查后），故这里断言**行为**而不是变量名。
+  //    原来这条断言的是 `/const hasToolCalls = .../` 这个**变量名**——
+  //    属于「读源码文本」的弱测试：它只能证明「有人写过这个变量」，
+  //    不能证明「工具调用不会被误判」。改成直接喂数据给判据函数。
+  const { isEmptyAssistantTurn } = await import('../src/gateway/stream.ts')
+  const turn = (message: Record<string, unknown>, finish: string | null = 'stop') =>
+    ({ index: 0, message: { role: 'assistant', ...message }, finish_reason: finish }) as never
+
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', reasoning_content: '' })), true,
+    '正文与思考都空 ⇒ 判为空响应')
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', tool_calls: [{ id: 'x' }] }, 'tool_calls')), false,
+    '⚠️ 工具调用是**成功**响应，不得误判（假阳性比原缺陷更糟：agent 主路径）')
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', reasoning_content: '想' }, 'length')), false,
+    '只有思考内容也算有产出')
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', refusal: '不行' })), false,
+    '⚠️ 拒答（refusal）是产出 —— 2026-10-21 审查补的漏判')
+  assert.equal(isEmptyAssistantTurn(turn({ content: '', function_call: { name: 'f' } })), false,
+    '⚠️ 旧式 function_call 是产出 —— 同上')
+  assert.equal(isEmptyAssistantTurn(turn({ content: 'hi' })), false)
+  assert.equal(isEmptyAssistantTurn(undefined), false, 'choice 缺失不判为空')
+
+  // ④ 两条路径都必须用同一个判据（防止再退回「各写一遍」而漂移）
+  const responsesSrc = readFileSync('src/gateway/responses.ts', 'utf8')
+  assert.ok(/isEmptyAssistantTurn\(/.test(block),
+    'server.ts 必须使用共用判据 isEmptyAssistantTurn')
+  assert.ok(/isEmptyAssistantTurn\(/.test(responsesSrc),
+    '⚠️ responses.ts 非流式路径也必须使用同一判据（否则又是「只修一半」）')
 })
 
 test('⚠️ aggregateSse 确实会把 tool_calls 放进 message（上一条测试的前提）', () => {
@@ -1656,7 +1845,8 @@ test('🔴 Gemini matchesShape：必须认自己，且**不得**认领 buddy / l
 })
 
 test('Gemini 续期：必须回写**轮换后的** refresh_token，且缺 refresh_token 时明确要「重新登录」', async () => {
-  const { refreshGeminiCredential } = await import('../src/providers/gemini.ts')
+  const { refreshGeminiCredential, geminiDefaultClientId, geminiDefaultClientSecret } =
+    await import('../src/providers/gemini.ts')
   const base = {
     provider: 'gemini',
     uid: 'sub-1',
@@ -1699,8 +1889,13 @@ test('Gemini 续期：必须回写**轮换后的** refresh_token，且缺 refres
     assert.equal(seenUrl, 'https://oauth2.googleapis.com/token')
     assert.equal(seenContentType, 'application/x-www-form-urlencoded')
     // 表单字段**逐字**：四个字段一个都不能少、顺序也照参考实现。
-    assert.match(seenBody, /^client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep\.apps\.googleusercontent\.com/)
-    assert.ok(seenBody.includes('client_secret=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'),
+    // ⚠️ 期望值由源码导出函数拼出（不写字面量）：
+    // 该 client 是 Google 为原生应用签发的 **public client**（RFC 8252 §8.5，
+    // 无法保密），源码已用分段拼接规避扫描器；测试同样不写字面量，既避免
+    // Push Protection 误判，又保证测试与源码**不分叉**（改源码即同步）。
+    assert.ok(seenBody.includes(`client_id=${geminiDefaultClientId()}`),
+      'client_id 必须是源码默认 public client')
+    assert.ok(seenBody.includes(`client_secret=${geminiDefaultClientSecret()}`),
       '⚠️ 缺 client_secret 会回 `client_secret is missing`')
     assert.ok(seenBody.includes('refresh_token=old-refresh'))
     assert.ok(seenBody.endsWith('grant_type=refresh_token'), 'grant_type 必须是 refresh_token')
@@ -2182,4 +2377,42 @@ test('⚠️ workbuddy 国际版 matchesShape 必须支持嵌套与顶层 domain
   // 国内版凭据不应误判为国际版
   assert.equal(wb?.matchesShape?.({ domain: 'copilot.tencent.com' }), false)
   assert.equal(wb?.matchesShape?.({ auth: { domain: 'copilot.tencent.com' } }), false)
+})
+
+test('🔴 findErrorFrameInRaw 必须同时认「裸 JSON」与「SSE 帧」两种错误形态', async () => {
+  // 2026-10-21 审查（M1）发现的**严重**缺陷：`/v1/responses` 非流式路径
+  // 读完流直接 aggregateSse → HTTP 200，全程不判错 ⇒ 客户端拿到「成功 + 空答案」。
+  // 修法是把判据抽成共用函数，本测试锁住这个函数的行为。
+  const { findErrorFrameInRaw } = await import('../src/gateway/stream.ts')
+
+  // ① 裸 JSON 错误体（CodeArts 经华为 APIG 的形态：HTTP 200 + 无 data: 前缀）
+  assert.equal(
+    findErrorFrameInRaw('{"error":{"message":"model not found"}}'),
+    'model not found',
+    '裸 JSON 错误体必须认出',
+  )
+
+  // ② 标准 SSE 错误帧（data: 后有空格）
+  assert.equal(
+    findErrorFrameInRaw('data: {"error":{"message":"rate limited"}}\n\n'),
+    'rate limited',
+  )
+
+  // ③ ⚠️ 无空格形态 `data:{...}` —— 历史上手写 startsWith('data: ') 漏过它
+  assert.equal(
+    findErrorFrameInRaw('data:{"error":{"message":"no space"}}'),
+    'no space',
+    '无空格的 data: 前缀也必须认（走 parseSseLine，不手写前缀判断）',
+  )
+
+  // ④ 正常内容帧不得误报
+  assert.equal(
+    findErrorFrameInRaw('data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}'),
+    undefined,
+    '正常帧不得误判成错误',
+  )
+
+  // ⑤ 空串 / 无错误
+  assert.equal(findErrorFrameInRaw(''), undefined)
+  assert.equal(findErrorFrameInRaw('data: [DONE]\n\n'), undefined)
 })

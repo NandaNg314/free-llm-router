@@ -292,11 +292,20 @@ async function loadCapabilities(): Promise<readonly OpencodeModelCapability[]> {
       // 缓存读失败不影响功能（会退回兜底表）。
     }
   }
-  // 🔴 冷启动必须**主动拉一次**：内存空 + 缓存未命中时原实现直接返回空数组，
-  // 而 `refreshCapabilities()` 只被内部 stale 分支调用 ⇒ 能力表永远不会被拉取。
-  // 症状：`contextWindow` 恒为兜底值、`isFree` 恒为 false（面板上免费标不出来）。
-  // ⚠️ 这里**等它完成**（调用方需要能力表才能渲染正确目录）；
-  // ⚠️ 拉取失败不抛错（`refreshCapabilities` 自身吞异常），退回兜底表。
+  // ## 🔴 冷启动必须**主动拉一次**（这是本文件此前的一个真缺陷）
+  //
+  // ⚠️ 实测（2026-10-11）：内存空 + 缓存未命中时，原实现**直接返回空数组**，
+  // 而 `refreshCapabilities()` **只被自己内部的 stale 分支调用** ——
+  // **没有任何外部调用点** ⇒ 能力表**永远不会被拉取**。
+  //
+  // 症状：opencode 的 `contextWindow` 恒为兜底表的 262144（models.dev 里
+  // 明明是 1048576）、`maxOutput` 恒为 0、`capability.isFree` 恒为 false
+  // ⇒ 面板上「免费」标不出来（用户报「OpenCode 有的不显示」）。
+  //
+  // ⚠️ 这里**等它完成**（而不是 `void` 后台跑）：调用方需要能力表才能
+  // 渲染正确的目录，先返回空表会让用户看到**错的**上下文窗口。
+  // ⚠️ 拉取失败**不抛错**：目录不是主流程，退回兜底表即可
+  //（`refreshCapabilities` 自身吞异常，这里只等它）。
   await refreshCapabilities()
   return capabilityMemory
 }
@@ -758,7 +767,7 @@ async function listModels(_credential: ProviderCredential, _signal: AbortSignal)
       // （参考实现 `opencode-adapter.ts` 的 `inputModalitiesOf` 同款约定）。
       // 本轮**不**拉取能力表时也没有本地兜底 —— 故这里如实给 false。
       supportsImage: capability?.supportsImage === true,
-      // ## 🔴 两个「免费」含义不同，这里取**并集**
+      // ## 🔴 两个「免费」含义不同，这里取**并集**（用户报「OpenCode 有的不显示」）
       //
       // | 来源 | 含义 |
       // |---|---|
@@ -766,10 +775,14 @@ async function listModels(_credential: ProviderCredential, _signal: AbortSignal)
       // | `models.dev` 的 `capability.isFree` | `cost.input===0 && cost.output===0`，**真实定价免费** |
       //
       // ⚠️ 实测矛盾：`mimo-v2.6-flash-free` / `big-pickle` 在 models.dev 里
-      // cost 全 0（真免费），但兜底表给 `isFree: false`（不能匿名用，但定价确实是 0）
-      // ⇒ 面板上「免费」标不出来。
-      // ⇒ 取并集：任一来源说是免费就是免费（任一为真都意味着「调它不花钱」）。
-      // ⚠️ 不要只取 models.dev：能力表是异步拉取的，拿不到时会全 false。
+      // **cost 全 0（真免费）**，但兜底表给 `isFree: false`
+      //（它们不能匿名用，但**定价确实是 0**）⇒ 面板显示空白。
+      //
+      // ⇒ 取并集：**任一来源说是免费，就是免费**。两者都是「对用户有价值的事实」，
+      // 任一为真都意味着「调它不花钱」，而面板那列回答的正是这个问题。
+      //
+      // ⚠️ 不要只取 models.dev：能力表是**异步拉取**的，拿不到时会全 false
+      //（见上方 supportsImage 的保守回退），那时会把真免费的说成计费。
       isFree: m.isFree || capability?.isFree === true,
     }
   })
@@ -793,13 +806,88 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
   // ⚠️ 参考实现会在这里挂 undici 的 per-request `dispatcher`（`proxy`）。
   // Workers **没有 undici 的 Dispatcher**，`fetch` 也没有任何 per-request
   // 代理开关 ⇒ 这条能力整体丢弃。后果见文件头「必须丢掉的一件事」。
-  const res = await fetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    signal: request.signal,
-  })
-  return res
+  //
+  // ⚠️ 必须走 {@link withFirstFrameTimeout}：**不能**把 `request.signal` 直接交给
+  // `fetch`（那个信号只在客户端断开时触发 ⇒ 上游不响应时请求无限挂起）。
+  return withFirstFrameTimeout('OpenCode', request.signal, (signal) =>
+    fetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal,
+    }),
+  )
+}
+
+/**
+ * 「发出请求 → 收到响应头」的预算（毫秒）。超时即中止，交给网关换号。
+ *
+ * 与 `buddy.ts` 的同名常量、`qoder.ts` 的 `INFER_TIMEOUT_MS` 同一口径。
+ */
+const FIRST_FRAME_TIMEOUT_MS = 120_000
+
+/**
+ * 在「首帧超时」守卫下发起请求，返回上游响应。
+ *
+ * ## 为什么需要它（缺陷）
+ *
+ * 原先 `chat()` 把 `request.signal` **直接**交给 `fetch`，而那个信号只在
+ * **客户端断开**时触发 ⇒ 上游「接了连接但永不回响应头」（黑洞 / 半开连接 /
+ * 网关侧卡死）时，这条请求会**一直挂着**：用户看到「一直转圈」，而网关这边
+ * 既不换号也不报错。`buddy.chat` 早已用 `AbortController + setTimeout` 修过
+ * 同一形态，本家（以及 cline / minimax / trae）漏了。
+ *
+ * ## 为什么计时器必须「拿到响应头就撤掉」
+ *
+ * ⚠️ **不能**改成把 `AbortSignal.timeout()` 直接挂在 `fetch` 上：那个信号
+ * **同样管着响应体**，会把超过阈值的**长回答拦腰截断**（`qoder.ts:1305` 有
+ * 本地实测记录）。故这里用 `AbortController` + `setTimeout`，且在
+ * `finally` 里 `clearTimeout` —— 只覆盖「到响应头」这一段。
+ *
+ * ## 为什么超时抛**普通 `Error`** 而不是 `ProviderError`
+ *
+ * 本家的 `chat()` **从不抛 `ProviderError`**（非 2xx 原样 `return`，由网关的
+ * `!upstream.ok` 分支分类）。超时若包成 `ProviderError`，网关会先问
+ * `provider.shouldRotate(0, …)` —— 本家的 `classifyOpencodeError(0, …)` 归
+ * `transport`，而 `shouldRotateForKind('transport')` 是 **false** ⇒ 判成
+ * 「不换号」，可恢复的超时变成终态失败。
+ * 抛普通 `Error` 则走网关的**传输层失败**分支：**换号**且**不惩罚账号**，
+ * 正是这里要的语义（上游不响应不是某个账号的错）。
+ *
+ * ## 客户端取消
+ *
+ * 客户端信号仍然**穿透**到上游（组合信号），且成功路径**保留**监听 ——
+ * 用户点停止时上游流照样被掐断。
+ */
+function withFirstFrameTimeout(
+  label: string,
+  clientSignal: AbortSignal,
+  send: (signal: AbortSignal) => Promise<Response>,
+): Promise<Response> {
+  const controller = new AbortController()
+  const onClientAbort = (): void => controller.abort(clientSignal.reason)
+  if (clientSignal.aborted) controller.abort(clientSignal.reason)
+  else clientSignal.addEventListener('abort', onClientAbort, { once: true })
+  const timer = setTimeout(() => {
+    const timeout = new Error(
+      `${label} 首帧超时：${Math.round(FIRST_FRAME_TIMEOUT_MS / 1000)} 秒内没有收到响应头`
+      + '（上游不响应或连接半开，已中止本次请求）。',
+    )
+    timeout.name = 'TimeoutError'
+    controller.abort(timeout)
+  }, FIRST_FRAME_TIMEOUT_MS)
+  let gotResponse = false
+  return send(controller.signal)
+    .then((response) => {
+      gotResponse = true
+      return response
+    })
+    .finally(() => {
+      // 计时器只管到「拿到响应头」；拿到就撤，否则会掐断正在进行的流。
+      clearTimeout(timer)
+      // 失败路径摘掉客户端监听；成功路径保留（客户端中途取消仍要能掐断上游）。
+      if (!gotResponse) clientSignal.removeEventListener('abort', onClientAbort)
+    })
 }
 
 export const opencodeProvider: Provider = {

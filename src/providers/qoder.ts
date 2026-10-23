@@ -18,9 +18,10 @@
  *    只认通用名（`qwen-flash`），目录 key 一律 `Unsupported model`。
  *    两者**不是同一个 host**，混用 404。
  *    ⇒ 本适配器只走加密端点（`src/qoder-product.ts:188-207`）。
- * 2. **模型列表恒用静态表**：远端 `GET /algo/api/v2/model/list` 需 **WASM 签名**，
- *    属只读目录能力却要付密码学代价；参考实现因此**不发网络请求**
- *    （`AGENTS.md` 的 Qoder 章节第 3 条）。本适配器照做。
+ * 2. **模型列表优先拉远端目录**：`GET /algo/api/v2/model/list` 需 COSY 签名 ——
+ *    早先因此恒用静态表（`AGENTS.md` 的 Qoder 章节第 3 条），但静态表的倍率会过期。
+ *    现把 WASM 为推理生成的签名**改签**到目录路径（{@link resignQoderHeaders}），
+ *    拉取失败才回退静态表。
  * 3. **登录是 PKCE 设备码轮询**（不起本地监听端口），故 Workers 可行；
  *    但轮询的 **HTTP 404 表示「用户尚未完成授权」**，必须继续轮询而不是报错
  *    （`deepseek-harness-codearts/src/qoder-oauth.ts:107-118` 的实测依据：
@@ -42,11 +43,12 @@
  *   `Cosy-MachineToken` / `Cosy-MachineType`。Workers **无 `child_process`**
  *   （`AGENTS.md §2.5` 第 4 条）。故这两个值改为凭据 `extras` 里的两个字符串。
  *   ⚠️ **后果必须知道**（`src/qoder-machine.ts:33-59`）：缺这两个头时
- *   `/sash/api/v1/me/campaigns` 只回 **1 条 `VIEW_DETAILS`、`claimable:false`**，
+ *   **国际版**的 `/sash/api/v1/me/campaigns` 只回 **1 条 `VIEW_DETAILS`、`claimable:false`**，
  *   于是「今天已领」与「服务端没下发可领项」在响应上**无法区分** ——
  *   参考实现因此把「未领取」误报成「今天已领」（用户报障）。
- *   本适配器**刻意不复制该行为**：缺 machine 头时 `checkin()` **抛错**
- *   说明缺什么，而不是返回 `alreadyDone:true`（见 {@link checkin}）。
+ *   本适配器**刻意不复制该行为**：没有可领项时 `checkin()` **抛错**
+ *   说明原因，而不是返回 `alreadyDone:true`（见 {@link checkin}）。
+ *   **中国版不需要**这两个头（不带反而正常下发，见 {@link QoderProduct.checkinRequiresMachine}）。
  */
 
 import { ProviderError } from './types.js'
@@ -58,7 +60,8 @@ import type {
   ProviderCredential,
   ProviderModel,
 } from './types.js'
-import { prepareQoderInfer, type QoderInferMessage, type QoderInferTool } from './qoder-wasm.js'
+import { md5Hex } from './md5.js'
+import { prepareQoderInfer, resetQoderWasm, type QoderInferMessage, type QoderInferTool } from './qoder-wasm.js'
 
 // ─────────────────────────── 产品配置 ───────────────────────────
 
@@ -79,6 +82,37 @@ export interface QoderFallbackModel {
   contextWindow: number
   supportsImage?: boolean
   supportsThinking?: boolean
+  /**
+   * 可选思考档位（远端 `thinking_config.enabled.efforts` 的**键名**）。
+   *
+   * ## 三个必须记住的口径（照抄参考实现 qoder-product.ts 的实测结论）
+   *
+   * 1. **取键名不取值**：目录形如 `efforts: { xhigh:{}, low:{}, medium:{is_default:true} }`，
+   *    键即档位 id；按**目录原始顺序**保存（官方客户端也按对象键序渲染）。
+   * 2. **`is_default` 是「默认选中」不是「多选」**：IDE 里是下拉单选。
+   * 3. **「关闭思考」不塞进这个数组** —— 它由 {@link supportsDisable} 单独表达
+   *   （客户端会自己追加 `none`）。这里手动塞 `none` 会造成语义重复。
+   *
+   * ⚠️ 档位必须在客户端白名单内（`none/low/medium/high/xhigh/max`），
+   * 不在的会被**静默丢弃**。
+   */
+  efforts?: readonly string[]
+  /**
+   * 默认思考档位（目录 `efforts.<key>.is_default === true` 的那一项）。
+   *
+   * ⚠️ **必须落在 {@link efforts} 内**，否则客户端会拿一个不存在的档位发请求
+   *（本项目已有 `11150`「reasoning_effort 该模型不支持」的上游报错记录）。
+   * 无 `is_default` 时不设，让上游自行决定。
+   */
+  defaultEffort?: string
+  /**
+   * 是否提供「关闭思考」（目录 `thinking_config.disabled` 分支存在即 true）。
+   *
+   * ⚠️ 与 {@link efforts} **相互独立**，不能用一个标志表达：实测 CN 的
+   * `qmodel`/`qmodel_latest` 没有档位但能关闭；而 `gfmodel`/`gmodel` 等
+   * 有档位却不能关闭。
+   */
+  supportsDisable?: boolean
   isFree?: boolean
   /** 计费倍率（目录 `price_factor`）。**0 是合法值（免费）**，不能当缺失。 */
   priceFactor?: number
@@ -91,6 +125,10 @@ export interface QoderFallbackModel {
  * （`QODER_FALLBACK_MODELS`，逐条对照本机 `~/.qoder/.models/{uid}/catalog-v6`）。
  * ⚠️ **不要凭印象改数值** —— 国际版曾因「手工估值 + 单测只断言 id 列表」
  * 让 14 个模型的价格长期漂移未被发现（用户报障）。
+ *
+ * ⚠️ **运行时优先用远端目录**（{@link fetchQoderModelCatalog}），这张表只在
+ * 远端拉取失败时兜底。`qmodel_38max` / `qmodel_latest` / `qmodel` 三项的倍率
+ * 按 shuishuipingan/qoder2api-hub 的最新目录快照（0.5 / 0.5 / 0.1）校正过。
  */
 export const QODER_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
   { id: 'auto', name: 'Auto', contextWindow: 200_000, supportsImage: true, priceFactor: 0.5 },
@@ -100,17 +138,17 @@ export const QODER_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
   { id: 'smodel', name: 'Sonus', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 8 },
   { id: 'cmodel', name: 'Cantus', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 4 },
   // 免费额度模型（`is_free`）：e2e 探针默认用它们以免消耗积分。
-  { id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0.2 },
+  { id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0.5, efforts: ['xhigh', 'low', 'medium'], defaultEffort: 'xhigh', supportsDisable: true },
   // ⚠️ `priceFactor: 0` 是**免费**（实测），不是缺失。
-  { id: 'qfmodel', name: 'Qwen3.8-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0 },
-  { id: 'qmodel_latest', name: 'Qwen3.7-Max', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.1 },
-  { id: 'qmodel', name: 'Qwen3.7-Plus', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.04 },
-  { id: 'kmodel_latest', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImage: true, priceFactor: 1.4 },
-  { id: 'kmodel', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.8 },
-  { id: 'gmodel', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8 },
-  { id: 'gfmodel', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
-  { id: 'dmodel', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5 },
-  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
+  { id: 'qfmodel', name: 'Qwen3.8-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0, efforts: ['xhigh', 'low', 'medium'], defaultEffort: 'medium', supportsDisable: true },
+  { id: 'qmodel_latest', name: 'Qwen3.7-Max', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.5 },
+  { id: 'qmodel', name: 'Qwen3.7-Plus', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.1 },
+  { id: 'kmodel_latest', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImage: true, priceFactor: 1.4, efforts: ['high', 'low', 'max'], defaultEffort: 'max' },
+  { id: 'kmodel', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.8, efforts: ['high', 'low', 'max'], defaultEffort: 'max' },
+  { id: 'gmodel', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8, efforts: ['high', 'low', 'max'], defaultEffort: 'max' },
+  { id: 'gfmodel', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ['high', 'max'], defaultEffort: 'max' },
+  { id: 'dmodel', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5, efforts: ['high', 'max'], defaultEffort: 'max', supportsDisable: true },
+  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ['high', 'max', 'low'], defaultEffort: 'max', supportsDisable: true },
   { id: 'mmodel', name: 'MiniMax-M3', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.2 },
 ]
 
@@ -125,18 +163,26 @@ export const QODER_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
  * - CN **没有** `ultimate` / `performance` / `efficient` / `smodel` / `cmodel`
  *   —— 沿用会让菜单出现 5 个 CN 端点根本不认的模型，点了就报错；
  * - `mmodel` 在 CN 是 **MiniMax-M2.7**（国际版 M3），且档位表**只有 200K 一档**。
+ *
+ * ⚠️ 同国际版：**运行时优先用远端目录**，这张表只兜底；三项 Qwen 倍率已按
+ * shuishuipingan/qoder2api-hub 的最新 CN 目录快照校正。
  */
 export const QODER_CN_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
   { id: 'auto', name: 'Auto', contextWindow: 200_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5 },
-  { id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0.2 },
+  { id: 'qmodel_38max', name: 'Qwen3.8-Max', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0.5 },
   { id: 'qfmodel', name: 'Qwen3.8-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, isFree: true, priceFactor: 0 },
-  { id: 'qmodel_latest', name: 'Qwen3.7-Max', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
-  { id: 'qmodel', name: 'Qwen3.7-Plus', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.04 },
+  { id: 'qmodel_latest', name: 'Qwen3.7-Max', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5 },
+  { id: 'qmodel', name: 'Qwen3.7-Plus', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
   // CN 独有：Qwen3.7-Flash（国际版目录无此 key）。
   { id: 'q37fmodel', name: 'Qwen3.7-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
   // ⚠️ CN 的 `max_input_tokens` 是 96000，但档位表有 1M 档 → 填 1M（口径见 `contextWindow`）。
   { id: 'dmodel', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.5 },
-  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, priceFactor: 0.1 },
+  // ⚠️ CN 目录原本这三项全缺（`supportsThinking`/`efforts`/`defaultEffort`），
+  // 导致 `/v1/models` 里该模型既不能报档位、客户端也选不了思考强度。
+  // 2026-10-21 实测 reasoning_tokens 单调分层：
+  //   low=206 / high=436 / max=736 / **不传=1212**
+  // 「不传」比 low 多 5.9 倍 —— 上游默认走最重思考，必须显式声明档位。
+  { id: 'dfmodel', name: 'DeepSeek-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ['low', 'high', 'max'], defaultEffort: 'high', supportsDisable: true },
   { id: 'gmodel', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.8 },
   { id: 'gfmodel', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImage: true, supportsThinking: true, priceFactor: 0.1 },
   // CN 独有：GLM-5.2（国际版目录无此 key）。
@@ -188,6 +234,17 @@ export interface QoderProduct {
    * （`src/qoder-product.ts:244-274` 的对照表：`'5'` → 空活动、`'10'` → 1 条）。
    */
   sashClientType: string
+  /**
+   * 每日签到是否**必须**带真实设备身份头（`Cosy-MachineToken` + `Cosy-MachineType`）。
+   *
+   * - **国际版 `true`**：不带 → 服务端不下发 `CLAIM_BENEFIT`（本文件 {@link checkin} 的消融表；
+   *   Zhengyuuuui/qoder2api `checkin.go:73-88`、L0NE-6/Qoder-Daily 同结论）。
+   * - **中国版 `false`**：完全不带指纹头 → **正常下发**；带**自造/过期**的
+   *   machineToken 反而**不下发**（Zhengyuuuui/qoder2api `checkin.go:76-79` 单变量对照；
+   *   shuishuipingan/qoder2api-hub 同结论：派生假头会让每日领取活动被过滤）。
+   *   故 CN 缺头时照常签到，带头却没拿到可领项时再**不带头重试一次**。
+   */
+  checkinRequiresMachine: boolean
   userAgentPrefix: string
   fallbackModels: readonly QoderFallbackModel[]
 }
@@ -220,6 +277,7 @@ export function buildQoderProduct(variant: 'qoder' | 'qodercn'): QoderProduct {
         scene: 'assistant',
       },
       sashClientType: '10',
+      checkinRequiresMachine: false,
       userAgentPrefix: 'qoder',
       fallbackModels: QODER_CN_FALLBACK_MODELS,
     }
@@ -241,6 +299,7 @@ export function buildQoderProduct(variant: 'qoder' | 'qodercn'): QoderProduct {
       scene: 'assistant',
     },
     sashClientType: '10',
+    checkinRequiresMachine: true,
     userAgentPrefix: 'qoder',
     fallbackModels: QODER_FALLBACK_MODELS,
   }
@@ -252,6 +311,8 @@ export function buildQoderProduct(variant: 'qoder' | 'qodercn'): QoderProduct {
 const EXTRA_MACHINE_ID = 'machineId'
 const EXTRA_MACHINE_TOKEN = 'machineToken'
 const EXTRA_MACHINE_TYPE = 'machineType'
+/** 可选的第三件（`Cosy-MachineCode`），runtime-info 输出里与 token/type 同出。 */
+const EXTRA_MACHINE_CODE = 'machineCode'
 
 /** 宽容读取：接受嵌套（`{credential:{…}}` / `{data:{…}}`）与扁平两种形态。 */
 function unwrapCredential(input: unknown): Record<string, unknown> {
@@ -369,12 +430,17 @@ export function parseCredential(input: unknown): ProviderCredential {
   const nickname = readString(source, ['nickname', 'user_name', 'userName', 'name'])
     ?? (jwt === undefined ? undefined : readString(jwt, ['name', 'nickname']))
 
-  /** extras 是兜底口袋；机器头是**用户提供的配置**（Workers 无 child_process）。 */
+  /**
+   * extras 是兜底口袋；机器头是**用户提供的配置**（Workers 无 child_process）。
+   * 只有国际版签到必需；中国版不需要（见 `checkinRequiresMachine`）。
+   */
   const extras: Record<string, string> = { [EXTRA_MACHINE_ID]: machineId }
   const machineToken = readString(source, ['machineToken', 'machine_token', 'cosyMachineToken'])
   const machineType = readString(source, ['machineType', 'machine_type', 'cosyMachineType'])
   if (machineToken !== undefined) extras[EXTRA_MACHINE_TOKEN] = machineToken
   if (machineType !== undefined) extras[EXTRA_MACHINE_TYPE] = machineType
+  const machineCode = readString(source, ['machineCode', 'machine_code', 'cosyMachineCode'])
+  if (machineCode !== undefined) extras[EXTRA_MACHINE_CODE] = machineCode
 
   return {
     provider: 'qoder',
@@ -389,7 +455,17 @@ export function parseCredential(input: unknown): ProviderCredential {
 
 // ─────────────────────────── 模型目录 ───────────────────────────
 
-/** 兜底表 → 统一形状。 */
+/**
+ * 兜底表 / 远端目录 → 统一形状。
+ *
+ * ## `isFree` 的口径：**只认倍率 0**
+ *
+ * ⚠️ 目录的 `is_free` **不等于「不扣费」**：它标的是「免费额度模型」
+ *（Qwen3.8-Max 的 `is_free=true`，但 `price_factor=0.5`，照样按 0.5 扣）。
+ * 面板与 `/v1/models` 把 `isFree` 渲染成「免费」—— 直接透传会让用户以为
+ * Qwen3.8-Max 不花钱。故：有倍率时**以倍率为准**（0 才是免费），
+ * 只有缺倍率时才退回 `is_free`。
+ */
 export function toProviderModels(models: readonly QoderFallbackModel[]): ProviderModel[] {
   return models.map((m) => ({
     id: m.id,
@@ -400,8 +476,267 @@ export function toProviderModels(models: readonly QoderFallbackModel[]): Provide
     // 错误的输出预算（与 `workbuddy.ts:97-99` 同款纪律）。
     maxOutput: 0,
     supportsImage: m.supportsImage === true,
-    isFree: m.isFree === true,
+    isFree: m.priceFactor === undefined ? m.isFree === true : m.priceFactor === 0,
+    // ⚠️ **必须透传倍率**：面板「资费」列与 `/v1/models` 的名称都靠它显示
+    //（早先漏传，面板里 Qoder 一律显示「—」、客户端看不到倍率）。
+    ...(m.priceFactor === undefined ? {} : { priceFactor: m.priceFactor }),
+    // ⚠️ **必须透传思考档位**（同款教训：漏传 = 下游一律看不到）。
+    // `/v1/models` 的 `reasoning_efforts` 与面板生成的 DSH `reasoningEfforts`
+    // 都从这三个字段来；漏一个，用户就会看到「这个模型选不了思考强度」。
+    ...(m.efforts === undefined || m.efforts.length === 0 ? {} : { reasoningEfforts: [...m.efforts] }),
+    ...(m.defaultEffort === undefined ? {} : { defaultEffort: m.defaultEffort }),
+    ...(m.supportsDisable === true ? { canDisableThinking: true } : {}),
   }))
+}
+
+/** 远端模型目录的签名路径（签名时去掉 `/algo` 前缀，见 {@link resignQoderHeaders}）。 */
+const QODER_MODEL_LIST_PATH = '/api/v2/model/list'
+/** 远端目录缓存时长：目录变化很慢，但倍率有错峰促销，10 分钟足够跟上。 */
+/**
+ * 客户端接受的思考档位白名单（官方 asar 常量 `Qj`）。
+ *
+ * ⚠️ 不在白名单内的档位会被客户端**静默丢弃**，表现为「设了没生效」。
+ * 另有别名 `disabled`/`off` → `none`，但那是由客户端处理的，这里不重复。
+ */
+const EFFORT_WHITELIST = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+
+const QODER_CATALOG_TTL_MS = 10 * 60_000
+/** 拉目录的单次超时（只读接口，不该拖慢 `/v1/models`）。 */
+const QODER_CATALOG_TIMEOUT_MS = 15_000
+
+/** 每个变体（`qoder` / `qodercn`）一份的目录缓存。 */
+const qoderCatalogCache = new Map<string, { at: number; models: QoderFallbackModel[] }>()
+
+/** 测试用：清空目录缓存。 */
+export function resetQoderCatalogCache(): void {
+  qoderCatalogCache.clear()
+}
+
+/** 大小写不敏感地找头名（WASM 给的是 `Authorization` / `Cosy-Key` 这种首字母大写形态）。 */
+function findHeaderName(headers: Record<string, string>, name: string): string | undefined {
+  const lower = name.toLowerCase()
+  return Object.keys(headers).find((k) => k.toLowerCase() === lower)
+}
+
+/**
+ * 把 WASM 为推理请求生成的 COSY 签名**改签到另一个路径 / body**。
+ *
+ * ## 为什么能这样做（本地实测）
+ *
+ * `Authorization: Bearer COSY.<载荷>.<签名>` 里的签名是
+ *
+ * ```
+ * md5hex(载荷 + "\n" + Cosy-Key + "\n" + Cosy-Date + "\n" + body + "\n" + 路径（去掉 /algo）)
+ * ```
+ *
+ * —— 用这条公式对 WASM 的推理请求重算，结果与 WASM 输出**逐字节一致**；
+ * 再用它给 `GET /algo/api/v2/model/list`（body 为空串）改签，网关**通过签名校验**
+ *（假令牌实测：改签后回 `105 Login expired`，不改签回 `101 Signature invalid`）。
+ * 公式与 Zhengyuuuui/qoder2api 的 `cosy.SignRequest`、shuishuipingan/qoder2api-hub
+ * 的 `qoder_sign.py` 一致（只参考了公式，未复制代码）。
+ *
+ * ⚠️ 只改签名，**载荷原样保留**：载荷里是 WASM 加密的用户信息，我们没有、也不需要密钥。
+ */
+export function resignQoderHeaders(
+  headers: Record<string, string>,
+  signPath: string,
+  body: string,
+): Record<string, string> {
+  const authName = findHeaderName(headers, 'Authorization')
+  const keyName = findHeaderName(headers, 'Cosy-Key')
+  const dateName = findHeaderName(headers, 'Cosy-Date')
+  const auth = authName === undefined ? undefined : headers[authName]
+  const match = auth === undefined ? null : /^Bearer\s+COSY\.([^.\s]+)\.[0-9a-fA-F]+$/.exec(auth)
+  if (authName === undefined || keyName === undefined || dateName === undefined || match === null) {
+    throw new Error('WASM 返回的请求头里没有可识别的 COSY 签名')
+  }
+  const payload = match[1] ?? ''
+  const path = signPath.startsWith('/algo/') ? signPath.slice('/algo'.length) : signPath
+  const material = [payload, headers[keyName] ?? '', headers[dateName] ?? '', body, path].join('\n')
+  const signature = md5Hex(new TextEncoder().encode(material))
+  return { ...headers, [authName]: `Bearer COSY.${payload}.${signature}` }
+}
+
+/**
+ * 非聊天模型（补全 / 代码检索 / 生图）—— 不能出现在 `/v1/models` 里。
+ *
+ * 判据来自 shuishuipingan/qoder2api-hub 对远端目录的过滤口径：远端 `chat`
+ * 场景里偶尔混入这些内部模型，点了只会报错。
+ */
+export function isNonChatQoderModel(key: string): boolean {
+  const k = key.toLowerCase()
+  return k === 'lite'
+    || k.startsWith('codewise-')
+    || k.startsWith('completion-')
+    || k.endsWith('-image-alpha')
+    || k.endsWith('-image-alpha-edit')
+    || k.endsWith('-taco-completion')
+}
+
+/**
+ * 解析远端 `GET /algo/api/v2/model/list` 的响应。
+ *
+ * 响应形如 `{chat:[{key, display_name, enable, price_factor, is_free, is_vl,
+ * is_reasoning, max_input_tokens, context_config:{"1M":{token_count}}, …}], …}`。
+ *
+ * - 上下文取 `context_config` 的**最大档**（与静态表同一口径，见
+ *   {@link QoderFallbackModel.contextWindow}），没有档位表才用 `max_input_tokens`；
+ * - `price_factor` 是**拉取时刻的生效价**（含错峰促销），0 = 免费；
+ * - `enable:false` 是「当前账号套餐不可用」（国际版免费号只有两个 Qwen 可用），
+ *   **过滤掉**以免列出点了就报错的模型；若过滤后为空（目录口径异常）则全保留。
+ */
+export function parseQoderModelCatalog(raw: unknown): QoderFallbackModel[] {
+  const root = typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : {}
+  const list = Array.isArray(root.chat) ? root.chat : []
+  const enabled: QoderFallbackModel[] = []
+  const all: QoderFallbackModel[] = []
+  const seen = new Set<string>()
+  for (const item of list) {
+    if (typeof item !== 'object' || item === null) continue
+    const entry = item as Record<string, unknown>
+    const key = typeof entry.key === 'string' ? entry.key.trim() : ''
+    if (key === '' || seen.has(key) || isNonChatQoderModel(key)) continue
+    seen.add(key)
+
+    let contextWindow = 0
+    const tiers = entry.context_config
+    if (typeof tiers === 'object' && tiers !== null) {
+      for (const tier of Object.values(tiers as Record<string, unknown>)) {
+        const count = typeof tier === 'object' && tier !== null
+          ? (tier as Record<string, unknown>).token_count
+          : undefined
+        if (typeof count === 'number' && Number.isFinite(count) && count > contextWindow) contextWindow = count
+      }
+    }
+    if (contextWindow === 0 && typeof entry.max_input_tokens === 'number' && entry.max_input_tokens > 0) {
+      contextWindow = entry.max_input_tokens
+    }
+
+    const price = entry.price_factor
+    const priceFactor = typeof price === 'number' && Number.isFinite(price) && price >= 0 ? price : undefined
+    const displayName = typeof entry.display_name === 'string' && entry.display_name.trim() !== ''
+      ? entry.display_name.trim()
+      : key
+    // 思考档位：远端 `thinking_config.enabled.efforts` 的**键名**即档位 id。
+    //
+    // ⚠️ 取键不取值（值是 `{}` 或 `{is_default:true}`）；且必须过滤到客户端白名单内，
+    // 不在白名单的档位会被**静默丢弃**（等于没生效）。
+    // ⚠️ 「关闭思考」**不**塞进 efforts —— 它由 supportsDisable 单独表达，
+    // 客户端自己会追加 `none`；这里塞会造成语义重复。
+    const thinkingConfig = typeof entry.thinking_config === 'object' && entry.thinking_config !== null
+      ? entry.thinking_config as Record<string, unknown>
+      : undefined
+    const enabledBranch = thinkingConfig !== undefined && typeof thinkingConfig.enabled === 'object' && thinkingConfig.enabled !== null
+      ? thinkingConfig.enabled as Record<string, unknown>
+      : undefined
+    const rawEfforts = enabledBranch !== undefined && typeof enabledBranch.efforts === 'object' && enabledBranch.efforts !== null
+      ? enabledBranch.efforts as Record<string, unknown>
+      : undefined
+    const efforts: string[] = []
+    let defaultEffort: string | undefined
+    if (rawEfforts !== undefined) {
+      for (const [effortKey, meta] of Object.entries(rawEfforts)) {
+        const id = effortKey.trim().toLowerCase()
+        if (!EFFORT_WHITELIST.has(id) || efforts.includes(id)) continue
+        efforts.push(id)
+        // `is_default` 是「默认选中」，取第一个命中的即可。
+        if (defaultEffort === undefined && typeof meta === 'object' && meta !== null
+          && (meta as Record<string, unknown>).is_default === true) {
+          defaultEffort = id
+        }
+      }
+    }
+    // 默认档位必须落在 efforts 内（否则客户端会发一个不存在的档位）。
+    if (defaultEffort !== undefined && !efforts.includes(defaultEffort)) defaultEffort = undefined
+
+    const model: QoderFallbackModel = {
+      id: key,
+      name: displayName,
+      contextWindow,
+      supportsImage: entry.is_vl === true,
+      supportsThinking: entry.is_reasoning === true,
+      ...(entry.is_free === true ? { isFree: true } : {}),
+      ...(priceFactor === undefined ? {} : { priceFactor }),
+      ...(efforts.length === 0 ? {} : { efforts }),
+      ...(defaultEffort === undefined ? {} : { defaultEffort }),
+      // 目录存在 `thinking_config.disabled` 分支 ⇒ 可关闭思考（与 efforts 独立）。
+      ...(thinkingConfig !== undefined && thinkingConfig.disabled !== undefined ? { supportsDisable: true } : {}),
+    }
+    all.push(model)
+    if (entry.enable !== false) enabled.push(model)
+  }
+  return enabled.length > 0 ? enabled : all
+}
+
+/**
+ * 用账号凭据拉远端模型目录（带 10 分钟缓存）。
+ *
+ * ## 请求形态
+ *
+ * `GET {encryptedInferBase}/algo/api/v2/model/list?Encode=1`，头部取 WASM 为推理
+ * 生成的那一套（`Cosy-*` 设备 / 版本 / 用户头 + COSY 签名），再
+ * {@link resignQoderHeaders 改签}到目录路径、body 为空串。
+ *
+ * ⚠️ hub 版说要带 `qoder_encode("{}")` 作 body 发 GET —— 但 `fetch` 规范禁止 GET
+ * 带 body；空 body 的签名实测同样通过校验（Zhengyuuuui 版也是空 body）。
+ */
+export async function fetchQoderModelCatalog(
+  product: QoderProduct,
+  credential: ProviderCredential,
+  signal?: AbortSignal,
+): Promise<QoderFallbackModel[]> {
+  const cached = qoderCatalogCache.get(product.id)
+  if (cached !== undefined && Date.now() - cached.at < QODER_CATALOG_TTL_MS) return cached.models
+
+  const prepared = await prepareQoderInfer({
+    user: { uid: credential.uid, securityOauthToken: credential.accessToken },
+    machineId: credential.extras[EXTRA_MACHINE_ID] ?? credential.uid,
+    metadata: { ...product.clientMetadata },
+    host: product.encryptedInferBase,
+    ask: { modelKey: 'auto', userText: '', history: [], tools: [] },
+  })
+  const headers = resignQoderHeaders(prepared.headers, QODER_MODEL_LIST_PATH, '')
+  for (const name of ['Accept', 'X-Model-Key', 'X-Model-Source', 'Cache-Control', 'Connection']) {
+    const found = findHeaderName(headers, name)
+    if (found !== undefined) delete headers[found]
+  }
+  headers.Accept = 'application/json'
+
+  const timeout = AbortSignal.timeout(QODER_CATALOG_TIMEOUT_MS)
+  const response = await fetch(`${product.encryptedInferBase}/algo${QODER_MODEL_LIST_PATH}?Encode=1`, {
+    method: 'GET',
+    headers,
+    signal: signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
+  })
+  const text = await response.text()
+  if (!response.ok) {
+    throw new ProviderError({
+      provider: product.id,
+      httpStatus: response.status,
+      message: `Qoder 模型目录拉取失败：http=${response.status} ${text.slice(0, 200)}`,
+    })
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new ProviderError({ provider: product.id, message: `Qoder 模型目录不是 JSON：${text.slice(0, 200)}` })
+  }
+  const models = parseQoderModelCatalog(parsed)
+  if (models.length === 0) {
+    throw new ProviderError({ provider: product.id, message: 'Qoder 模型目录为空' })
+  }
+  qoderCatalogCache.set(product.id, { at: Date.now(), models })
+  return models
+}
+
+/**
+ * 查模型元数据（推理请求要带 `isReasoning` / `isVl` / 上下文等）：
+ * **远端目录缓存优先**，没有再查静态表 —— 远端新上的模型也能拿到正确元数据。
+ */
+function findQoderModel(product: QoderProduct, id: string): QoderFallbackModel | undefined {
+  return qoderCatalogCache.get(product.id)?.models.find((m) => m.id === id)
+    ?? product.fallbackModels.find((m) => m.id === id)
 }
 
 // ─────────────────────────── Anthropic 无关：推理链路 ───────────────────────────
@@ -660,9 +995,39 @@ export function parseQoderQueueError(value: unknown, depth = 0): { retryAfterMs?
 export function looksLikeQoderBillingError(value: unknown): boolean {
   if (typeof value === 'string') {
     const lower = value.toLowerCase()
-    return lower.includes('billing daily count exceeded')
+    if (
+      lower.includes('billing daily count exceeded')
       || lower.includes('daily count exceeded')
       || lower.includes('billing_error')
+    ) return true
+    /**
+     * 🔴 **字符串分支必须也能认出 JSON 里的 110**（2026-10-21 审查补，M3 指出）。
+     *
+     * ## 缺陷
+     * 上游的 `message` 常常是**被序列化过的 JSON 字符串**，且文案会被本地化
+     * （实测中文 `"今日调用次数已达上限"` 之类）。原来的字符串分支只匹配三个
+     * **英文**关键词 ⇒ 中文文案**一个都不命中** ⇒ 这个 110 专用分支**永远走不到**，
+     * 于是本该「如实上报、不重试」的 110 退化成通用 5xx/未知错误。
+     *
+     * 分类（`refineModelScoped` 认业务码）仍然对，但**文案降级**：
+     * 用户看到的是上游那句原始错误，而不是我们解析出的「这是日次数上限、不是余额耗尽」。
+     *
+     * ## 两层补救
+     * 1. 字符串本身是 JSON ⇒ 解析后递归（code 字段就能被对象分支认出来）；
+     * 2. 直接按文本找 `"code":110` —— 覆盖「JSON 里又套了一层字符串」的脏形态。
+     *
+     * ⚠️ 递归必须**可终止**：`JSON.parse` 的结果与原文相同（如纯数字）时不再递归。
+     */
+    const trimmed = value.trim()
+    if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed)
+        if (parsed !== value) return looksLikeQoderBillingError(parsed)
+      } catch {
+        // 不是合法 JSON：走下面的文本兜底
+      }
+    }
+    return /"code"\s*:\s*"?110"?/.test(value)
   }
   if (typeof value !== 'object' || value === null) return false
   const record = value as Record<string, unknown>
@@ -745,6 +1110,13 @@ export function unwrapQoderEnvelopeStream(
                 type: 'model_error',
               })}\n\n`),
             )
+            // ⚠️ 带业务码的错误帧之后**上游不关流**（实测挂到超时）—— 主动收尾，
+            // 让客户端立刻拿到错误，而不是干等。没有业务码的帧照旧继续读。
+            if (code !== undefined && String(code) !== '0' && String(code) !== '200') {
+              buffer = ''
+              controller.terminate()
+              return
+            }
             continue
           }
           controller.enqueue(encoder.encode(`data: ${inner}\n\n`))
@@ -777,10 +1149,17 @@ export function unwrapQoderEnvelopeStream(
  * 请求挂住几分钟，而 Worker 最终会被平台掐断（实测报
  * `Network connection lost.` 且耗时 122s）。
  */
-const QUEUE_MAX_DELAY_MS = 10_000
+const QUEUE_MAX_DELAY_MS = 20_000
 
-/** 排队重试的次数上限。 */
-const QUEUE_MAX_ATTEMPTS = 3
+/**
+ * 排队重试的次数上限。
+ *
+ * ⚠️ 必须与 `QUEUE_MAX_DELAY_MS` / `QUEUE_TOTAL_BUDGET_MS` **联合看**：
+ * 三者共同决定「最多能等多久」。若次数太小（3 × 10s = 30s），
+ * 60 秒总预算就永远用不满 ⇒ 用户在排队挤时被过早放弃。
+ * 现取值：4 × 20s = 80s > 预算 60s ⇒ **由预算先触发**，语义正确。
+ */
+const QUEUE_MAX_ATTEMPTS = 4
 
 /**
  * 排队的**总墙钟预算**（毫秒）—— 所有重试与等待加起来不得超过它。
@@ -805,7 +1184,21 @@ const QUEUE_MAX_ATTEMPTS = 3
  * 又远低于平台会掐断的量级。超出预算时**如实报「排队太挤」**，
  * 让客户端稍后重试 —— 那比挂到被平台掐断（无可读原因）好得多。
  */
-const QUEUE_TOTAL_BUDGET_MS = 45_000
+const QUEUE_TOTAL_BUDGET_MS = 60_000
+
+/**
+ * ## 为什么是 60 秒（用户 2026-10-21 明确要求）
+ *
+ * 原值 45 秒，理由是「实测常见排队 20–25s」。但用户的实际要求是
+ * **「等 60 秒，还不行才停」** —— 宁可多等 15 秒也别过早放弃，
+ * 因为排队挤的时候放弃意味着这次请求白费。
+ *
+ * ⚠️ **光改这个常量不够**（我第一版就差点只改这一处）：
+ * 次数上限 `QUEUE_MAX_ATTEMPTS=3` × 单次上限 `QUEUE_MAX_DELAY_MS=10s`
+ * = 最多只能等 ~30 秒 ⇒ **60 秒预算永远用不满**，形同虚设。
+ * 故三处必须一起改：预算 60s / 单次 20s / 次数 4 ⇒ 上限 80s > 预算 60s，
+ * 预算才是真正的约束（由它先触发）。
+ */
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -830,6 +1223,7 @@ async function postQoderInfer(
   product: QoderProduct,
   credential: ProviderCredential,
   request: ChatRequest,
+  signal: AbortSignal,
 ): Promise<Response> {
   const body = request.body as Record<string, unknown>
   const messages = Array.isArray(body.messages) ? (body.messages as Array<Record<string, unknown>>) : []
@@ -841,13 +1235,34 @@ async function postQoderInfer(
   const userText = qoderContentText(lastUser?.content)
   const systemText = qoderContentText(lastUser === undefined ? '' : body.system ?? body.system_prompt)
 
-  const model = product.fallbackModels.find((m) => m.id === request.model)
+  const model = findQoderModel(product, request.model)
   const maxTokens = typeof body.max_tokens === 'number' && Number.isSafeInteger(body.max_tokens) && body.max_tokens > 0
     ? body.max_tokens
     : undefined
-  const reasoningEffort = typeof body.reasoning_effort === 'string' && body.reasoning_effort.length > 0
+  // ⚠️ **客户端没给档位时，用目录里的默认档位补上**（`defaultEffort`）。
+  //
+  // ## 为什么必须补
+  //
+  // 不传 `reasoning_effort` 并不等于「上游用中性默认值」—— 实测同一个问题
+  //（`qodercn/dfmodel`，"解释递归"）的 reasoning_tokens：
+  //
+  // | 请求 | reasoning_tokens |
+  // |---|---|
+  // | 不传档位 | **1417** |
+  // | `low`    | 247 |
+  // | `max`    | 728 |
+  //
+  // 不传时的思考量**比显式 `max` 还多 2 倍**，即上游默认走的是「最重思考」。
+  // 客户端（如 DSH）只在用户**主动选**档位时才带该字段，于是「没选」= 被动
+  // 接受最贵的档位，既慢又费积分。
+  //
+  // 口径：目录给了 `defaultEffort` 就用它（那是上游自己声明的默认档）；
+  // 目录没给则保持 `undefined`（= 不干预，与改动前一致）。
+  const clientEffort = typeof body.reasoning_effort === 'string' && body.reasoning_effort.length > 0
     ? body.reasoning_effort
     : undefined
+  const catalogDefaultEffort = findQoderModel(product, request.model)?.defaultEffort
+  const reasoningEffort = clientEffort ?? catalogDefaultEffort
 
   const prepared = await prepareQoderInfer({
     user: { uid: credential.uid, securityOauthToken: credential.accessToken },
@@ -885,13 +1300,135 @@ async function postQoderInfer(
     method: 'POST',
     headers: prepared.headers,
     body: prepared.body,
-    // ⚠️ **必须带超时** —— 只透传 `request.signal` 等于「永不超时」，
-    // 一次挂住就会让上层所有预算（排队总预算等）失效。
-    // 两者用 `any` 组合：客户端取消与超时都要生效。
-    signal: request.signal.aborted
-      ? request.signal
-      : AbortSignal.any([request.signal, AbortSignal.timeout(INFER_TIMEOUT_MS)]),
+    // ⚠️ 超时由调用方的 `signal` 承担（见 `chat()` 的「首帧超时」说明）——
+    // **不能**在这里挂 `AbortSignal.timeout`：fetch 的 signal 同样管着响应体，
+    // 30 秒一到会把**正在输出**的长回答拦腰截断（本地实测：流到一半抛 TimeoutError）。
+    signal,
   })
+}
+
+/** {@link peekQoderFirstFrame} 的结果。 */
+export type QoderFirstFrame =
+  | { kind: 'stream'; stream: ReadableStream<Uint8Array> }
+  | { kind: 'error'; status: number; text: string }
+
+/**
+ * 读到第一个有意义的 `data:` 帧，判断上游是「开始输出」还是「HTTP 200 包着的错误」。
+ *
+ * ## 为什么必须在 provider 层做（本地实测）
+ *
+ * 加密端点**鉴权失败也回 HTTP 200**，错误装在第一帧的信封里：
+ *
+ * ```
+ * data:{"headers":{…},"body":"{\"code\":\"105\",\"message\":\"Login expired\"}","statusCodeValue":403,…}
+ * ```
+ *
+ * 而且发完这一帧**上游不关流**（实测一直挂到超时）。若原样交给网关：
+ * ① 网关只会把它当普通错误帧，**不会触发续期**（续期只认 ProviderError / 401）；
+ * ② 若错误出现在流中途，客户端要一直等到超时。
+ * 故这里先窥探首帧：错误 → 取消上游、交回错误文本（由 `chat()` 走排队 / 额度 /
+ * 续期分支）；正常 → 把已读字节原样接回流的开头，一个字节不丢。
+ */
+export async function peekQoderFirstFrame(body: ReadableStream<Uint8Array>): Promise<QoderFirstFrame> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  const prefix: Uint8Array[] = []
+  let prefixBytes = 0
+  let text = ''
+  let scanned = 0
+
+  const replay = (ended: boolean): ReadableStream<Uint8Array> => {
+    let index = 0
+    return new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (index < prefix.length) {
+          controller.enqueue(prefix[index++]!)
+          return
+        }
+        if (ended) {
+          controller.close()
+          return
+        }
+        const { done, value } = await reader.read()
+        if (done) controller.close()
+        else controller.enqueue(value)
+      },
+      cancel(reason) {
+        return reader.cancel(reason)
+      },
+    })
+  }
+
+  /** 把一段 JSON 文本判成「错误」时的结果；不是错误返回 undefined。 */
+  const asError = (payload: string): { status: number; text: string } | undefined => {
+    let status = 200
+    let inner = unwrapQoderEnvelopePayload(payload)
+    if (inner !== null) {
+      try {
+        const envelope = JSON.parse(payload) as { statusCodeValue?: unknown }
+        if (typeof envelope.statusCodeValue === 'number') status = envelope.statusCodeValue
+      } catch {
+        // unwrap 已经解析成功过，这里不会失败
+      }
+    } else {
+      inner = payload
+    }
+    if (inner.includes('"choices"') || inner.includes('[DONE]')) return undefined
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(inner)
+    } catch {
+      return undefined
+    }
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const record = parsed as Record<string, unknown>
+    // ⚠️ 只有**带业务码或 error 字段**的才算错误帧 —— 其它不认识的帧照常放行，
+    // 交给下游的信封整流器处理（宁可放行，也不误杀正常输出）。
+    if (record.code === undefined && record.error === undefined) return undefined
+    return { status, text: inner }
+  }
+
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) {
+      const rest = text.slice(scanned).trim()
+      const payload = rest.startsWith('data:') ? rest.slice(5).trim() : rest
+      const error = payload.startsWith('{') ? asError(payload) : undefined
+      if (error !== undefined) return { kind: 'error', ...error }
+      return { kind: 'stream', stream: replay(true) }
+    }
+    prefix.push(value)
+    prefixBytes += value.byteLength
+    text += decoder.decode(value, { stream: true })
+
+    for (;;) {
+      const newline = text.indexOf('\n', scanned)
+      if (newline === -1) break
+      const line = text.slice(scanned, newline).replace(/\r$/, '').trim()
+      scanned = newline + 1
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (payload === '') continue
+      const error = asError(payload)
+      if (error === undefined) return { kind: 'stream', stream: replay(false) }
+      // 错误帧之后上游不关流 —— 主动取消，免得连接一直挂着。
+      await reader.cancel().catch(() => {})
+      return { kind: 'error', ...error }
+    }
+    // 兜底：64 KiB 还没看到完整 data 帧（不像信封流）—— 不再窥探，原样放行。
+    if (prefixBytes > 64 * 1024) return { kind: 'stream', stream: replay(false) }
+  }
+}
+
+/** 是否「登录态失效」（业务码 105 / `Login expired`）—— 续期即可恢复。 */
+export function looksLikeQoderLoginExpired(text: string): boolean {
+  try {
+    const parsed = JSON.parse(text) as { code?: unknown }
+    if (parsed.code === '105' || parsed.code === 105) return true
+  } catch {
+    // 不是 JSON —— 走文本判据
+  }
+  return /login expired|token expired|not logged in/i.test(text)
 }
 
 /** 发起对话（返回**已转成 OpenAI SSE** 的响应）。 */
@@ -903,14 +1440,59 @@ async function chat(
   // ⚠️ 记**开始时刻**，用于总预算判据（见 QUEUE_TOTAL_BUDGET_MS 的说明）。
   const queueStartedAt = Date.now()
   for (let attempt = 0; ; attempt += 1) {
-    let response: Response
+    // ## 首帧超时（不是整流超时）
+    //
+    // 超时只覆盖「发请求 → 收到响应头 → 读到第一帧」这一段：首帧到了就撤掉计时器，
+    // 之后的输出只受客户端取消约束。
+    // ⚠️ 早先把 `AbortSignal.timeout(30s)` 直接挂在 fetch 上 —— 它同样管着响应体，
+    // 于是**任何超过 30 秒的回答都会被拦腰截断**（本地实测：流到一半抛 TimeoutError）。
+    const controller = new AbortController()
+    const onClientAbort = (): void => controller.abort(request.signal.reason)
+    if (request.signal.aborted) controller.abort(request.signal.reason)
+    else request.signal.addEventListener('abort', onClientAbort, { once: true })
+    const timer = setTimeout(() => {
+      const timeout = new Error(`Qoder first frame timeout after ${INFER_TIMEOUT_MS}ms`)
+      timeout.name = 'TimeoutError'
+      controller.abort(timeout)
+    }, INFER_TIMEOUT_MS)
+    /** 失败路径要把客户端取消的监听也摘掉；成功路径保留（客户端中途取消仍要能掐断上游）。 */
+    const release = (): void => {
+      clearTimeout(timer)
+      request.signal.removeEventListener('abort', onClientAbort)
+    }
+
+    let status: number
+    let text: string
     try {
-      response = await postQoderInfer(product, credential, request)
+      const response = await postQoderInfer(product, credential, request, controller.signal)
+      if (response.ok) {
+        if (response.body === null) {
+          release()
+          throw new ProviderError({ provider: product.id, message: '上游返回 200 但没有响应体' })
+        }
+        const first = await peekQoderFirstFrame(response.body)
+        if (first.kind === 'stream') {
+          clearTimeout(timer)
+          return new Response(unwrapQoderEnvelopeStream(first.stream, product.id), {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+          })
+        }
+        // HTTP 200 包着的错误帧：按信封里的 `statusCodeValue` 当作真实状态码，
+        // 与非 2xx 走**同一套**排队 / 额度 / 续期判据（两条通道必须一致）。
+        status = first.status >= 400 ? first.status : 502
+        text = first.text
+      } else {
+        status = response.status
+        text = await response.text().catch(() => '')
+      }
+      release()
     } catch (error) {
+      release()
+      if (error instanceof ProviderError) throw error
       // ## 🔴 必须把「超时/客户端取消」翻译成**可分类**的错误
       //
-      // 实测缺陷：`postQoderInfer` 的 `AbortSignal.timeout(INFER_TIMEOUT_MS)`
-      // 触发后抛 `TimeoutError`，而**这里没有 catch** ⇒ 它直接穿透到
+      // 实测缺陷：超时触发后抛 `TimeoutError`，若不在这里接住 ⇒ 它直接穿透到
       // Worker 的异常边界 ⇒ 客户端收到 **HTTP 500 `internal_error`**。
       //
       // ⚠️ 那是**错的分类**：单次推理超时说明「上游慢/在排队」，
@@ -926,27 +1508,44 @@ async function chat(
       const message = error instanceof Error ? error.message : String(error)
       // ⚠️ 只有「超时/中止」才归为繁忙；其它传输层错误仍按可重试的网络问题处理。
       const timedOut = /timeout|timed out|abort/i.test(message)
+        || (error instanceof Error && error.name === 'TimeoutError')
+      /**
+       * 🔴 **WASM 签名模块的 panic 必须单独报**（2026-10-22 线上故障）。
+       *
+       * 用户看到的原文是：
+       * ```
+       * 供应商「Qoder (中国版)」请求失败：unknown: Qoder 请求失败：unreachable
+       * ```
+       * 这句 `unreachable` 是 **Rust 的 panic 文本**（wasm 以 `panic=abort` 编译），
+       * 不是网络错误、更不是账号问题 —— 用户因此以为是"号坏了"或"网关坏了"，
+       * 而他自己用官方客户端明明正常。
+       *
+       * 真实成因：WASM 实例是**模块级单例**，内存/栈指针/对象堆全共享，
+       * 并发请求会交错（详见 `qoder-wasm.ts` 的 `withWasmLock` 注释）。
+       * 现在已用互斥锁串行化；这条文案负责在**万一还发生**时说清是引擎问题。
+       */
+      const wasmPanic = /^unreachable$/i.test(message.trim())
+        || /unreachable/i.test(message)
+      /**
+       * ⚠️ 检出 wasm 层错误就**丢弃实例**（自愈）。见 `resetQoderWasm` 的说明：
+       * 单例若已损坏，不重置的话**之后每条请求都会撞同一个坏实例**，
+       * 表现为「一直失败、重试无用，只能重启进程」。
+       */
+      if (wasmPanic) resetQoderWasm()
       throw new ProviderError({
         provider: product.id,
         retryable: true,
         message: timedOut
-          ? `Qoder 单次请求超过 ${Math.round(INFER_TIMEOUT_MS / 1000)} 秒未返回`
+          ? `Qoder 单次请求超过 ${Math.round(INFER_TIMEOUT_MS / 1000)} 秒没有返回首帧`
             + `（上游繁忙或排队）。请稍后重试 —— 这是上游问题，不是账号或配置问题。`
-          : `Qoder 请求失败：${message}`,
+          : wasmPanic
+            ? 'Qoder 的**签名模块**执行失败（Rust WASM panic: unreachable）。'
+              + '这不是账号、凭据或上游的问题 —— 你的账号是正常的（官方客户端可用）。'
+              + '成因是签名用的 WASM 实例被并发请求交错复用；已加互斥锁串行化，'
+              + '若仍出现请重试一次。'
+            : `Qoder 请求失败：${message}`,
       })
     }
-
-    if (response.ok) {
-      if (response.body === null) {
-        throw new ProviderError({ provider: product.id, message: '上游返回 200 但没有响应体' })
-      }
-      return new Response(unwrapQoderEnvelopeStream(response.body, product.id), {
-        status: 200,
-        headers: { 'content-type': 'text/event-stream; charset=utf-8' },
-      })
-    }
-
-    const text = await response.text().catch(() => '')
 
     // ── 排队（业务码 10605，可能藏在两层 message 里）→ 按服务端延迟等待后重试 ──
     // ⚠️ **不能用顶层 `code` 当门禁**：第三次回归时顶层是 403、10605 在 message 里。
@@ -959,13 +1558,46 @@ async function chat(
         // ⚠️ 如实说明「是排队太挤」，而不是把它伪装成失败 ——
         // 用户据此知道「稍后重试有用」，而不是「我的账号/配置有问题」。
         // ⚠️ `retryable: true`：排队是**容量**问题，换号或稍后重试确实有效。
+        /**
+         * 🔴 **`httpStatus` 必须改写成 503，不能沿用上游的 403**（2026-10-21 实测）。
+         *
+         * ## 真实故障链（从 `[waf-403]` 日志抓到原文）
+         *
+         * 上游排队码 `10605` 常随 **HTTP 403** 返回。这里抛出 `ProviderError` 时
+         * 沿用了 `httpStatus: status`（= 403），于是网关侧：
+         *   1. `classify(403, 这段中文文案)` —— 文案不是 JSON 信封；
+         *   2. `parseEnvelope` 返回 `undefined`；
+         *   3. `isWafBlocked(403, ...)` 命中 ⇒ **`waf_blocked`**；
+         *   4. 处置 = `punish: true, dimension: 'soft'` ⇒ **罚账号 + 冷却 60 秒**。
+         *
+         * 而真相是「上游排队挤」——账号完全健康。单账号池下这等于整条链路断 60 秒，
+         * 用户看到的就是「API 密钥无效 / 本轮运行失败」这类误导性报错。
+         *
+         * ## 为什么是 503
+         * 503 = 服务暂时不可用，语义上正是「上游容量/排队」。它不会被判成 WAF
+         *（WAF 判据写死 `403`），也不会落进 4xx 的参数错误分支。
+         * `retryable: true` 保持 —— 排队换号或稍后重试确实有效。
+         */
         throw new ProviderError({
           provider: product.id,
-          httpStatus: response.status,
+          httpStatus: 503,
           retryable: true,
+          // ⚠️ **报文里必须带业务码 `{"code":10605}`**（2026-10-21 审查补，M3 指出）。
+          //
+          // 网关的 `classify()` 只能从**文本**里解析业务码。原来这段纯中文文案
+          // 里没有任何码 ⇒ 503 落进 5xx 分支 ⇒ `server` ⇒ **breaker**
+          // ⇒ 3 次熔断健康号 30 分钟（比原先的「WAF 误判罚 60 秒」更重）。
+          //
+          // 现在带上 `{"code":10605}` 后：`classify` 走 5xx 分支里的
+          // 「已知业务码优先」路径 ⇒ `rate_limited`（且 10605 已被
+          // `refineModelScoped` 纳入模型级）⇒ 只冷却该模型，不再熔断账号。
+          //
+          // 把码直接写进对用户可见的文案里是**有意的**：它让「上游到底说了什么」
+          // 可被直接看到，省得排查时再猜。
           message:
             `Qoder 服务繁忙：排队等待已超过 ${Math.round(QUEUE_TOTAL_BUDGET_MS / 1000)} 秒`
             + `（已尝试 ${attempt + 1} 次，实际等待 ${Math.round(spent / 1000)} 秒）。`
+            + `上游业务码：{"code":${QODER_QUEUE_CODE}}。`
             + '请稍后重试 —— 这是上游排队，不是账号或配置问题。',
         })
       }
@@ -976,34 +1608,81 @@ async function chat(
       continue
     }
 
-    // ── 额度用尽（业务码 110）→ **不可重试**，如实上报 ──
+    // ── 业务码 110（`Billing daily count exceeded`）→ 如实上报 ──
+    //
+    // ## 🔴 这里原先把 110 写成「当日额度已用尽」，**是错的**（2026-10-21 实测纠正）
+    //
+    // 用户是专业版会员，明确表示「不可能用尽」。实测 `/admin/accounts/balance`
+    // 直连上游拿到的 **`credits: 4565`（充足）**，而坐实了 110 的真实语义：
+    // 上游原文是 `Billing daily count exceeded` —— 关键词是 **count（次数）**，
+    // 不是 credits（额度）。**这不是余额耗尽。**
+    //
+    // ## 更严重的一次错误连锁（必须记住）
+    // 我一度把 `110` 加进全局 `CODE_KIND` → `credit_exhausted`，
+    // 而 `credit_exhausted` 的处置是 `dimension: 'hard'` ⇒ **硬冷却到次日 04:00**。
+    // 于是「一个语义未明的码」直接让账号被锁 **619 分钟（10.3 小时）**，
+    // 而账号其实完全健康。**把不确定的码映射到最重的处置，代价远大于收益。**
+    // ⇒ 已回滚：110 不再进全局码表（保持 `punish: false`，不冷却账号）。
+    //
+    // ## 现在的处置
+    // `retryable: false`：日次数上限按自然日重置，短重试无意义。
+    // 文案**如实引用上游原文**，不再替上游下「额度用尽」的结论 ——
+    // 用户看到 `Billing daily count exceeded` 才能自己去判断/申诉。
     if (looksLikeQoderBillingError(text)) {
       throw new ProviderError({
         provider: product.id,
-        httpStatus: response.status,
-        // ⚠️ `retryable: false`：额度按自然日结算，重试与换号都无意义；
-        // 标记应为「UTC+8 当日 24:00 解禁」（由账号池负责，不在本层）。
+        httpStatus: status,
         retryable: false,
-        message: `Qoder 当日额度已用尽（${response.status}）：${text.slice(0, 300)}`,
+        message:
+          `Qoder 返回业务码 110（${status}）：${text.slice(0, 300)}`
+          + '\n⚠️ 这不是「余额耗尽」（实测该账号 credits 仍有数千），'
+          + '上游原文是「Billing daily count exceeded」，更像是**日调用次数**上限。',
+      })
+    }
+
+    // ── 登录态失效（业务码 105）→ 报 401，网关据此**自动续期并重放一次** ──
+    // ⚠️ 文案里必须保留 `Login expired`：网关的 `isAuthLikeFailure` 按 `expired` 认续期。
+    if (looksLikeQoderLoginExpired(text)) {
+      throw new ProviderError({
+        provider: product.id,
+        httpStatus: 401,
+        retryable: false,
+        message: `Qoder 登录态已过期（Login expired，需要续期）：${text.slice(0, 200)}`,
       })
     }
 
     throw new ProviderError({
       provider: product.id,
-      httpStatus: response.status,
+      httpStatus: status,
       // ⚠️ 429 / 402 值得换号（`types.ts` 的缺省语义）。
-      retryable: response.status === 429 || response.status === 402,
-      message: `Qoder 推理失败：http=${response.status} ${text.slice(0, 300)}`,
+      retryable: status === 429 || status === 402,
+      message: `Qoder 推理失败：http=${status} ${text.slice(0, 300)}`,
     })
   }
 }
 
 // ─────────────────────────── 余额 / 签到（`/sash/` 端点） ───────────────────────────
 
-/** `/sash/` 端点的请求头。 */
-function sashHeaders(product: QoderProduct, credential: ProviderCredential): Record<string, string> {
+/** 凭据里是否带了**成对**的设备身份头。 */
+function hasMachineIdentity(credential: ProviderCredential): boolean {
+  return credential.extras[EXTRA_MACHINE_TOKEN] !== undefined
+    && credential.extras[EXTRA_MACHINE_TYPE] !== undefined
+}
+
+/**
+ * `/sash/` 端点的请求头。
+ *
+ * `useMachine=false` 时**刻意不带**设备身份头（中国版签到的回退路径，见
+ * {@link QoderProduct.checkinRequiresMachine}）。
+ */
+function sashHeaders(
+  product: QoderProduct,
+  credential: ProviderCredential,
+  useMachine = true,
+): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
+    'Accept-Language': 'zh-CN',
     Authorization: `Bearer ${credential.accessToken}`,
     // ⚠️ 桌面 app 身份（`'10'`）；用 CLI 的 `'5'` 时活动列表恒为空。
     'Cosy-ClientType': product.sashClientType,
@@ -1013,9 +1692,11 @@ function sashHeaders(product: QoderProduct, credential: ProviderCredential): Rec
   const token = credential.extras[EXTRA_MACHINE_TOKEN]
   const type = credential.extras[EXTRA_MACHINE_TYPE]
   // ⚠️ **必须成对**出现：只带一个等于没带（实测消融表）。
-  if (token !== undefined && type !== undefined) {
+  if (useMachine && token !== undefined && type !== undefined) {
     headers['Cosy-MachineToken'] = token
     headers['Cosy-MachineType'] = type
+    const code = credential.extras[EXTRA_MACHINE_CODE]
+    if (code !== undefined) headers['Cosy-MachineCode'] = code
   }
   return headers
 }
@@ -1134,27 +1815,43 @@ async function balance(
 /** 一条活动（`campaigns[]` 的一项）。 */
 interface QoderCampaign {
   campaignId: string
+  campaignKey?: string
   actionType?: string
   claimStatus?: string
   amount?: number
 }
 
-/** 解析 `/sash/api/v1/me/campaigns` 的响应。 */
+/**
+ * 解析 `/sash/api/v1/me/campaigns` 的响应。
+ *
+ * 兼容 `{campaigns:[…]}` 与 `{data:{campaigns:[…]}}` 两种外形
+ * （L0NE-6/Qoder-Daily `do_checkin` 同样两种都认）。
+ */
 function parseCampaigns(body: unknown): { claimable: boolean; campaigns: QoderCampaign[] } {
   if (typeof body !== 'object' || body === null) return { claimable: false, campaigns: [] }
-  const record = body as Record<string, unknown>
+  let record = body as Record<string, unknown>
+  if (!Array.isArray(record.campaigns)
+    && typeof record.data === 'object' && record.data !== null
+    && Array.isArray((record.data as Record<string, unknown>).campaigns)) {
+    record = record.data as Record<string, unknown>
+  }
   const raw = Array.isArray(record.campaigns) ? record.campaigns : []
   const campaigns: QoderCampaign[] = []
   for (const item of raw) {
     if (typeof item !== 'object' || item === null) continue
     const entry = item as Record<string, unknown>
-    const campaignId = entry.campaignId ?? entry.campaign_id ?? entry.id
-    if (typeof campaignId !== 'string' || campaignId.length === 0) continue
+    const key = typeof entry.campaignKey === 'string' && entry.campaignKey.length > 0
+      ? entry.campaignKey
+      : undefined
+    const idRaw = entry.campaignId ?? entry.campaign_id ?? entry.id
+    const campaignId = typeof idRaw === 'string' && idRaw.length > 0 ? idRaw : key
+    if (campaignId === undefined) continue
     const benefit = typeof entry.benefit === 'object' && entry.benefit !== null
       ? (entry.benefit as Record<string, unknown>)
       : undefined
     campaigns.push({
       campaignId,
+      ...(key !== undefined ? { campaignKey: key } : {}),
       ...(typeof entry.actionType === 'string' ? { actionType: entry.actionType } : {}),
       ...(typeof entry.claimStatus === 'string' ? { claimStatus: entry.claimStatus } : {}),
       ...(typeof benefit?.amount === 'number' ? { amount: benefit.amount } : {}),
@@ -1166,10 +1863,18 @@ function parseCampaigns(body: unknown): { claimable: boolean; campaigns: QoderCa
 /**
  * 每日签到（领取活动积分）。
  *
- * ## ⚠️ 缺 machine 头时**必须抛错**，不能报「今天已领」
+ * ## 中国版 vs 国际版
+ *
+ * - **中国版（qodercn）**：**不需要** machine 头 —— 不带指纹头正常下发
+ *   `CLAIM_BENEFIT`；带自造/过期 token 反而被过滤（出处见
+ *   {@link QoderProduct.checkinRequiresMachine}）。故缺头时照常签到；
+ *   带头却没拿到可领项时**不带头重试一次**。
+ * - **国际版（qoder）**：必须带真实 machine 头，见下表。
+ *
+ * ## ⚠️ 没有可领项时**必须抛错**，不能报「今天已领」
  *
  * 这是本适配器与参考实现**刻意不同**的一处，理由是那条被记录的真实缺陷
- * （`deepseek-harness-codearts/src/qoder-machine.ts:33-59`）：
+ * （`deepseek-harness-codearts/src/qoder-machine.ts:33-59`，国际版实测）：
  *
  * | 请求头 | `/sash/api/v1/me/campaigns` |
  * |---|---|
@@ -1178,7 +1883,8 @@ function parseCampaigns(body: unknown): { claimable: boolean; campaigns: QoderCa
  *
  * 参考实现把「筛出 0 个可领活动」当成「今天已领」，于是**把
  * 『服务端没下发数据』误报成『今天已领』**（用户报障：插件说已领、官方还能领）。
- * 本适配器改为：**没有 machine 头就不下结论**，抛错说明要配哪两个字段。
+ * 本适配器改为：只有看到 `CLAIMED` 才报已领；国际版缺头时抛错说明要配哪两个字段，
+ * 其余「无可领项」也抛错（调用方对任何返回值都会记「今日已签到」）。
  *
  * ⚠️ 「今天已领」的**正确判据不是「列表为空」** —— 抓包实测领取前后对照
  * （`AGENTS.md` 的「Qoder 每日领取」章节）：领取成功后列表**仍非空**，
@@ -1186,75 +1892,110 @@ function parseCampaigns(body: unknown): { claimable: boolean; campaigns: QoderCa
  * 顶层 `claimable` 变 `false`。
  *
  * ⚠️ 幂等判据是响应体的 `replayed`，**不是 HTTP 状态码**：重复领取同样返回
- * **200**，但 `replayed:true`、**不含 `benefit`**。
+ * **200**，但 `replayed:true`、**不含 `benefit`**（另认 409 / `ALREADY_CLAIMED`）。
+ * 成功判据是 `status === 'CLAIMED'`。
  */
 async function checkin(
   product: QoderProduct,
   credential: ProviderCredential,
   signal: AbortSignal,
 ): Promise<CheckinResult> {
-  const machineToken = credential.extras[EXTRA_MACHINE_TOKEN]
-  const machineType = credential.extras[EXTRA_MACHINE_TYPE]
-  if (machineToken === undefined || machineType === undefined) {
-    throw new ProviderError({
-      provider: product.id,
-      message: 'Qoder 自动签到需要设备身份头 `Cosy-MachineToken` + `Cosy-MachineType`（必须成对）。'
-        + 'Workers 无法运行 Qoder 的 `runtime-info.exe` 生成它们，'
-        + '请在导入凭据时把这两个值一并放进 `machineToken` / `machineType` 字段'
-        + '（可从 Qoder 桌面端的 `machine_token.json` 取：`token` → machineToken、`type` → machineType）。'
-        + '缺这两个头时服务端只下发 1 条 `VIEW_DETAILS`（`claimable:false`），'
-        + '此时「今天已领」与「没有可领项」无法区分 —— 故这里如实报错而不谎报已领',
-    })
-  }
-
-  const timeout = AbortSignal.timeout(20_000)
+  const hasMachine = hasMachineIdentity(credential)
+  const timeout = AbortSignal.timeout(25_000)
   const requestSignal = signal.aborted ? signal : AbortSignal.any([signal, timeout])
 
-  const res = await fetch(`${product.openApiBase}/sash/api/v1/me/campaigns`, {
-    method: 'GET',
-    headers: sashHeaders(product, credential),
-    signal: requestSignal,
-  })
-  if (!res.ok) {
-    throw new ProviderError({
-      provider: product.id,
-      httpStatus: res.status,
-      retryable: res.status === 429,
-      message: `Qoder 活动列表查询失败：http=${res.status}`,
+  const listCampaigns = async (useMachine: boolean): Promise<QoderCampaign[]> => {
+    // `forceRefresh=true`：拉实时列表而不是服务端缓存（L0NE-6/Qoder-Daily `CAMPAIGNS_QUERY`）。
+    const res = await fetch(`${product.openApiBase}/sash/api/v1/me/campaigns?forceRefresh=true`, {
+      method: 'GET',
+      headers: sashHeaders(product, credential, useMachine),
+      signal: requestSignal,
     })
+    if (!res.ok) {
+      const hint = res.status === 401 || res.status === 403 ? '（凭据失效或地区选错，请重新登录）' : ''
+      throw new ProviderError({
+        provider: product.id,
+        httpStatus: res.status,
+        retryable: res.status === 429,
+        message: `Qoder 活动列表查询失败：http=${res.status}${hint}`,
+      })
+    }
+    return parseCampaigns(await res.json().catch(() => undefined)).campaigns
   }
-  const { claimable, campaigns } = parseCampaigns(await res.json())
-
+  const isBenefit = (c: QoderCampaign): boolean => c.actionType === 'CLAIM_BENEFIT'
   // ⚠️ 只领 `actionType === 'CLAIM_BENEFIT' && claimStatus === 'CLAIMABLE'`：
   // 实测还有 `VIEW_DETAILS` 型活动（如「Pro 首月翻倍」），对它发 claim 是错的。
-  const target = campaigns.find(
-    (c) => c.actionType === 'CLAIM_BENEFIT' && c.claimStatus === 'CLAIMABLE',
-  )
-  if (target === undefined) {
-    // 有 `CLAIM_BENEFIT` 但已 `CLAIMED` → 真·今天已领。
-    const claimed = campaigns.find((c) => c.actionType === 'CLAIM_BENEFIT')
-    if (claimed !== undefined) {
-      return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（活动状态为 CLAIMED）' }
+  const findTarget = (list: QoderCampaign[]): QoderCampaign | undefined =>
+    list.find((c) => isBenefit(c) && c.claimStatus === 'CLAIMABLE')
+
+  let useMachine = hasMachine
+  let campaigns = await listCampaigns(useMachine)
+  // ⚠️ 中国版：带了（可能已过期的）machine 头却没拿到 `CLAIM_BENEFIT` →
+  // **不带头再查一次**。CN 不带指纹头本来就正常下发，而过期/自造的 token
+  // 会让服务端过滤掉每日领取活动（见 `checkinRequiresMachine` 的出处）。
+  if (useMachine && !product.checkinRequiresMachine && !campaigns.some(isBenefit)) {
+    const plain = await listCampaigns(false)
+    if (plain.some(isBenefit)) {
+      useMachine = false
+      campaigns = plain
     }
-    // 只有 `VIEW_DETAILS` → 服务端**没有下发可领项**。带齐 machine 头后仍如此，
-    // 才可能是「今天真的没有活动」（活动每日 10:00 UTC+8 刷新）。
-    if (campaigns.length > 0) {
-      return {
-        alreadyDone: true,
-        gained: 0,
-        detail: `Qoder 当前没有可领取的活动（服务端下发 ${campaigns.length} 条，`
-          + '均为 VIEW_DETAILS 型；活动每日 10:00（UTC+8）刷新）',
-      }
-    }
-    return { alreadyDone: true, gained: 0, detail: 'Qoder 活动列表为空，暂无可领积分' }
   }
 
-  // ⚠️ 请求体必须是**空串**（抓包实测 `content-length: 0`）。
+  const target = findTarget(campaigns)
+  if (target === undefined) {
+    // 有 `CLAIM_BENEFIT` 但已 `CLAIMED` → 真·今天已领。
+    if (campaigns.some((c) => isBenefit(c) && c.claimStatus === 'CLAIMED')) {
+      return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（活动状态为 CLAIMED）' }
+    }
+    const listed = campaigns.length === 0
+      ? '活动列表为空'
+      : `服务端下发 ${campaigns.length} 条：${campaigns.map((c) => `${c.actionType ?? '?'}/${c.claimStatus ?? '?'}`).join('、')}`
+    // ⚠️ 国际版缺 machine 头 → 服务端只下发 `VIEW_DETAILS`，此时「今天已领」与
+    // 「没有可领项」**无法区分**，如实报错说明缺什么，绝不谎报已领。
+    if (product.checkinRequiresMachine && !hasMachine) {
+      throw new ProviderError({
+        provider: product.id,
+        message: 'Qoder 国际版自动签到需要设备身份头 `Cosy-MachineToken` + `Cosy-MachineType`（必须成对）。'
+          + '请在导入凭据时把这两个值一并放进 `machineToken` / `machineType`（可选 `machineCode`）字段'
+          + '（取自官方客户端 / qodercli 的 runtime-info 输出，或桌面端的 `machine_token.json`：'
+          + '`token` → machineToken、`type` → machineType）。'
+          + `缺这两个头时服务端不下发可领项（${listed}）`,
+      })
+    }
+    // ⚠️ 不返回 `alreadyDone:true`：调用方会据此记「今日已签到」，
+    // 而这里服务端确实没有给可领项 —— 如实报错，下一轮 cron 再试。
+    throw new ProviderError({
+      provider: product.id,
+      message: `Qoder 当前没有可领取的签到活动（${listed}）。`
+        + '每日活动在 10:00（UTC+8）刷新；若今天已在客户端领过，活动行可能直接消失'
+        + (hasMachine ? '；若导入了 machineToken，它可能已过期，可删除后重试' : ''),
+    })
+  }
+
+  // ⚠️ 请求体必须是**空串**（抓包实测 `content-length: 0`；
+  // Zhengyuuuui/qoder2api `doCheckinRequest` 同样空 body + `origin`）。
   const claimRes = await fetch(
     `${product.openApiBase}/sash/api/v1/me/campaigns/${encodeURIComponent(target.campaignId)}/claim`,
-    { method: 'POST', headers: sashHeaders(product, credential), body: '', signal: requestSignal },
+    {
+      method: 'POST',
+      headers: { ...sashHeaders(product, credential, useMachine), Origin: product.openApiBase },
+      body: '',
+      signal: requestSignal,
+    },
   )
   const text = await claimRes.text().catch(() => '')
+  let parsed: Record<string, unknown> | undefined
+  try {
+    const value: unknown = JSON.parse(text)
+    if (typeof value === 'object' && value !== null) parsed = value as Record<string, unknown>
+  } catch {
+    parsed = undefined
+  }
+  // ⚠️ **幂等判据是 `replayed`，不是状态码**：重复领取也回 200，但
+  // `replayed:true`、不含 `benefit`。另认 409 / `ALREADY_CLAIMED`（L0NE-6/Qoder-Daily）。
+  if (claimRes.status === 409 || parsed?.result === 'ALREADY_CLAIMED' || parsed?.replayed === true) {
+    return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（服务端回已领取/replayed）' }
+  }
   if (!claimRes.ok) {
     throw new ProviderError({
       provider: product.id,
@@ -1263,28 +2004,28 @@ async function checkin(
       message: `Qoder 领取失败：http=${claimRes.status} ${text.slice(0, 200)}`,
     })
   }
-  let replayed = false
-  let gained = target.amount ?? 0
-  let message: string | undefined
-  try {
-    const parsed = JSON.parse(text) as { replayed?: unknown; benefit?: { amount?: unknown }; message?: unknown }
-    // ⚠️ **幂等判据是 `replayed`，不是状态码**：重复领取也回 200，
-    // 但 `replayed:true`、不含 `benefit`。
-    replayed = parsed.replayed === true
-    if (parsed.benefit?.amount === undefined) gained = 0
-    else if (typeof parsed.benefit.amount === 'number') gained = parsed.benefit.amount
-    if (typeof parsed.message === 'string') message = parsed.message
-  } catch {
-    // 非 JSON 响应：claimable 已经说明成功过，按成功处理但收益未知。
-    gained = 0
+  // 成功的权威判据是 `status === 'CLAIMED'`（三个参考实现一致）；
+  // 有 status 却不是 CLAIMED → 没领成，不能报成功。
+  if (typeof parsed?.status === 'string' && parsed.status !== 'CLAIMED') {
+    throw new ProviderError({
+      provider: product.id,
+      message: `Qoder 签到未完成（上游状态 ${parsed.status}）：${text.slice(0, 200)}`,
+    })
   }
-  if (replayed) {
-    return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（服务端回 replayed=true）' }
-  }
+  const benefit = typeof parsed?.benefit === 'object' && parsed.benefit !== null
+    ? (parsed.benefit as Record<string, unknown>)
+    : undefined
+  const gained = typeof benefit?.amount === 'number' ? benefit.amount : 0
+  const validity = typeof benefit?.validity === 'object' && benefit.validity !== null
+    ? (benefit.validity as Record<string, unknown>)
+    : undefined
+  const days = typeof validity?.days === 'number' ? validity.days : undefined
+  const message = typeof parsed?.message === 'string' ? parsed.message : undefined
   return {
     alreadyDone: false,
     gained,
-    detail: message ?? `Qoder 领取成功${gained > 0 ? `，+${gained} 积分` : ''}`,
+    detail: message
+      ?? `Qoder 领取成功${gained > 0 ? `，+${gained} 积分` : ''}${days !== undefined ? `（${days} 天有效）` : ''}`,
   }
 }
 
@@ -1456,7 +2197,7 @@ async function refresh(
 
   return {
     // ⚠️ `{...credential}` 展开保留 uid / nickname / extras（machineId、machineToken、
-    // machineType）—— 机器头是**用户提供的配置**，Workers 里无法重新探测，
+    // machineType、machineCode）—— 机器头是**用户提供的配置**，Workers 里无法重新探测，
     // 丢了积分/推理能力都会退化。
     ...credential,
     uid: nextUid,
@@ -1491,9 +2232,9 @@ export function buildQoderProvider(product: QoderProduct): Provider {
       chat: true,
       balance: true,
       /**
-       * ✅ **可自动签到**，但**依赖用户提供两个 device 头**
+       * ✅ **可自动签到**：中国版直接可用；国际版**依赖用户提供两个 device 头**
        * （见 {@link checkin} 的说明与 `capabilities` 的诚实纪律：
-       * 缺配置时 `checkin()` 抛错而不是谎报已领）。
+       * 没有可领项时 `checkin()` 抛错而不是谎报已领）。
        */
       checkin: true,
     },
@@ -1505,18 +2246,87 @@ export function buildQoderProvider(product: QoderProduct): Provider {
      * （实测：本地 QODER 凭据被判成 buddy）。
      * Qoder 独有：`security_oauth_token` / `machine_id`（成对出现）。
      */
+    /**
+     * 对象判别式：Qoder 凭据的**独有**字段。
+     *
+     * ⚠️ 不认 `access_token` / `uid` 这些通用字段 ——
+     * 它们和 buddy 等家重叠，拿来判别会让 Qoder 凭据被 buddy 兜底抢走
+     * （实测：本地 QODER 凭据被判成 buddy）。
+     * Qoder 独有：`security_oauth_token` / `machine_id`（成对出现）。
+     *
+     * ## ⚠️⚠️ 中国版与国际版**凭据形态完全相同**，必须靠旁证区分
+     *
+     * 两个变体的凭据字段一模一样（都只有 `security_oauth_token` + `machine_id`），
+     * 而它们是**两个独立的账号体系**（不同 clientId、不同 openApi host）。
+     * 若判别式不做区分，自动识别会**恒定选中数组里排在前面的那个**
+     * ⇒ 中国版账号被挂到国际版名下，发推理时打到错误的 host。
+     *
+     * ⇒ 沿用本项目 `buddy` / `workbuddy` 的**同一套纪律**
+     *（`src/providers/buddy.ts:431-457`）：
+     *   - **默认变体（国际版 `qoder`）不声明额外判据** —— 它是兜底；
+     *   - **非默认变体（中国版）**声明旁证：域名 / 显式 variant 标记。
+     *
+     * 认的旁证（任一成立即判为中国版）：
+     *   - 任意字符串字段（含嵌套 `auth`）里出现 `qoder.cn` 或 `qoder.com.cn`
+     *   - 显式 `variant` / `region` / `realm` 为 `cn` / `china` / `qodercn`
+     */
     matchesShape(input) {
-      return (
-        typeof input['security_oauth_token'] === 'string'
-        || (typeof input['machine_id'] === 'string' && typeof input['security_oauth_token'] === 'string')
-      )
+      // ⚠️ 字段可能在**顶层**，也可能被包在 auth 里（两种导入形态都实测存在，
+      // 与 buddy 的 domain 读取同款处理）。只读顶层会漏认嵌套形态。
+      const auth = input['auth'] as Record<string, unknown> | undefined
+      const pick = (key: string): unknown => input[key] ?? auth?.[key]
+
+      const hasQoderFields = typeof pick('security_oauth_token') === 'string'
+
+      // ── 先算「中国版旁证」，两个变体都要用 ──
+      let cnEvidence = false
+      for (const key of ['variant', 'region', 'realm']) {
+        const raw = pick(key)
+        if (typeof raw !== 'string') continue
+        const v = raw.toLowerCase()
+        if (v === 'cn' || v === 'china' || v === 'qodercn') { cnEvidence = true; break }
+      }
+      if (!cnEvidence) {
+        // CN 的 host 可能出现在任意嵌套字段（domain / openApi / auth.*），
+        // 故用序列化快扫 —— 比逐个字段名穷举更不容易漏。
+        const flat = JSON.stringify(input)
+        if (flat.includes('qoder.com.cn') || flat.includes('qoder.cn')) cnEvidence = true
+      }
+
+      if (product.id !== 'qodercn') {
+        // ⚠️⚠️ **国际版必须排除带 CN 旁证的凭据**（2026-10-19 蓝队实测发现）。
+        //
+        // 根因：parseCredentialAnywhere 按 **PROVIDERS 数组顺序**逐个问
+        // matchesShape，而 qoder 排在 qodercn 之前。若国际版对**任何**
+        // Qoder 形状都返回 true，中国版**永远轮不到** ——
+        // 导出中国版凭据会被**静默归到国际版名下**，推理时打到错误 host。
+        //
+        // 这与 buddy/workbuddy 的处境完全相同，那边的解法是「默认变体
+        // **不声明** matchesShape」（buddy.ts:182）。Qoder 两侧都声明了，
+        // 故这里用「国际版显式排除 CN 旁证」达成同样效果。
+        //
+        // ⚠️ 若改成「让 qodercn 排到 qoder 前面」，也能修好 —— 但那是
+        // **依赖数组顺序**的隐式约束，加一个新变体就会复发。显式排除更稳。
+        return hasQoderFields && !cnEvidence
+      }
+
+      // ── 中国版：形状像 Qoder **且**另有 CN 旁证 ──
+      return hasQoderFields && cnEvidence
     },
     parseCredential,
-    async listModels(_credential, _signal) {
-      // ⚠️ **恒用静态表，不发网络请求**：远端 `GET /algo/api/v2/model/list`
-      // 需 WASM 签名，而目录是只读能力 —— 付密码学代价换一张几乎不变的清单
-      // 不值得（`AGENTS.md` 的 Qoder 章节第 3 条，参考实现同样做法）。
-      return toProviderModels(product.fallbackModels)
+    async listModels(credential, signal) {
+      // ✅ **优先拉远端目录**（含实时倍率与促销价、账号可用性），失败回退静态表。
+      //
+      // ⚠️ 早先「恒用静态表」的理由是远端目录需要 WASM 签名 —— 现已确认可以把
+      // WASM 为推理生成的签名**改签**到目录路径（见 {@link resignQoderHeaders}），
+      // 不需要额外的密码学实现；而静态表的倍率会过期（用户实测面板价格不对）。
+      try {
+        return toProviderModels(await fetchQoderModelCatalog(product, credential, signal))
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.warn(`[qoder] ${product.id} 远端模型目录不可用，回退静态表：${message.slice(0, 200)}`)
+        return toProviderModels(product.fallbackModels)
+      }
     },
     /**
      * ✅ **可静默续期**：`POST {openApiBase}/api/v1/deviceToken/refresh`

@@ -164,6 +164,152 @@ export function intlConversationHeaders(input: {
 }
 
 /**
+ * ⚠️ **会话链路 ID**（b3 追踪头）—— 补上「链式请求」这一机器特征。
+ *
+ * ## 为什么需要（同类项目封禁复盘的真实结论）
+ *
+ * 官方 IDE 的请求是**链式**的：同一个对话里 multi-turn 请求共享同一条链路，
+ * 且每请求都带 b3 追踪头；而第三方反代发的是**孤立请求**（既无会话 id、也无 trace），
+ * 这本身就是可识别的机器特征。上游 2026-10-20 起加的渠道校验（`11‑128`）
+ * 判的是「头部身份 + **会话头族**」，故补齐链路能直接缓解。
+ *
+ * ## 各字段的语义（与抓包口径一致）
+ *
+ * | 头 | 稳定性 | 形态 |
+ * |---|---|---|
+ * | `X-Conversation-ID` | 同一客户端会话内**稳定** | 带连字符 UUID（见 `intlConversationHeaders`） |
+ * | `X-Conversation-Request-ID` | 每请求新生成（重试由调用方复用） | 32 位 hex |
+ * | `X-Conversation-Message-ID` | 每请求**必然**新生成 | 32 位 hex |
+ * | `X-B3-TraceId` | 同一会话内**稳定**（一条链路 = 一个 trace） | 32 位 hex |
+ * | `X-B3-SpanId` | 每请求新生成 | 16 位 hex |
+ * | `X-B3-Sampled` | 恒 `1`（官方客户端全量采样） | — |
+ *
+ * ## ⚠️ trace id 为什么跟着**会话**而不是每请求随机
+ *
+ * b3 的语义里 trace 代表**一条调用链**，span 代表链上的一次调用。
+ * 官方 IDE 的多轮对话天然是「一条 trace、多个 span」；若我们每请求换 trace，
+ * 就退回成「一堆互不相干的单 span 请求」，正是复盘里指出的那个特征。
+ * ⇒ `deriveTraceId32(conversationId)`：同会话恒定、跨会话/跨账号互不相同
+ * （会话 id 本身已按「账号+会话」派生，故这里不需要再掺 uid）。
+ *
+ * ⚠️ 会话 id 无法判定时（客户端没给 `user` / `conversation_id`）**退化为每请求随机**，
+ * 且绝不从消息内容推断 —— 本项目纪律：宁可「不粘」也不能「错误地粘」。
+ */
+/**
+ * 会话链**运行时开关**（面板「防封」分区控制，见 `SafetyConfig.sessionTrace`）。
+ *
+ * ## ⚠️ 从「模块级全局」改成「按账号参数透传」（2026-10-22）
+ *
+ * 原注释写着：*「该配置是**全局单值**，不存在『不同请求要不同值』的情况，
+ * 故模块级变量不会读串。若将来要按账号区分配置，必须改成参数透传。」*
+ *
+ * 这个「将来」在用户提出「我希望我可以每个账号不同设置」时到了。
+ * 保留模块级变量会让 `qodercn` 与 `workbuddy` 只能共用一个值 ——
+ * 正是用户要摆脱的约束。
+ *
+ * ## 现在的作用域
+ *
+ * `sessionTraceHeaders` 的**第三个参数**就是本次调用的值（`input`、`includeB3` 之后的那个）；
+ * 不传时回落模块级 `sessionTraceEnabled`（既有调用点行为不变）。
+ *
+ * ⚠️ 回落而不是「默认 false」：漏传时应当维持原样，不能静默把 b3 关掉 ——
+ * 那会让国际服丢掉渠道要求的链路头，表现为莫名的 11-128。
+ */
+let sessionTraceEnabled = true
+
+/** 设置会话链开关（由网关按面板配置刷新；仅作为未显式传参时的回落值）。 */
+export function setSessionTraceEnabled(enabled: boolean): void {
+  sessionTraceEnabled = enabled
+}
+
+/** 当前开关状态（供测试断言）。 */
+export function isSessionTraceEnabled(): boolean {
+  return sessionTraceEnabled
+}
+
+export function sessionTraceHeaders(input: {
+  /** 客户端显式会话标识派生出的会话 id（空/缺省 ⇒ 每请求随机）。 */
+  conversationId?: string
+  /** 轮级 id：重试须复用（调用方在重试循环外算一次），缺省则现生成。 */
+  turnRequestId?: string
+} = {}, includeB3 = true, traceEnabled?: boolean): HeaderMap {
+  // ⚠️⚠️ 这里**千万不能**整段 return {}。
+  //
+  // `intlConversationHeaders` 那 5 个会话头是 v0.1.2 为修「11‑128 渠道拦截
+  // 被误判成限流」而加的**必需头**：缺任一个上游直接回 11‑128，请求根本发不出去。
+  // 我第一版把开关写成「关掉 ⇒ 一个头都不发」，等于把这个开关做成了
+  // 「一键封掉国际服」—— 比不做开关更糟。
+  //
+  // 所以开关只作用在**本轮新增的 b3 三件套**上（那是可选的行为化特征，
+  // 没有它服务照常工作）；会话头族**恒发**。
+  // ⚠️ 会话头族复用 `intlConversationHeaders`，**不另写一份**：
+  // 两处各写一遍必然分叉（本项目已多次踩过「同一概念两套判据」）。
+  // 它返回的 5 个头一条都不能少（缺任一个上游就回 11‑128）。
+  const conversation = intlConversationHeaders({
+    ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+    ...(input.turnRequestId === undefined ? {} : { turnRequestId: input.turnRequestId }),
+  })
+  const conversationId = conversation['X-Conversation-ID'] ?? ''
+  return {
+    ...conversation,
+    // b3 受两道闸门控制：
+    // ① `includeB3`（调用方按变体决定）—— ⚠️ **国内版必须传 false**，
+    //    否则上游判「两套 trace 并存」回 `11-128 request illegal`；
+    // ② 开关：本次调用显式传入的值优先，未传才回落模块级全局
+    //    （`traceEnabled ?? sessionTraceEnabled`，注意 `false` 是合法值，
+    //     不能用 `||` —— 那会把"显式关闭"吞成"用全局"）。
+    ...((traceEnabled ?? sessionTraceEnabled) && includeB3 ? b3TraceHeaders({ conversationId }) : {}),
+  }
+}
+
+/**
+ * b3 追踪头三件套（`X-B3-TraceId` 32 hex / `X-B3-SpanId` 16 hex / `X-B3-Sampled: 1`）。
+ *
+ * ⚠️ 头名用 `X-B3-TraceId` 这种 Zipkin 规范写法，与本文件其余头的风格一致
+ *（HTTP 头名大小写不敏感，且 HTTP/2 会统一小写，故不影响上游解析）。
+ */
+export function b3TraceHeaders(input: { conversationId?: string } = {}): HeaderMap {
+  const conversationId = input.conversationId ?? ''
+  return {
+    // 会话可判定 ⇒ 稳定（一条链路）；不可判定 ⇒ 随机（仍必须存在，缺头代价更大）
+    'X-B3-TraceId': conversationId === '' ? randomHex32() : deriveTraceId32(conversationId),
+    'X-B3-SpanId': randomHex16(),
+    'X-B3-Sampled': '1',
+  }
+}
+
+/**
+ * 由种子**稳定派生** 32 位 hex（b3 trace id 形态，同步、无依赖）。
+ *
+ * ⚠️ 与 `deriveDeviceId`（`crypto.subtle`，异步）刻意不同：头构造函数必须同步，
+ * 故用四路 FNV-1a 32 位混合拼出 128 位。它只需要「同种子同值、异种子不撞」，
+ * 不需要密码学强度（trace id 不含任何秘密）。
+ */
+export function deriveTraceId32(seed: string, salt = 'trace'): string {
+  return `${fnv1a32Hex(`${salt}:${seed}#0`)}${fnv1a32Hex(`${salt}:${seed}#1`)}${fnv1a32Hex(
+    `${salt}:${seed}#2`,
+  )}${fnv1a32Hex(`${salt}:${seed}#3`)}`
+}
+
+/**
+ * FNV-1a 32 位 → 8 位 hex（含两轮搅动）。
+ *
+ * ⚠️ 搅动必须写成 `h = (h ^ (h >>> 15)) >>> 0`：复合赋值 `h ^= h >>> 15`
+ * 会把「右移结果」**赋回** h（等价于 `h = h >>> 15`），高位全丢、尾部变短。
+ */
+function fnv1a32Hex(text: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  h = (h ^ (h >>> 15)) >>> 0
+  h = Math.imul(h, 0x2545f491) >>> 0
+  h = (h ^ (h >>> 13)) >>> 0
+  return h.toString(16).padStart(8, '0')
+}
+
+/**
  * 国际服的**设备头**（2 个）：`X-Machine-ID` + `X-Session-ID`。
  *
  * ## ⚠️ 为什么必须补（2026-10-20 二次实测）
@@ -207,21 +353,7 @@ export function intlDeviceHeaders(input: {
  */
 export function deriveUuidLike(seed: string, salt = ''): string {
   /** FNV-1a 32 位 → 8 位 hex（分段用不同后缀，避免各段高度相关）。 */
-  const chunk = (suffix: string): string => {
-    let h = 0x811c9dc5
-    const text = `${salt}${seed}#${suffix}`
-    for (let i = 0; i < text.length; i += 1) {
-      h ^= text.charCodeAt(i)
-      h = Math.imul(h, 0x01000193) >>> 0
-    }
-    // ⚠️ 搅动必须写成 `h = (h ^ (h >>> 15)) >>> 0`。
-    // 这里曾误写成 `h ^= h >>> 15` —— 复合赋值把「右移结果」**赋回** h，
-    // 等价于 `h = h >>> 15`，高位全丢、尾部变短。
-    h = (h ^ (h >>> 15)) >>> 0
-    h = Math.imul(h, 0x2545f491) >>> 0
-    h = (h ^ (h >>> 13)) >>> 0
-    return h.toString(16).padStart(8, '0')
-  }
+  const chunk = (suffix: string): string => fnv1a32Hex(`${salt}${seed}#${suffix}`)
   // ⚠️ 每个字段必须**精确按段宽**取字符（8-4-4-4-12）。
   // 曾写过「把某个数组元素改成 `'4'`」的版本 —— 那会丢掉该字节的高半字节，
   // 整串少一位，产出一个**不报错**的「假 UUID」。这里用纯字符串切片，长度天然守恒。
@@ -374,6 +506,13 @@ export function referenceChatHeaders(input: {
   sessionId?: string
   /** 国际服轮级 ID（重试须复用，否则上游视作新的一轮）。拿不到就省略。 */
   turnRequestId?: string
+  /**
+   * 会话链（b3 三件套）开关，**按账号**取值（见 `SafetyConfig.sessionTrace`
+   * 与 `AccountState.safetyOverride`）。
+   *
+   * ⚠️ 不传 ⇒ 回落模块级全局（既有调用点行为不变）。
+   */
+  sessionTrace?: boolean
 }): HeaderMap {
   if (input.variant === 'workbuddy') return intlReferenceChatHeaders(input)
 
@@ -395,6 +534,18 @@ export function referenceChatHeaders(input: {
     // 国内版 `CodeBuddyIDE/1.106.1`，国际版 `WorkBuddy/… workbuddy-ai/…`。
     'User-Agent': CODEBUDDY_USER_AGENT,
   }
+  /**
+   * 🔴 **设备标识必须发**（2026-10-22，A7）。
+   *
+   * `intlDeviceHeaders` 的注释里早有实测结论：缺 `X-Machine-ID` 时
+   * 上游会回 `14003 Model busy`（首条 200、后续 429）。但国内版这条路径
+   * **一个都不发** —— 同一个结论只用在一条分支上。
+   *
+   * 现在由调用方统一传 `machineId` / `sessionId`（与 `/v3/config` 同源），
+   * 传了才发：不传时不臆造（避免「静默为所有账号伪造同一台设备」）。
+   */
+  if (input.machineId !== undefined && input.machineId !== '') headers['X-Machine-ID'] = input.machineId
+  if (input.sessionId !== undefined && input.sessionId !== '') headers['X-Session-ID'] = input.sessionId
   if (input.accessToken !== '') headers.Authorization = `Bearer ${input.accessToken}`
   return headers
 }
@@ -412,6 +563,8 @@ function intlReferenceChatHeaders(input: {
   turnRequestId?: string
   machineId?: string
   sessionId?: string
+  /** 该账号生效的会话链开关（不传则回落全局，见 `sessionTraceHeaders`）。 */
+  sessionTrace?: boolean
 }): HeaderMap {
   // ⚠️ 官方值就是 `SaaS`（部署类型），不是产品名 `WorkBuddy` ——
   // 与 `X-IDE-Name` 分工不同，发成 `WorkBuddy` 会被判身份不自洽。
@@ -434,10 +587,32 @@ function intlReferenceChatHeaders(input: {
       ...(input.machineId === undefined ? {} : { machineId: input.machineId }),
       ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
     }),
-    ...intlConversationHeaders({
-      ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
-      ...(input.turnRequestId === undefined ? {} : { turnRequestId: input.turnRequestId }),
-    }),
+    // 会话头族 + **仅国际版**追加 b3 链路头。
+    //
+    // ⚠️⚠️ **国内版发 b3 会让 WorkBuddy 全线 `11-128 request illegal`**
+    //（2026-10-21 实测：三个国内版账号逐一熔断，用户报「WB 号好像都被封了」）。
+    //
+    // 定位过程：把 `sessionTrace` 开关关掉后，同一个请求立刻 200 并正常出字；
+    // 打开就 `request_illegal: request illegal`。这是**唯一变量**，故根因确定。
+    //
+    // 原因：国内版指纹是 **CLI 口径**（`cliChatHeaders` 已自带 `X-Trace-ID`），
+    // 而 b3 是**另一套 trace 体系**。两套并存 ⇒ 上游看到自相矛盾的链路标识，
+    // 判为非法调用。参考实现的对照表也写着「我们多发了一批头，
+    // 在国际版端点上不被认可」—— b3 正好又犯了一次同样的错。
+    //
+    // 正确切分：**国际版**（workbuddy）要 b3（渠道要求链路可串联）；
+    // **国内版**（buddy）不要，它只认自己那套 CLI 头。
+    ...sessionTraceHeaders(
+      {
+        ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
+        ...(input.turnRequestId === undefined ? {} : { turnRequestId: input.turnRequestId }),
+      },
+      // 国际版**要** b3：渠道要求链路可串联，且它的指纹是桌面口径，
+      // 与 b3 不冲突（国内版才冲突，见 `referenceChatHeaders` 主分支的说明）。
+      true,
+      // 第三个参数 = 该账号生效的会话链开关（不传则回落全局）。
+      input.sessionTrace,
+    ),
   }
   if (input.accessToken !== '') {
     headers.Authorization = `Bearer ${input.accessToken}`
@@ -508,7 +683,12 @@ export function cliChatHeaders(input: {
   if (input.variant === 'workbuddy') {
     Object.assign(
       headers,
-      intlConversationHeaders({
+      // ⚠️ **这里刻意不传第三个参数**（会话链开关）：走 `cliChatHeaders` 的都是
+      // 「列模型目录 / 签到 / 余额探测」这类**非对话**请求，它们的调用方拿不到
+      // 具体账号的 `safetyOverride`（那些路径甚至可能没有账号上下文）。
+      // ⇒ 回落模块级全局值。这是**有意的边界**，不是漏传：
+      // 按账号的会话链开关只作用于**对话**请求（`referenceChatHeaders` 那条路）。
+      sessionTraceHeaders({
         ...(input.conversationId === undefined ? {} : { conversationId: input.conversationId }),
         turnRequestId: input.conversationRequestId,
       }),
@@ -604,9 +784,19 @@ export function mpHeaders(input: { uid: string; accessToken: string }): HeaderMa
   }
 }
 
-/** 生成 32 位 hex（消息级 ID）。 */
+/** 生成 32 位 hex（消息级 ID / b3 trace id）。 */
 export function randomHex32(): string {
-  const bytes = new Uint8Array(16)
+  return randomHex(16)
+}
+
+/** 生成 16 位 hex（b3 span id）。 */
+export function randomHex16(): string {
+  return randomHex(8)
+}
+
+/** 生成 `byteLength * 2` 位 hex。 */
+function randomHex(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength)
   crypto.getRandomValues(bytes)
   let out = ''
   for (const b of bytes) out += b.toString(16).padStart(2, '0')

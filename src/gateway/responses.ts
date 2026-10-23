@@ -49,11 +49,11 @@
  */
 
 import {
-  aggregateSse, createFrameTranslator, detectErrorFrame, parseSseLine,
+  aggregateSse, createFrameTranslator, detectErrorFrame, findErrorFrameInRaw,
+  isEmptyAssistantTurn, parseSseLine,
   type AggregatedCompletion,
 } from './stream.js'
 import { handleChatCompletions } from './server.js'
-import type { SubkeyContext } from './authz.js'
 import type { Env } from '../env.js'
 
 // ─────────────────────────── 请求侧 ───────────────────────────
@@ -411,11 +411,48 @@ export function toResponsesObject(
     items.push({ kind: 'reasoning', id: hexId('rs'), outputIndex: idx++, text: reasoning, callId: '', name: '', args: '' })
   }
   const content = typeof message.content === 'string' ? message.content : ''
+  /**
+   * 🔴 **拒答（`refusal`）必须变成可见的文本**（2026-10-22，G10 收尾）。
+   *
+   * `aggregateSse` 现在会累积 `refusal`，`isEmptyAssistantTurn` 因此不再把
+   * 「纯拒答」判成空响应 —— 这是修好的部分。但如果这里不读它，
+   * `/v1/responses` 就会把**合法拒答**渲染成 `output_text: ""`：
+   * 从「502 明确报错」翻转成「200 但答案空白」。
+   *
+   * 按本项目的铁律「空回复比报错更糟」，那反而是更坏的形态 ——
+   * 所以判据修好后，**这条出口必须同步消费 `refusal`**。
+   */
+  const refusal = typeof message.refusal === 'string' ? message.refusal : ''
   const calls = Array.isArray(message.tool_calls) ? message.tool_calls : []
   // ⚠️ 正文为空但**有**工具调用时，不发空的 message 项 ——
   // 那会让客户端多渲染一个空气泡。
-  if (content !== '' || calls.length === 0) {
-    items.push({ kind: 'message', id: hexId('msg'), outputIndex: idx++, text: content, callId: '', name: '', args: '' })
+  // ⚠️ 拒答同理：它没有 tool_calls，必须发出去（内容就是拒答原文）。
+  if (content !== '' || refusal !== '' || calls.length === 0) {
+    items.push({
+      kind: 'message',
+      id: hexId('msg'),
+      outputIndex: idx++,
+      text: content !== '' ? content : refusal,
+      callId: '',
+      name: '',
+      args: '',
+    })
+  }
+  /**
+   * 旧式 `function_call`（非 `tool_calls` 数组形态）同样要映射成输出项，
+   * 否则「只有 function_call 的响应」在这里又会变成一个空 items。
+   */
+  const legacyCall = isObject(message.function_call) ? message.function_call : undefined
+  if (legacyCall !== undefined) {
+    items.push({
+      kind: 'function_call',
+      id: hexId('fc'),
+      outputIndex: idx++,
+      text: '',
+      callId: '',
+      name: nonEmptyString(legacyCall.name) ?? '',
+      args: typeof legacyCall.arguments === 'string' ? legacyCall.arguments : '',
+    })
   }
   for (const call of calls) {
     const c = isObject(call) ? call : {}
@@ -701,7 +738,19 @@ export function toResponsesSse(
         )
       }
     }
-    const content = typeof delta.content === 'string' ? delta.content : ''
+    /**
+     * 🔴 **拒答分片也要透出**（2026-10-22，G10 收尾）。
+     *
+     * 上游拒答时给的是 `delta.refusal`，不是 `delta.content`。
+     * 原来这里只读 `content` ⇒ 整段拒答被丢弃 ⇒ 客户端收到一条
+     * 「什么也没说、正常结束」的流 —— 用户完全不知道模型拒绝了。
+     *
+     * 归一到 `content` 通道（与 `aggregateSse` 把 refusal 拼进 message 的做法一致），
+     * 这样 `response.output_text.delta` 事件、收尾的 `output[]` 都不用再分支。
+     */
+    const rawContent = typeof delta.content === 'string' ? delta.content : ''
+    const refusalDelta = typeof delta.refusal === 'string' ? delta.refusal : ''
+    const content = rawContent !== '' ? rawContent : refusalDelta
     if (content !== '') {
       // ⚠️ 正文开始 ⇒ **先关掉推理项**：协议里 reasoning 是独立输出项，
       // 与 message 并列；让它们同时"开着"会让客户端把两者串在一起。
@@ -843,8 +892,6 @@ export async function handleResponses(
   env: Env,
   realm = 'cn',
   ctx?: ExecutionContext,
-  /** 子密钥上下文（透传给 chat 处理器，用于配额记账）。 */
-  subkey?: SubkeyContext,
 ): Promise<{ response: Response }> {
   let body: ResponsesRequest
   try {
@@ -878,12 +925,28 @@ export async function handleResponses(
 
   // ⚠️ 复用 Chat 处理器 = 复用**全部**既有能力（选号/轮转/冷却/续期/渠道指纹）。
   // 见本文件头「实现策略」的说明。
+  // ⚠️ 请求级指定账号（`X-FLR-Account`）要跟着转过去，否则 Responses 入口会静默忽略它
+  const pinnedAccount = request.headers.get('x-flr-account')
   const chatRequest = new Request(new URL('/v1/chat/completions', request.url), {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(pinnedAccount !== null && pinnedAccount.trim() !== '' ? { 'x-flr-account': pinnedAccount.trim() } : {}),
+    },
+    /**
+     * 🔴 **必须带 `signal`**（2026-10-21 审查发现，M1 指出）。
+     *
+     * 这里把 `/v1/responses` 的请求转成内部 `/v1/chat/completions` 的 Request。
+     * 漏掉 `signal` ⇒ 内层 `clientGone()` 恒 false ⇒ 用户在 Responses 入口
+     * 点「停止」会被记成**账号失败** ⇒ 健康号被熔断（3 次 30 分钟）。
+     *
+     * ⚠️ 与 `server.ts` 反向容灾那处是**同一个缺陷的两个入口** ——
+     * 修一处必须同时修另一处，否则又是「只修一半」。
+     */
+    signal: request.signal,
     body: JSON.stringify(chatBody),
   })
-  const inner = await handleChatCompletions(chatRequest, env, realm, ctx, subkey)
+  const inner = await handleChatCompletions(chatRequest, env, realm, ctx)
 
   // 上游失败：把错误**原样**包成 Responses 的形状（不吞掉原因）。
   if (!inner.response.ok || inner.response.body === null) {
@@ -933,6 +996,46 @@ export async function handleResponses(
   }
 
   const aggregated = aggregateSse(raw, { model, now: Date.now() })
+
+  /**
+   * 🔴 **必须判错，不能直接 200**（2026-10-21 审查发现的**严重**缺陷，M1 指出）。
+   *
+   * ## 缺陷
+   * 本文件**流式**路径会识别错误帧并发 `response.failed`（见上方 787 行附近），
+   * 而**非流式**路径读完流后直接 `aggregateSse` → `Response.json(..., 200)`，
+   * 全程**一次 `detectErrorFrame` 都没有**。
+   *
+   * 链路：`handleResponses` 把 `chatBody.stream = true` 交给
+   * `handleChatCompletions`，拿到 SSE；上游错误帧被转成
+   * `data: {"error":{...}}`；`aggregateSse` 对该帧 `choices` 非数组 ⇒ `continue`
+   * ⇒ 产出 `content:''`；`toResponsesObject` 于是给出 `text:''`、
+   * `status:'completed'`、`error:null` 的**成功**响应。
+   *
+   * ⇒ 客户端看到「成功，但模型什么都没说」。
+   * `server.ts` 里那条「空响应必须报错」的守卫（`nonStreamingResponse`）
+   * **本路径根本不经过** —— 而它的注释写的正是「**空回复比报错更糟**」。
+   *
+   * ## 修法
+   * 复用抽到 `stream.ts` 的两个共用判据（`findErrorFrameInRaw` /
+   * `isEmptyAssistantTurn`），与 `server.ts` **同一套口径**，结构上不再漂移。
+   * 顺序上先找错误帧：上游若给了明确原因，优先把它透出来（比笼统的「空响应」有用）。
+   */
+  const upstreamError = findErrorFrameInRaw(raw)
+  if (upstreamError !== undefined) {
+    return { response: errorJson(upstreamError, 502) }
+  }
+  if (isEmptyAssistantTurn(aggregated.choices[0])) {
+    const snippet = raw.trim().slice(0, 200)
+    return {
+      response: errorJson(
+        '上游返回了空响应（既没有正文/思考内容，也没有可识别的错误帧）。'
+          + '这通常意味着上游临时拒绝或该模型不可用，请稍后重试。'
+          + (snippet === '' ? '' : `上游原文片段：${snippet}`),
+        502,
+      ),
+    }
+  }
+
   return {
     response: Response.json(toResponsesObject(body, model, aggregated, responseId), {
       headers: { 'cache-control': 'no-store' },

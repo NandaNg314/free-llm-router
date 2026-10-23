@@ -214,9 +214,18 @@ test('prepareChatBody 拒绝非对象 / 缺 messages', () => {
   assert.throws(() => prepareChatBody({ model: 'x' }), /messages/)
 })
 
-test('⚠️ sanitizeChatBody：裸 11128 必须改写（出现在请求里本身就是拦截条件）', () => {
-  assert.equal(sanitizeChatBody('错误码 11128'), '错误码 11-128')
-  // 相邻数字不受影响
+test('⚠️ sanitizeChatBody：真实错误码必须改写（出现在请求里本身就是拦截条件）', () => {
+  // ⚠️ 同样是「输入 === 期望值」的空转断言（详见 protocol.test.ts 同名修复记录）。
+  // 这里用码点构造，避免源码里的连字符被归一化后断言静默失效。
+  const CP = (codes: number[]): string => String.fromCharCode(...codes)
+  const REAL = CP([0x31, 0x31, 0x2d, 0x31, 0x32, 0x38]) // 11-128（ASCII 连字符）
+
+  for (const input of ['错误码 ' + REAL, 'code=' + REAL, REAL]) {
+    const out = sanitizeChatBody(input)
+    assert.notEqual(out, input, `必须发生改写：${input}`)
+    assert.ok(!out.includes(REAL), `改写后仍含真实错误码：${out}`)
+  }
+  // 相邻数字不受影响（Go 侧实测 11148 / 11101 / 11115 均放行）
   assert.equal(sanitizeChatBody('11148'), '11148')
   assert.equal(sanitizeChatBody('11101'), '11101')
 })
@@ -422,10 +431,33 @@ test('⚠️ WAF 拦截不换号（可能是 IP 级，换号无用）', () => {
   assert.equal(m.rotate, false, 'IP 级拦截换号无用，只会放大请求')
 })
 
-test('⚠️ 11140 请求非法不换号（同样的非法请求换号也失败）', () => {
+test('🔴 11140 是账号级封禁 ⇒ 罚该号，但**不换号硬重试**', () => {
+  // 上游原文（2026-10-21，HTTP 403）：
+  //   {"code":11140,"msg":"request illegal",
+  //    "displayMsg":{"zh":"账号存在异常行为，已被限制使用",
+  //                  "en":"Your account has been restricted due to unusual activity"}}
+  //
+  // ## 本测试的两次修正（保留了每一次的教训）
+  //
+  // ① 最初断言 `rotate: false`，理由「换号无用（同样的非法请求）」。
+  //    对了一半：换号确实绕不过**这个**号，但当时把 11140 与 11128 混为一谈。
+  //
+  // ② 后来改成 `rotate: true`，理由「上游说的是 this account has been restricted，
+  //    罚的是这一个号 ⇒ 换号有用」。这条推理**仍然漏了一层**：
+  //    换号改变的是「谁发请求」，不改变「从哪台设备发」。
+  //    workbuddy2api-hub #422/#425 实测：在 11140 上「冷却该号后立刻换下一个号
+  //    继续同一请求」，一个请求最多遍历整个池子，**用户 7 个号在一次任务里全被封**。
+  //    社区复盘的红线原文：「看到 11140 立即停手，解封前严禁换号继续打同一设备
+  //    —— 设备指纹会连坐」。
+  //
+  // ③ 现在：罚该号（一次即生效，见 `restricted` 维度）+ **不换号**，
+  //    把原因如实交给客户端。下一次**独立**请求自然会落到别的号
+  //   （该号已被持久化标记 restrictedUntil，选号时直接跳过），
+  //    不需要在同一个请求里硬换。
   const m = mapErrorToPunishment('request_illegal')
   assert.equal(m.punish, true, '是强信号，要罚')
-  assert.equal(m.rotate, false)
+  assert.equal(m.dimension, 'restricted', '账号级限制专用维度（breaker 要 3 次才生效，太迟）')
+  assert.equal(m.rotate, false, '不换号硬重试：换号会把池子逐个拖进设备级限制')
 })
 
 test('余额耗尽 / session 死亡 / 5xx 应换号', () => {
@@ -671,13 +703,23 @@ test('⚠️ 会话粘性只在首轮生效（换号后还粘回去会死循环�
   assert.ok(hits >= 2, `两条路径都应限定首轮，实际匹配 ${hits} 处`)
 })
 
-test('🔴 渠道配额严格隔离：禁止跨渠道自动切流容灾', () => {
+test('🔴 跨渠道容灾必须有深度保护，且不得复用已消费的 request', () => {
   const src = readFileSync('src/gateway/server.ts', 'utf8')
   const code = stripComments(src)
 
-  // 严禁存在跨渠道自动降级/切流的 console.log 或回退调用，各渠道配额严格隔离
-  assert.ok(!/\[failover\]/.test(code), '⚠️ 严禁存在跨渠道自动容灾切流逻辑')
-  assert.ok(!/handleChatCompletions\(fallbackRequest/.test(code), '⚠️ 严禁将国际版请求自动转发给国内版')
+  // ① 两个入口都必须接受 failoverDepth 参数（否则无法阻止相互递归）
+  assert.ok(/failoverDepth = 0/.test(code), '⚠️ handleChatCompletions 必须有 failoverDepth 默认参数')
+  assert.ok(/input\.failoverDepth \?\? 0/.test(code), '⚠️ handleProviderChat 必须读取 failoverDepth')
+
+  // ② 反向往返容灾必须受 `failoverDepth === 0` 约束
+  const guards = [...code.matchAll(/failoverDepth === 0/g)].length
+  assert.ok(guards >= 2, `⚠️ 两个方向的容灾都必须判 failoverDepth===0（实际 ${guards} 处）`)
+
+  // ③ 国际版→国内版回退**不得**复用被消费过的 request —— 必须重建
+  //    （否则 request.json() 二次读取必抛错 ⇒ 恒 400）。
+  const failoverCall = /handleChatCompletions\(fallbackRequest, env, 'cn', ctx, 1\)/
+  assert.ok(failoverCall.test(code), '⚠️ 国际版容灾必须传重建的 fallbackRequest 且深度=1')
+  assert.ok(/new Request\(request\.url/.test(code), '⚠️ 必须用 rawBody 重建 Request，不能复用原 request')
 })
 
 test('⚠️ 绑定会话必须在成功后（首帧到达）才做，且用 waitUntil 托住', () => {
@@ -838,13 +880,6 @@ test('⚠️ 6004 必须判为**模型级**限流，不是账号级', () => {
   const got = refineModelScoped('rate_limited', body)
   assert.equal(got.dimension, 'model', '6004 必须罚模型维度')
   assert.equal(got.code, 6004)
-})
-
-test('⚠️ 14003 必须判为模型级限流（WorkBuddy 国际版实测）', () => {
-  const body = '{"code":14003,"msg":"too many requests","requestId":"1791a042-7c39-4636-9dfa-2b9a3a8a153b","displayMsg":{"en":"Model busy. Please switch models or retry later"}}'
-  const got = refineModelScoped('rate_limited', body)
-  assert.equal(got.dimension, 'model', '14003 必须罚模型维度')
-  assert.equal(got.code, 14003)
 })
 
 test('⚠️ 14017 等其它限流码仍是账号级（不能一律都罚模型）', () => {
@@ -1060,7 +1095,8 @@ test('🔴 同号并发必须摊开（否则上游踢掉先前的流）', () => 
   // ⚠️ 纯加权随机不够：它每次都独立掷骰，完全可能连中同一个账号。
   const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
   const i = src.indexOf('async pick(request: PickRequest)')
-  const block = stripComments(src.slice(i, i + 4000))
+  // 窗口取到 pick() 末尾（函数体随「指定账号」等逻辑增长，固定字数会截断）
+  const block = stripComments(src.slice(i, src.indexOf('\n  }\n', src.indexOf('浮点误差兜底', i))))
   assert.ok(/SPREAD_WINDOW_MS/.test(block), '必须按时间窗摊开刚被选中的账号')
   assert.ok(/notePickedAt\(/.test(block), '必须记录/查询最近选中的时刻')
   assert.ok(
@@ -1074,16 +1110,74 @@ test('⚠️ 摊开必须让位于显式会话粘性（有 user 字段时优先 
   // 否则「同一会话命中 prompt cache」这个收益就没了。
   const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
   const i = src.indexOf('async pick(request: PickRequest)')
-  const block = stripComments(src.slice(i, i + 4000))
+  // 窗口取到 pick() 末尾（函数体随「指定账号」等逻辑增长，固定字数会截断）
+  const block = stripComments(src.slice(i, src.indexOf('\n  }\n', src.indexOf('浮点误差兜底', i))))
   const prefIdx = block.indexOf('preferred !== ')
   const spreadIdx = block.indexOf('SPREAD_WINDOW_MS')
   assert.ok(prefIdx > 0 && spreadIdx > 0, '两段逻辑都应存在')
   assert.ok(prefIdx < spreadIdx, '⚠️ 粘性判断必须在摊开**之前**')
 })
 
+// ───── WorkBuddy 国际版 14003「模型繁忙」被误判为账号级限流 ─────
+
+test('🔴 14003（WorkBuddy 国际版模型繁忙）必须判为**模型级**冷却，不是账号级', () => {
+  // ## 真实报文（2026-10-19，wb 国际版实测）
+  //
+  // `{"code":14003,"msg":"too many requests","displayMsg":{"en":
+  //   "Model busy. Please switch models or retry later"}}`
+  //
+  // 「switch models」明确是**模型级**：换个模型立刻能用。
+  //
+  // ⚠️ 判成账号级的后果比 6004 更严重：**池内所有账号**会被逐个拉黑，
+  // 且连续 3 次失败触发 **30 分钟账号熔断** ⇒ 整个服务突然全挂，
+  // 而真实原因只是「某个模型繁忙」。
+  const body = JSON.stringify({
+    code: 14003,
+    msg: 'too many requests',
+    displayMsg: { en: 'Model busy. Please switch models or retry later' },
+  })
+
+  // ① 业务码必须先被识别成 rate_limited（否则 refine 根本不会被调用）
+  assert.equal(classify(429, body).kind, 'rate_limited', '14003 必须归类为 rate_limited')
+
+  // ② 维度必须是 model（关键）
+  assert.equal(
+    refineModelScoped('rate_limited', body).dimension,
+    'model',
+    '14003 必须是模型级冷却',
+  )
+
+  // ③ 文案兜底：即使上游换了码值，只要文案说「模型繁忙/换模型」也必须模型级
+  //    （这是**第二道腿** —— 只靠数字会再次误判）
+  const noCode = JSON.stringify({ msg: 'Model busy. Please switch models or retry later' })
+  assert.equal(
+    refineModelScoped('rate_limited', noCode).dimension,
+    'model',
+    '文案含 model busy / switch models 时必须模型级（码值兜底）',
+  )
+  assert.equal(
+    refineModelScoped('rate_limited', JSON.stringify({ msg: 'switch to the other model' })).dimension,
+    'model',
+    'switch to the other 也必须模型级',
+  )
+
+  // ④ 回归守卫：6004 仍必须是模型级
+  assert.equal(refineModelScoped('rate_limited', JSON.stringify({ code: 6004 })).dimension, 'model')
+
+  // ⑤ 回归守卫：真正无关的 429 仍是账号级（不能因为加宽判定而把普通限流也放过）
+  assert.equal(
+    refineModelScoped('rate_limited', JSON.stringify({ code: 14017 })).dimension,
+    'soft',
+    '14017 是账号级，不得被误判成模型级',
+  )
+})
+
 // ───── 「账号是好的但就是用不了」：11128 渠道拦截被误判为账号故障 ─────
 
-test('🔴 11128 必须判为渠道拦截（channel_blocked），不是 request_illegal', () => {
+test('🔴 11128 必须判为渠道拦截（waf_blocked），不是 request_illegal', () => {
+  // ⚠️ 用码点构造真实错误码：它带 ASCII 连字符，写成字面量有被归一化的风险，
+  // 而写成 `code: 11-128` 更糟 —— 那是**算术表达式**（= -117），不是字符串。
+  const REAL = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
   // ## 实测缺陷（用户报「账号明明都是好的，但就是用不了」）
   //
   // 上游原文：`Illegal API invocation from an unapproved channel` /
@@ -1100,10 +1194,7 @@ test('🔴 11128 必须判为渠道拦截（channel_blocked），不是 request_
   // waf_blocked 会触发 `noteWaf` 的 IP 级判定，凑够 2 个账号就**误报全局封锁**
   //（用户报「显示出口 IP 被 WAF 拦截」）。故现在用**独立的 channel_blocked**。
   const body = JSON.stringify({
-    // NOTE: the upstream sends this code as a STRING (see BRIEF). The old assertion
-    // wrote the arithmetic expression, which evaluates to -117 -- neither the
-    // upstream shape nor a known numeric code. Stale assertion, not a bug.
-    code: '11-128',
+    code: REAL,
     msg: 'Illegal API invocation from an unapproved channel',
   })
   // ⚠️ 必须是**独立的 channel_blocked**，不能是 waf_blocked ——
@@ -1136,7 +1227,7 @@ test('🔴 流内错误必须按类别罚，不能一律 breaker', () => {
     'soft', '⚠️ 渠道拦截必须软冷却',
   )
   assert.equal(punishmentForStreamError('The request was blocked by security policy.'), 'soft')
-  assert.equal(punishmentForStreamError('code 11128'), 'soft')
+  assert.equal(punishmentForStreamError('code ' + String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)), 'soft')
   // ⚠️ 配对的**反向**用例：真正的流中断仍须熔断（否则坏号不会被剔除）
   assert.equal(punishmentForStreamError('流传输中断：connection reset'), 'breaker')
   assert.equal(punishmentForStreamError('upstream returned invalid json'), 'breaker')
@@ -1212,19 +1303,78 @@ test('⚠️ 渠道拦截与 WAF 必须是两个独立类别（形态不同、�
   // ⚠️ 混为一类会产生两个假故障：
   //   ① 健康账号被逐个软冷却；
   //   ② 凑够阈值后误报「出口 IP 被拦」并全局停服。
-  const src = readFileSync('src/upstream/client.ts', 'utf8')
-  // 上游把 11-128 以**字符串**形态回（`code: "11-128"`），`Number()` 得到 NaN，
-  // 故改由 `parseEnvelope` 归一成 `CHANNEL_BLOCKED_CODE`，再查 `CODE_KIND` 表：
-  // 判据从「字面量 `11-128: 'channel_blocked'`」变成「常量键 → channel_blocked」。
-  assert.match(src, /\[CHANNEL_BLOCKED_CODE\]: 'channel_blocked'/, '11-128 必须归为 channel_blocked')
-  assert.ok(!/CHANNEL_BLOCKED_CODE]: 'waf_blocked'/.test(src), '不得归为 waf_blocked（那会触发 IP 级判定）')
-  assert.equal(classify(400, JSON.stringify({ code: '11-128', msg: 'request illegal' })).kind, 'channel_blocked')
+  // ⚠️ 断言方式已改：**不再锁源码文本，而是直接验行为**（2026-10-19）。
+  //
+  // 原先写的是 `assert.ok(/11-128: 'channel_blocked'/.test(src))` —— 那是锁**写法**，
+  // 而这条链路真正的缺陷恰恰藏在**行为**里：真实报文里的码是**字符串**，
+  // `parseEnvelope` 曾对它做 `Number()` 得到 NaN，于是它被判成「无信封」
+  // ⇒ 走 `waf_blocked`。锁源码文本的话，这种「看起来对、行为是错的」照样通过。
+  const REAL = String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)
+  const channelBody = JSON.stringify({
+    code: REAL,
+    msg: "Illegal API invocation from an unapproved channel",
+  })
+  assert.equal(classify(403, channelBody).kind, 'channel_blocked', '真实渠道拦截必须归为 channel_blocked')
+  assert.notEqual(classify(403, channelBody).kind, 'waf_blocked', '⚠️ 不得被误判为 waf_blocked（会触发 IP 级封禁）')
+  assert.equal(classify(403, '<html>waf</html>').kind, 'waf_blocked', '真 WAF（403 无信封）仍必须是 waf_blocked')
 
   // 两者的处置都要「不换号」，但罚款不同
   assert.equal(mapErrorToPunishment('channel_blocked').rotate, false)
   assert.equal(mapErrorToPunishment('channel_blocked').punish, false, '不罚账号')
   assert.equal(mapErrorToPunishment('waf_blocked').punish, true, 'HTTP 403 仍要软冷却')
 })
+
+// ───── 消息归一必须接在**公共入口**（provider 路径曾完全绕过） ─────
+
+test('🔴 消息归一（developer→system）必须在 handleChatCompletions 内、且早于 provider 派发', () => {
+  // ## 实测事故（2026-10-21，用户报「Qoder 中国版 502」）
+  //
+  // 上游返回：
+  //   HTTP 400 {"code":"provider_error",
+  //     "details":"Failed to deserialize the JSON body into the target type:
+  //                messages[0].role: unknown variant `developer`,
+  //                expected one of `system`, `user`, `assistant`, `tool`"}
+  //
+  // `cleanupToolPairing` 早就实现了 developer→system 降级，但**只在
+  // `prepareChatBody` 里被调用**，而它只服务默认供应商（buddy）。
+  // 具名/聚合 provider 走 `handleProviderChat`，`rawBody` 原样展开就发上游
+  // ⇒ 归一从未生效。buddy 路径侥幸没事，Qoder 全线 400。
+  //
+  // 这与本项目「同一个 bug 只修一半」是同一类错误：**修在了某一条路上**。
+  // 故此处钉住两件事：① 调用点在公共入口；② 位置早于所有派发分支。
+  const server = stripComments(readFileSync('src/gateway/server.ts', 'utf8'))
+  const fnAt = server.indexOf('export async function handleChatCompletions')
+  assert.ok(fnAt >= 0, 'handleChatCompletions 必须存在')
+
+  const callAt = server.indexOf('cleanupToolPairing(')
+  assert.ok(callAt > fnAt, '归一必须在 handleChatCompletions 内调用（不能在 provider 各自实现）')
+
+  // 必须早于聚合分支与 provider 派发 —— 否则那两条路径拿到的是未归一的 rawBody
+  const aggAt = server.indexOf('handleAggregateChat({')
+  const providerFnAt = server.indexOf('export async function handleProviderChat')
+  assert.ok(aggAt > callAt, '聚合分支必须拿到归一后的 rawBody')
+  assert.ok(providerFnAt > callAt, 'handleProviderChat 的派发必须拿到归一后的 rawBody')
+
+  // server.ts 里只允许这一处调用：重复实现正是旧伤的来源
+  assert.equal(
+    [...server.matchAll(/cleanupToolPairing\s*\(/g)].length,
+    1,
+    'server.ts 里必须只有一处归一调用',
+  )
+})
+
+test('🔴 归一幂等：buddy 路径经 prepareChatBody 跑第二遍不得改变结果', () => {
+  // 归一点上移到公共入口后，buddy 路径会经过它**和** `prepareChatBody` 两次。
+  // 若不幂等，第二次会把已转成 system 的消息再处理一遍（或丢掉合法消息）。
+  const once = cleanupToolPairing([
+    { role: 'developer', content: 'You are an expert coding assistant.' },
+    { role: 'user', content: 'hi' },
+  ]) as Array<Record<string, unknown>>
+  const twice = cleanupToolPairing(once) as Array<Record<string, unknown>>
+  assert.deepEqual(twice, once, '第二次归一不得改变结果')
+  assert.equal(twice[0]!.role, 'system')
+})
+
 
 // ───── `role: 'developer'` 导致 11128（用户报两处 502 的根因） ─────
 
@@ -1315,7 +1465,7 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
   assert.equal(dom['X-IDE-Name'], 'CodeBuddy', '国内版归属名是 CodeBuddy')
   assert.equal(dom['X-IDE-Type'], 'CodeBuddy')
   assert.equal(dom['X-Product'], 'CodeBuddy')
-  assert.equal(intl['X-IDE-Name'], 'WorkBuddy', '国际版归属名是 WorkBuddy')
+  assert.equal(intl['X-IDE-Name'], 'WorkBuddy')
 
   // ⚠️ 版本号不同
   assert.equal(dom['X-IDE-Version'], '1.106.1', '国内版版本是 1.106.1')
@@ -1500,8 +1650,10 @@ test('🔴 聚合前缀必须在 `splitModelName` **之前**剥掉（否则会�
   assert.ok(/const AGG_PREFIX = `\$\{AGGREGATE_PROVIDER_ID\}\/`/.test(code),
     '⚠️ 必须手写剥聚合前缀（splitModelName 不认识它）')
   // ② 判据必须是**完全前缀匹配**，不能是「包含」
-  assert.ok(/rawModel === AGGREGATE_PROVIDER_ID \|\| rawModel\.startsWith\(AGG_PREFIX\)/.test(code),
+  //    （2026-10-21 起比较的是小写副本：`Aggregate/auto` 也要进聚合）
+  assert.ok(/rawLower === AGGREGATE_PROVIDER_ID \|\| rawLower\.startsWith\(AGG_PREFIX\)/.test(code),
     '⚠️ 必须是完全前缀匹配（否则 buddy/aggregate/x 会被误吞）')
+  assert.ok(/const rawLower = rawModel\.toLowerCase\(\)/.test(code), '小写副本必须由 rawModel 派生')
   // ③ 传进聚合的 model 必须是**剥过前缀**的
   assert.ok(/model: rawModel\.slice\(AGG_PREFIX\.length\)/.test(code),
     '⚠️ 必须传剥过前缀的裸键')

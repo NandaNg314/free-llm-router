@@ -56,20 +56,7 @@ export function bearerOf(request: Request): string {
  * 白名单非空 = 空串直接拒），这是 fail-closed 的方向。
  */
 export function clientIpOf(request: Request): string {
-  // Workers 部署：`cf-connecting-ip` 由边缘 override，伪造不了。
-  const cf = (request.headers.get('cf-connecting-ip') ?? '').trim()
-  if (cf !== '') return cf
-  // VPS / Node 部署：前面通常挂着 Nginx / Caddy 反代，真实来源在 `x-forwarded-for`。
-  // ⚠️ 取**最后一跳**（反代追加在末尾）而不是第一跳：第一跳是客户端自报，
-  // 可被随意伪造 —— 拿它做 IP 白名单等于没有白名单。
-  const xff = (request.headers.get('x-forwarded-for') ?? '').trim()
-  if (xff !== '') {
-    const parts = xff.split(',').map((s) => s.trim()).filter((s) => s !== '')
-    const last = parts[parts.length - 1]
-    if (last !== undefined && last !== '') return last
-  }
-  // 再退到直连地址（Node 适配层把 `req.socket.remoteAddress` 写进这个头）。
-  return (request.headers.get('x-real-ip') ?? '').trim()
+  return (request.headers.get('cf-connecting-ip') ?? '').trim()
 }
 
 /** 鉴权结果。 */
@@ -194,6 +181,51 @@ export function settleUsage(
     .catch((error: unknown) => {
       console.error('[apikey] token 记账失败：', error instanceof Error ? error.message : String(error))
     })
+}
+
+/**
+ * 子密钥的「本次请求归属」——用 `WeakMap` 挂在 `ctx` 上。
+ *
+ * 🔴 **为什么必须这样传**（2026-10-21 审查补，安全面专项）。
+ *
+ * ## 缺陷：`token` 配额是一条**从未接线**的死限制
+ * `authenticate()` 在鉴权那一刻用 `input=0, output=0` 记一次请求（那时还不知道用量），
+ * 而 `settleUsage()` —— 唯一能把真实 token 补上去的函数 —— **零调用者**。
+ * 于是 `maxTokens` 永远判不到：实测 `maxTokens=5` 时连发 3 次全部放行，
+ * 面板「已用 0 / 100000」永远不动，管理员零告警。
+ *
+ * ## 为什么不把 `ApiKeyRecord` 一路透传下去
+ * `handleChatCompletions()` 是**位置参数**签名，且被三处（两个探针 + 主路径）调用，
+ * `handleProviderChat()` 是对象参数 —— 两种签名都要改，还会污染 provider 层。
+ * 真正需要它的只有「用量已知的那 4 个点」，而它们都能拿到同一个 `ctx`。
+ *
+ * ⇒ 鉴权成功后把归属挂到 `ctx`（按对象身份，天然随请求回收），
+ * 用量点就地 `settleSubkeyUsage(...)`。主密钥路径**零开销**（WeakMap 里没有条目）。
+ */
+const subkeyByCtx = new WeakMap<object, { record: ApiKeyRecord; ip: string }>()
+
+/** 鉴权成功且用的是子密钥时调用一次，登记本次请求的归属。 */
+export function registerSubkeyUsage(ctx: object | undefined, record: ApiKeyRecord, ip: string): void {
+  if (ctx === undefined) return
+  subkeyByCtx.set(ctx, { record, ip })
+}
+
+/**
+ * 用量已知时调用：把真实 token 补进子密钥配额。
+ *
+ * ⚠️ 不 `await`、不抛错：记账失败最多让配额失真，不该影响已经成功的响应。
+ */
+export function settleSubkeyUsage(
+  ctx: object | undefined,
+  env: Env,
+  input: number,
+  output: number,
+  model: string,
+): void {
+  if (ctx === undefined) return
+  const entry = subkeyByCtx.get(ctx)
+  if (entry === undefined) return
+  void settleUsage(env, entry.record, input, output, model, entry.ip)
 }
 
 /**

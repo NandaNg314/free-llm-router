@@ -251,7 +251,7 @@ test('⚠️ 活动类动作必须排在成长任务之前（先拿确定性收�
 
 test('⚠️ 成长计划（「执行每日任务」按钮）必须包含签到步骤', () => {
   // 面板文案与后端注释都承诺「签到 → 全部成长任务 → 领奖」
-  //（`src/panel/assets/index.html:50-53`、`src/index.ts:447`）。
+  //（旧版面板任务说明、`src/index.ts:447`）。
   // 实测证据（2026-10-04，线上 `/admin/tasks/status`）：该按钮触发的运行里有
   // 23 步、若干成长任务，却**没有任何 checkin 步骤** —— 这就是用户报的
   // 「每日任务/签到不工作」。签到是幂等的，入队无副作用。
@@ -268,7 +268,7 @@ test('⚠️ 成长计划（「执行每日任务」按钮）必须包含签到�
 })
 
 test('⚠️ 所有步骤的 delayMs 必须 ≥ 0（负数会让 alarm 立即重排，形成忙循环）', () => {
-  for (const plan of ['daily', 'growth'] as const) {
+  for (const plan of ['daily', 'growth', 'intlDaily'] as const) {
     for (const step of planByName(plan)) {
       assert.ok(step.delayMs >= 0, `${plan} 的 ${step.action} delayMs 为负：${step.delayMs}`)
     }
@@ -295,7 +295,7 @@ test('计划里没有重复的任务码动作（避免白跑）', () => {
 
 test('⚠️ 计划里引用的动作必须都已注册（否则会报「未注册的动作」）', () => {
   const registered = new Set(registeredActions())
-  for (const plan of ['daily', 'growth'] as const) {
+  for (const plan of ['daily', 'growth', 'intlDaily'] as const) {
     for (const step of planByName(plan)) {
       assert.ok(registered.has(step.action), `${plan} 引用了未注册的动作：${step.action}`)
     }

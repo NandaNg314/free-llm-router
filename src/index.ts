@@ -19,8 +19,11 @@
  */
 
 import { TaskRunnerDO, type RunContext, type TaskStep } from './taskrunner/TaskRunnerDO.js'
+import { classify } from './upstream/client.js'
+import { diagnoseAccount, healthy } from './pool/state.js'
 import { AccountPoolDO } from './pool/AccountPoolDO.js'
-import { planByName } from './taskrunner/plans.js'
+import { planByName, type PlanName } from './taskrunner/plans.js'
+import { cstDay } from './upstream/travel.js'
 import { resolveUpstream, type Env } from './env.js'
 import { cliChatHeaders } from './upstream/headers.js'
 import { isValidUid, LOGIN_STATE_TTL_MS, pollLogin, startLogin } from './upstream/auth.js'
@@ -69,14 +72,8 @@ import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
-import { handleChatCompletions } from './gateway/server.js'
-import {
-  type AuthResult,
-  type SubkeyContext,
-  authenticate,
-  clientIpOf,
-  countUse,
-} from './gateway/authz.js'
+import { handleChatCompletions, refineModelScoped, resetMaxRotateCache } from './gateway/server.js'
+import { resetSafetyConfigCache, resolveSafetyFor } from './gateway/safety.js'
 import {
   emptyApiKeyUsage,
   generateApiKey,
@@ -84,11 +81,17 @@ import {
   isWindowExpired,
   keyPrefix,
   modelAllowed,
+  type ApiKeyRecord,
   normalizeApiKeyLimits,
   resetUsageWindow,
   toApiKeyView,
 } from './store/apikeys.js'
+import { authenticate, clientIpOf, countUse, registerSubkeyUsage } from './gateway/authz.js'
+import { authBlocked, noteAuthFailure, noteAuthSuccess } from './gateway/inbound-limit.js'
+import { utc8DayKey } from './store/usage.js'
+import { BodyTooLargeError, MAX_IMPORT_BYTES, MAX_REQUEST_BYTES, readJsonCapped } from './gateway/body.js'
 import { fetchBalance } from './upstream/checkin.js'
+import { claimCompensation, fetchCompensationStatus } from './upstream/compensation.js'
 import { listTasks } from './upstream/tasks.js'
 import { listModels, pickCredential } from './gateway/models.js'
 /**
@@ -165,9 +168,6 @@ import {
   buildVirtualModels,
   type ProviderCatalog,
 } from './gateway/aggregate.js'
-// ⚠️ 计费倍率兜底从模型名后缀解析（`· x0.05`）—— 与聚合排序**共用同一个实现**：
-// 各写一份必然分叉（聚合按它排序、目录按它展示，两处不一致会让用户困惑）。
-import { priceFactorFromName } from './providers/canonical-models.js'
 import {
   buildCodeArtsCallbackUrl,
   buildCodeArtsLoginUrl,
@@ -189,16 +189,20 @@ import {
   TRAE_LOGIN_CALLBACK_PATH,
   TRAE_LOGIN_STATE_TTL_MS,
 } from './providers/trae.js'
-import { panelAsset, securityHeaders, loginSecurityHeaders } from './panel/index.js'
+import { panelAsset, securityHeaders } from './panel/index.js'
 
 // DO 类必须从入口导出，否则 wrangler 找不到绑定目标。
 export { AccountPoolDO, TaskRunnerDO }
 
 /** JSON 响应助手，统一 no-store（避免缓存鉴权结果）。 */
-function json(value: unknown, status = 200): Response {
+function json(value: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(value, null, 2), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      ...extraHeaders,
+    },
   })
 }
 
@@ -1050,6 +1054,149 @@ async function pollTraeLogin(
  *
  * ⚠️ **只兜异常，不改行为**：正常路径一个字节都不受影响。
  */
+/**
+ * 渠道归属前缀（`/v1/models` 的 `name` 用）的**特例**。
+ *
+ * 这三家用短中文标签；其余家一律用供应商展示名（`Provider.name`，
+ * 如 `Qoder (中国版)`），见 {@link channelLabelFor}。
+ *
+ * ⚠️ 早先只给这三家加前缀，理由是「其余家的 id 前缀已可读」—— 但客户端的
+ * 模型选择器**只显示 `name`、不显示 id**（用户实测：Qoder 的模型只显示
+ * `DeepSeek-Flash`，看不出是哪家、多少倍率；而多家都有同名模型）。
+ */
+const CHANNEL_LABEL: Record<string, string> = {
+  buddy: '国内',
+  workbuddy: '国际',
+  aggregate: '聚合',
+}
+
+/** `/v1/models` 名称里的渠道标签：特例表优先，否则用供应商展示名。 */
+function channelLabelFor(providerId: string): string | undefined {
+  return CHANNEL_LABEL[providerId] ?? findProvider(providerId)?.name
+}
+
+/** 倍率的展示形态：去掉浮点尾巴（`0.30000000000000004` → `0.3`）。 */
+function formatPriceFactor(value: number): string {
+  return String(Number(value.toFixed(4)))
+}
+
+/**
+ * `/v1/models` 条目的**客户端可读化**补全。
+ *
+ * ## 为什么必须做（用户实测反馈）
+ *
+ * 上游给的字段是 `contextWindow` / `maxOutput` / `supportsImage` / `credits`，
+ * 这些**不是 OpenAI 标准字段**，绝大多数第三方客户端
+ *（Cherry Studio / ChatBox / LobeChat / Open WebUI …）**直接忽略** ⇒
+ * 表现为「多模态没标、上下文空白、看不到倍率、分不清国内/国际」。
+ *
+ * ## 两条补全路径（互补，不是二选一）
+ *
+ * 1. **`name` 承载**（零配置通用）：`name` 是**所有客户端都会显示**的字段，
+ *    故把「国内/国际」与倍率写进去。这是覆盖面最广的一条。
+ * 2. **OpenRouter 风格字段**（自动识别）：`context_length` /
+ *    `top_provider` / `architecture.input_modalities` —— 识别这套约定的
+ *    客户端可**自动**读到上下文与多模态，无需人工配置。
+ *
+ * ⚠️ **原有字段一个都不删**：既有客户端与面板仍按原字段读，
+ *    本次只是**追加**。`credits` 保留（面板的「倍率」列在用）。
+ *
+ * ⚠️ `name` 的改动会影响面板的「名称」列（变长，且倍率与「倍率」列重复）——
+ *    这是为了让**外部客户端**正确显示而付的代价，已与用户确认接受。
+ */
+function annotateModelEntry(
+  entry: Record<string, unknown>,
+  providerId: string,
+): Record<string, unknown> {
+  const ctx =
+    typeof entry.contextWindow === 'number' && entry.contextWindow > 0
+      ? entry.contextWindow
+      : undefined
+  const maxOut =
+    typeof entry.maxOutput === 'number' && entry.maxOutput > 0 ? entry.maxOutput : undefined
+  // ⚠️ 聚合是虚拟路由，上游不给 `supportsImage`；但它承载的模型均支持视觉，
+  //    判成「纯文本」会让用户无法给 `aggregate/*` 发图。
+  const acceptsImage = entry.supportsImage === true || providerId === AGGREGATE_PROVIDER_ID
+  const isFree = entry.isFree === true
+
+  // ── 路径 1：名称承载渠道 + 倍率 ──
+  const label = channelLabelFor(providerId)
+  const rawName =
+    typeof entry.name === 'string' && entry.name !== ''
+      ? entry.name
+      : String(entry.id).split('/').slice(1).join('/')
+  const parts: string[] = []
+  if (label !== undefined) parts.push(label)
+  parts.push(rawName)
+  if (isFree) {
+    parts.push('免费')
+  } else {
+    // 上游的 credits 形如 `x0.21` 或 `x0.34 credits`，只取数值部分
+    const mu =
+      typeof entry.credits === 'string' ? entry.credits.match(/x\s*([0-9.]+)/i)?.[1] : undefined
+    if (mu !== undefined) {
+      parts.push(`×${mu}`)
+    } else if (typeof entry.priceFactor === 'number' && Number.isFinite(entry.priceFactor)) {
+      // 没有 `credits` 字符串的家（qoder / trae / lobsterai …）用数值倍率；0 = 免费
+      parts.push(entry.priceFactor === 0 ? '免费' : `×${formatPriceFactor(entry.priceFactor)}`)
+    }
+  }
+
+  const out: Record<string, unknown> = { ...entry, name: parts.join(' · ') }
+
+  // ── 路径 2：OpenRouter 风格字段 ──
+  if (ctx !== undefined) {
+    out.context_length = ctx
+    out.top_provider = {
+      context_length: ctx,
+      ...(maxOut === undefined ? {} : { max_completion_tokens: maxOut }),
+    }
+  }
+  out.architecture = {
+    modality: acceptsImage ? 'text+image->text' : 'text->text',
+    input_modalities: acceptsImage ? ['text', 'image'] : ['text'],
+    output_modalities: ['text'],
+  }
+
+  // ── 路径 3：思考档位（与 workbuddy2api-hub 的 `/v1/models` 同名字段） ──
+  //
+  // ⚠️ DSH 的模型发现**只读** id / name / 上下文 / 输出上限，不读这些字段 ——
+  // 它只给配置里声明了 `reasoningEfforts` 的模型开「推理努力」选择器，
+  // 否则报「不支持推理努力」。面板「接入指南 → DSH」据这里生成那份声明。
+  if (Array.isArray(entry.reasoningEfforts) && entry.reasoningEfforts.length > 0) {
+    out.reasoning_efforts = entry.reasoningEfforts
+  }
+  if (typeof entry.defaultEffort === 'string' && entry.defaultEffort !== '') {
+    out.reasoning_default_effort = entry.defaultEffort
+  }
+  if (typeof entry.canDisableThinking === 'boolean') out.reasoning_can_disable = entry.canDisableThinking
+  return out
+}
+
+/**
+ * 拼 OAuth 回调地址时用的「对外基准地址」。
+ *
+ * 🔴 **绝不能直接用 `url.origin`**（2026-10-21 审查补，安全面专项）：
+ * 它来自 `Host` + `x-forwarded-proto` 两个**客户端可控**的请求头。
+ * 伪造 Host 就能把回调指到攻击者域，而 OAuth 回调里带着
+ * 「换取上游凭据的能力凭证（secret）」—— 等于把账号送人。
+ *
+ * 优先 `PUBLIC_URL`；未设置才回落到请求 origin（单机场景），并打一次 warn。
+ */
+let warnedMissingPublicUrl = false
+function publicOrigin(env: Env, url: URL): string {
+  const configured = env.PUBLIC_URL?.trim()
+  if (configured !== undefined && configured !== '') return configured.replace(/\/+$/, '')
+  if (!warnedMissingPublicUrl) {
+    warnedMissingPublicUrl = true
+    console.warn(
+      '⚠️ [安全] 未设置 PUBLIC_URL，OAuth 回调地址将按请求头 Host 拼接。'
+        + '生产环境请设置 PUBLIC_URL，否则伪造 Host 可把回调指到他人域名。',
+    )
+  }
+  return url.origin
+}
+
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
     return await handleInner(request, env, ctx)
@@ -1062,129 +1209,31 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     console.error(
       `[unhandled] ${request.method} ${url?.pathname ?? '(bad url)'} → ${message}\n${stack}`,
     )
-    // 回给客户端**可读原因**（而不是 `error code: 1101`）。
+    /**
+     * 🔴 **不回显内部异常原文**（2026-10-21 审查补，安全面专项）。
+     *
+     * 原来直接把 `error.message` 拼进响应。任何持 key 者（含配额最紧的子密钥）
+     * 都能稳定把内部文案读回来 —— 实测 `POST body: null` 就回
+     * `服务内部错误：Cannot read properties of null (reading 'model')`；
+     * 而这通道对 `SQLITE_*`、文件路径、表名同样直通。
+     *
+     * 改为：对外固定文案 + 一个 `traceId`（与日志里的同一串），
+     * 用户报障时给这个 id，我们按它去日志里找完整堆栈。
+     */
+    const traceId = crypto.randomUUID().slice(0, 8)
+    console.error(`[unhandled] traceId=${traceId}（对外不再回显内部原因）`)
     return new Response(
       JSON.stringify({
         error: {
-          message: `服务内部错误：${message}`,
+          message: `服务内部错误，请稍后重试（如反复出现请把 traceId 反馈给我们：${traceId}）`,
           type: 'internal_error',
           code: 'internal_error',
+          traceId,
         },
       }),
       { status: 500, headers: { 'content-type': 'application/json; charset=utf-8' } },
     )
   }
-}
-
-/**
- * 把计费倍率归一成**可 JSON 化的值**：有限数字，或 `null`（= 未标注）。
- *
- * ## 🔴 为什么不能直接把它丢给 `JSON.stringify`
- *
- * 内部用 `Number.POSITIVE_INFINITY` 表示「该家没提供倍率」（这是对的：
- * 未知 ≠ 免费 ≠ 0）。但 **`JSON.stringify(Infinity)` 得到的是 `null`** ——
- * 字段还在、值变成了空，客户端无法区分「未标注」与「字段读坏了」，
- * 面板也只能靠 `Number.isFinite()` 反推。
- *
- * ⇒ 在**唯一出口**显式归一成 `null`，并语义写死：
- *   `null` = 上游没给倍率（仍可正常调用，不等于免费）；
- *   `0`    = 免费。
- * ⚠️ 负数/NaN 也归到 `null`（上游不会给，但脏数据不该变成一个看起来有效的倍率）。
- */
-function priceFactorOrNull(value: number): number | null {
-  return Number.isFinite(value) ? value : null
-}
-
-/**
- * 从请求体里读 `model`（**不消费 body**）。
- *
- * ⚠️ 用 `request.clone()`：直接 `request.json()` 会把 body 读掉，
- * 后面网关再读就报 `Body is unusable`（Clone 是标准做法，两路各持一份流）。
- * 读不到时返回空串 —— 由调用方决定怎么处理（不要在这里报错，
- * 「model 缺失」的真实报错应由网关层给出更准确的文案）。
- */
-async function peekModel(request: Request): Promise<string> {
-  try {
-    const body = (await request.clone().json()) as unknown
-    if (body === null || typeof body !== 'object') return ''
-    const m = (body as Record<string, unknown>).model
-    return typeof m === 'string' ? m : ''
-  } catch {
-    return ''
-  }
-}
-
-/** 子密钥守卫的结果。 */
-interface V1Guard {
-  /** 非 `undefined` 时应直接返回它（鉴权失败）。 */
-  denied?: Response
-  /** 命中的子密钥上下文（主密钥时为 `undefined`）。 */
-  key?: SubkeyContext
-}
-
-/**
- * `/v1/*` 的鉴权与配额守卫。
- *
- * ## 为什么必须在这一层做（而不是在统一的鉴权段）
- *
- * 模型白名单需要请求体里的 `model`，而请求体只能读一次 ——
- * 在大鉴权段里读了，后面网关就拿到一个已消费的 body。
- * 故把「需要模型才能判的鉴权」推到网关入口，用 `request.clone()` 预读。
- *
- * ## 记账时机（关键）
- *
- * **放行时立即占请求数名额**，不等响应结束 —— 否则流式响应会到最后一刻
- * 才计数，并发请求会全部穿过配额检查（配额形同虚设）。
- * token 则在流结束后由 `settleUsage` 补录（那时才知道）。
- */
-async function guardV1(
-  request: Request,
-  env: Env,
-  cached: AuthResult | undefined,
-): Promise<V1Guard> {
-  const model = await peekModel(request)
-  const auth = cached ?? (await authenticate(request, env, model))
-
-  if (auth.kind === 'none') {
-    return {
-      denied: json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401),
-    }
-  }
-  if (auth.kind === 'admin') return {}
-  if (auth.kind === 'subkey-denied') {
-    // ⚠️ 被拒也要记一笔（`rejected`）—— 用户在面板上才能看到「有 N 次被拒」，
-    // 而不是只看到「没用过」。但**不**计入 requests（配额不该因被拒而消耗）。
-    try {
-      await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')).recordApiKeyUse({
-        id: auth.record.id,
-        ip: clientIpOf(request),
-        model,
-        input: 0,
-        output: 0,
-        rejected: true,
-      })
-    } catch {
-      // 记账失败不影响拒绝结果
-    }
-    return {
-      denied: json({ error: { message: auth.reason, type: 'permission_error' } }, auth.status),
-    }
-  }
-
-  // 命中可用子密钥：
-  // ⚠️ 模型白名单已在 `authenticate` 里查过，这里是第二道防线
-  //（防止后续改动走到这条路径时绕过）。
-  if (model !== '' && !modelAllowed(model, auth.record.limits.models)) {
-    return {
-      denied: json({ error: { message: `模型 ${model} 不在允许列表内`, type: 'permission_error' } }, 403),
-    }
-  }
-
-  // 占名额（不 await —— 不拖慢首字节；失败会打日志，不静默）
-  void countUse(env, auth.record, request, model)
-  // ⚠️ IP 在**这里**读（拿的是原始 request），随上下文传下去 ——
-  // `/v1/responses` 会新造 Request，届时原始 IP 头已经不在里面了。
-  return { key: { record: auth.record, ip: clientIpOf(request) } }
 }
 
 /** 真正的业务路由（异常由上面的 {@link handle} 统一兜住）。 */
@@ -1193,13 +1242,53 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   const path = url.pathname
 
   /**
-   * `/v1/*` 本次请求的鉴权结果（`undefined` = 尚未判定）。
+   * 🔴 **全局请求体预检**（2026-10-21 审查补，安全面专项）。
    *
-   * ⚠️ 用变量在函数作用域里传递，而不是每个分支各自调一次 `authenticate`：
-   * 鉴权要读 DO（两三次往返），一个请求只能鉴一次；
-   * 且「先暂存结果、到分支里再用」能让模型白名单在同一处生效。
+   * 放在**路由之前**、也放在**鉴权之前**：攻击者不需要有效密钥就能用巨体打满内存
+   *（实测一条 120 MiB 让 RSS +322 MB），所以这道门不能等鉴权。
+   *
+   * ⚠️ 这只是**廉价预检**：`content-length` 可省略（chunked）或伪造。
+   * 真正的防线是 `readJsonCapped`——边读边计数、超限立刻 cancel。
+   * 两道一起才成立；只有这一道会被轻易绕过。
    */
-  let v1Auth: AuthResult | undefined
+  /**
+   * 🔴 **`realm` 必须白名单**（2026-10-21 审查补，安全面专项）。
+   *
+   * 原来 `?realm=` 直接喂给 `env.ACCOUNT_POOL.idFromName(realm)`，**完全不校验**。
+   * 而适配层的 `get()` 按名字**永久缓存**实例、并在 SQLite 里建行 ——
+   * 于是任何一把有效密钥（哪怕配额最紧的子密钥）循环 `?realm=rand` 就能：
+   *   每请求 +1 个常驻实例（16–30 KB，5 分钟才回收）+ SQLite 2 行（**只增不减**）
+   * ⇒ 填满数据卷 ⇒ 全站 500。实测 400 个不同 realm 全部通过鉴权并落库。
+   *
+   * 放在**鉴权之前**：连无效密钥也不该有机会创建实例。
+   * 只有两个合法分片（与 `scheduled()`/面板遍历的取值一致）。
+   */
+  const requestedRealm = url.searchParams.get('realm')
+  if (requestedRealm !== null && requestedRealm !== 'cn' && requestedRealm !== 'global') {
+    return json(
+      {
+        error: {
+          message: `realm 只能是 cn 或 global（收到 ${JSON.stringify(requestedRealm)}）`,
+          type: 'invalid_request_error',
+        },
+      },
+      400,
+    )
+  }
+
+  const declaredLength = Number(request.headers.get('content-length') ?? '')
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_IMPORT_BYTES) {
+    return json(
+      {
+        error: {
+          message: `请求体过大：${Math.round(declaredLength / 1024 / 1024)} MiB 超过上限`
+            + `（普通接口 ${Math.round(MAX_REQUEST_BYTES / 1024 / 1024)} MiB、导入 ${Math.round(MAX_IMPORT_BYTES / 1024 / 1024)} MiB）`,
+          type: 'payload_too_large',
+        },
+      },
+      413,
+    )
+  }
 
   // ── 免鉴权：存活探针（不含任何敏感信息） ──
   if (path === '/healthz') {
@@ -1213,14 +1302,29 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // 刻意不用 cookie（cookie 会自动附带，需要额外 CSRF 防护；Authorization 头不会）。
   const asset = panelAsset(path)
   if (asset !== undefined) {
-    // ⚠️ 登录页有自己的 CSP：它含一个真实 `<form>`，而 `form-action 'none'`
-    // 会把提交拦下并在控制台报错（见 `CSP_LOGIN` 的说明）。
-    const isLoginPage = path === '/login' || path === '/login/'
-    const headers = isLoginPage ? loginSecurityHeaders() : securityHeaders()
-    return new Response(asset.body, {
-      status: 200,
-      headers: { ...headers, 'content-type': asset.contentType },
-    })
+    const headers = {
+      ...securityHeaders(),
+      'content-type': asset.contentType,
+      'cache-control': asset.cacheControl,
+      etag: asset.etag,
+    }
+    // ⚠️ 支持条件请求：内容没变就回 304（省流量），变了才回全量。
+    // 这正是 `no-cache` 能成立的前提 —— 没有 ETag 的 `no-cache` 等于每次全量重下。
+    const inm = request.headers.get('if-none-match')
+    if (inm !== null && inm === asset.etag) {
+      return new Response(null, { status: 304, headers })
+    }
+    return new Response(asset.body, { status: 200, headers })
+  }
+  // 旧版独立登录页已并入单页面板（未登录时面板自己显示登录表单）——旧书签直接跳过去。
+  if (path === '/login' || path === '/login/') {
+    return new Response(null, { status: 302, headers: { ...securityHeaders(), location: '/panel/' } })
+  }
+  // `/panel/*` 下不存在的文件直接 404（面板用 hash 路由，不需要服务端回落到 index.html）。
+  // ⚠️ 不能落进下面的鉴权分支：那会对一个静态路径返回 401 JSON，让人误以为是密钥问题。
+  // 只拦带尾斜杠的子路径；`/panel` 本身在下面 302 到 `/panel/`。
+  if (path.startsWith('/panel/')) {
+    return new Response('Not Found', { status: 404, headers: { ...securityHeaders(), 'content-type': 'text/plain; charset=utf-8' } })
   }
 
   // ── /favicon.ico：显式返回 204 ──
@@ -1261,46 +1365,93 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return await handleTraeCallback(env, url, path)
   }
 
-  // ── 鉴权 ──
+  // ── 其余一律鉴权 ──
   //
-  // ## 两套凭据
+  // ## 🔴 两条身份通道（主密钥 vs 子密钥）
   //
-  // 1. **主密钥**（`API_KEY`）—— 全量权限：面板、`/admin/*`、`/v1/*`；
-  // 2. **子密钥**（自定义 API Key）—— **只能**调 `/v1/*`，且受配额/IP/模型限制。
+  // 主密钥（`API_KEY`）能进 `/admin/*` 与 `/v1/*`；**子密钥只能进 `/v1/*`**。
   //
-  // ⚠️ 子密钥走「先放行、后记账」：模型白名单要从**请求体**里读，
-  // 而请求体只能读一次，故对话路径的鉴权推到 `guardV1()` 里做。
-  // 这里只处理：
-  //   - `/admin/*` 与面板：**只认主密钥**（子密钥不得触管理面）；
-  //   - `/v1/models`：无请求体，在这里就能判完；
-  //   - 其余 `/v1/*`：交给各分支自己的 `guardV1()`。
-  const isV1 = path.startsWith('/v1/')
+  // ⚠️ 为什么必须在这里分流、而不是在 `authorized()` 里一并放行：
+  // 子密钥是"发给外部调用方的受限凭证"，它若能进 `/admin/*`，就能
+  // **自己给自己扩容**（改写自己的 limits）、列出别人的 Key、读账号凭据 ——
+  // 那等于把"受限"两个字作废。
+  //
+  // ⚠️ 判定顺序刻意为「主密钥优先」：子密钥路径要打一次 DO（查哈希），
+  // 主密钥不用。日常运维走的是主密钥，不该为子密钥的选择付代价。
+  const isV1Path = path.startsWith('/v1/')
+  /**
+   * 🔴 **子密钥记录必须提到外层作用域**（2026-10-21 审查补，M6 指出高危）。
+   *
+   * 原来 `sub` 只活在下面这个 `if` 块里，而模型白名单**必须等请求体解析完**
+   * （那一刻才知道 `model`）才能判 ⇒ 块外的代码拿不到 `record` ⇒
+   * 校验点**根本无处安放**，于是从来没有被校验过。
+   */
+  /**
+   * 🔴 **鉴权失败限速**（2026-10-21 审查补，安全面专项）。
+   *
+   * 全仓原本没有入站限流：实测 **200 个乱猜 Bearer 并发打完只要 179 ms**
+   *（≈1100 rps，全部 401、无 429、无延时），而每个请求都要一次 SHA-256 + 一次
+   * DO/SQLite 查询。两条利用路径：在线爆破弱主密钥；无凭据打满 CPU。
+   *
+   * 判据是「**失败次数**」而非总流量 —— 正常客户端几乎不会鉴权失败，
+   * 所以误伤面最小；且鉴权成功会把该 IP 的计数清零（防爆破不能变成拒绝服务）。
+   */
+  const clientIp = clientIpOf(request)
+  const blocked = authBlocked(clientIp)
+  if (blocked.limited) {
+    return json(
+      {
+        error: {
+          message: `鉴权失败次数过多，请 ${Math.ceil(blocked.retryAfterMs / 1000)} 秒后重试`,
+          type: 'rate_limit_error',
+        },
+      },
+      429,
+      { 'retry-after': String(Math.ceil(blocked.retryAfterMs / 1000)) },
+    )
+  }
 
-  if (isV1) {
-    if (path === '/v1/models') {
-      const auth = await authenticate(request, env, '')
-      if (auth.kind === 'none') {
-        return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
-      }
-      if (auth.kind === 'subkey-denied') {
-        // ⚠️ 被拒也要记一笔（`rejected`）—— 否则面板上「用量全 0、却调不通」
-        // 看不出发生了什么。与 `guardV1` 的处理保持一致。
-        try {
-          await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')).recordApiKeyUse({
-            id: auth.record.id, ip: clientIpOf(request), model: '',
-            input: 0, output: 0, rejected: true,
-          })
-        } catch { /* 记账失败不影响拒绝结果 */ }
-        return json({ error: { message: auth.reason, type: 'permission_error' } }, auth.status)
-      }
-      v1Auth = auth
-      // ⚠️ **子密钥必须在列目录时也占名额**：不占的话 `/v1/models` 可以无限调
-      // 而不消耗配额，面板「请求数」永远是 0 —— 一个对不上的配额表比没有更糟。
-      if (auth.kind === 'subkey') void countUse(env, auth.record, request, '')
+  let subkeyRecord: ApiKeyRecord | undefined
+  if (!(await authorized(request, env))) {
+    // 不是主密钥 ⇒ 只有在 `/v1/*` 上才尝试子密钥。
+    if (!isV1Path) {
+      noteAuthFailure(clientIp)
+      return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
     }
-    // 其余 `/v1/*` 不在这里鉴权（`v1Auth` 仍是 `undefined`）——见各分支。
-  } else if (!(await authorized(request, env))) {
-    return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
+    // ⚠️ 此时还不知道模型，先传空串跳过模型检查；真正的模型校验在
+    // 拿到请求体之后（见下方 `/v1/chat/completions` 分支）。
+    const sub = await authenticate(request, env, '')
+    if (sub.kind === 'none') {
+      noteAuthFailure(clientIp)
+      return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
+    }
+    // 鉴权成功 ⇒ 清掉该 IP 的失败计数（否则同事的合法请求会被一起锁住）
+    noteAuthSuccess(clientIp)
+    if (sub.kind === 'subkey-denied') {
+      // ⚠️ 429 用于配额（可重试），403 用于 IP/模型范围（换 Key 才行）——
+      // 两者对调用方的运维含义完全不同，不能合并成一个状态码。
+      return json({ error: { message: sub.reason, type: 'permission_error' } }, sub.status)
+    }
+    // 放行：占住请求数名额（token 在流结束时补）。
+    // ⚠️ 不 await —— 它不该拖慢首字节；失败只记日志。
+    if (sub.kind === 'subkey') {
+      // ⚠️ 模型名此时还未知（在请求体里），传空串占名额即可；
+      // `countUse` 内部的 `recordApiKeyUse` 只累加请求数，不校验模型。
+      // 模型白名单改在拿到请求体后单独判（见下方 `subkeyRecord` 的用法）。
+      subkeyRecord = sub.record
+    /**
+     * 🔴 登记本次请求的「子密钥归属」（2026-10-21 审查补，安全面专项）。
+     *
+     * `token` 配额此前是一条**从未接线**的死限制：`authenticate()` 只用
+     * `input=0/output=0` 记一次请求，而唯一能补真实用量的 `settleUsage()`
+     * **零调用者** ⇒ `maxTokens` 永远判不到（实测 `maxTokens=5` 连发 3 次全放行）。
+     *
+     * 挂到 `ctx` 上（WeakMap，随请求回收）：网关在 4 个「用量已知」的点调
+     * `settleSubkeyUsage(...)` 把真实 token 补回去。主密钥路径没有条目，零开销。
+     */
+    registerSubkeyUsage(ctx, sub.record, clientIpOf(request))
+      ctx.waitUntil(countUse(env, sub.record, request, ''))
+    }
   }
 
   // ── 登录：发起（返回授权 URL 给前端/用户） ──
@@ -1401,118 +1552,87 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ error: { message: 'unknown or expired state（请重新发起登录）', type: 'unknown_state' } }, 404)
   }
 
-  // ═══════════════════ 自定义 API Key（子密钥） ═══════════════════
-  //
-  // ## 为什么子密钥只有主密钥能管
-  //
-  // 这些端点全部在「先过 admin 鉴权」段落之后，故天然只认主密钥 ——
-  // 子密钥连**列列表**都不行，否则一把泄漏的子密钥可以自己给自己扩容。
-  //
-  // ## 明文只在两个地方出现
-  //
-  // ① 创建响应；② 重置响应。之后**永不回显**（库里只有哈希）——
-  // 若列表能回显明文，任何一次面板截图就等于密钥泄漏。
-
-  if (path === '/admin/apikeys' && request.method === 'GET') {
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
-    const records = await pool.listApiKeys()
-    const usages = await pool.listApiKeyUsages()
-    const now = Date.now()
-    const keys = records.map((r) => {
-      let u = usages[r.id] ?? emptyApiKeyUsage()
-      // ⚠️ 展示要反映**当前窗口**：窗口已过期就展示归零后的值，
-      // 否则用户会看到「上一窗口用满了」而误判成超额。
-      if (isWindowExpired(u, r.limits, now)) u = resetUsageWindow(u, now)
-      return toApiKeyView(r, u)
-    })
-    // 最近创建的在前（新加的更容易找到）
-    keys.sort((a, b) => b.createdAt - a.createdAt)
-    return json({ keys, now })
-  }
-
-  if (path === '/admin/apikeys' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const name = typeof body.name === 'string' && body.name.trim() !== '' ? body.name.trim().slice(0, 60) : '未命名'
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
-    // ⚠️ 生成→哈希→存库；明文只在本次响应里返回。
-    const plaintext = generateApiKey()
-    const record = await pool.addApiKey({
-      name,
-      hash: await hashApiKey(plaintext),
-      prefix: keyPrefix(plaintext),
-    })
-    // 创建时就可以带上限制（面板「新建」表单支持一次填完）
-    const limits = normalizeApiKeyLimits(body.limits)
-    const saved = await pool.updateApiKey(record.id, { limits })
-    if (saved === undefined) return jsonError(500, '创建后回读失败', 'internal_error')
-    return json({
-      // ⚠️ **只在这里出现一次**（面板必须提示用户立即复制）
-      key: plaintext,
-      record: toApiKeyView(saved, emptyApiKeyUsage()),
-    })
-  }
-
-  if (path === '/admin/apikeys/update' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const id = typeof body.id === 'string' ? body.id : ''
-    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
-    const patch: { name?: string; enabled?: boolean; limits?: ReturnType<typeof normalizeApiKeyLimits> } = {}
-    if (typeof body.name === 'string' && body.name.trim() !== '') patch.name = body.name.trim().slice(0, 60)
-    if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
-    if (body.limits !== undefined) patch.limits = normalizeApiKeyLimits(body.limits)
-    const updated = await pool.updateApiKey(id, patch)
-    if (updated === undefined) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
-    const usage = await pool.getApiKeyUsage(id)
-    return json({ ok: true, record: toApiKeyView(updated, usage) })
-  }
-
-  // ⚠️ 重置用 POST：语义上「生成新的密钥材料」是**不可逆**操作（旧 Key 立刻失效）。
-  if (path === '/admin/apikeys/reset' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
-    const id = typeof body.id === 'string' ? body.id : ''
-    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
-    const plaintext = generateApiKey()
-    const updated = await pool.updateApiKey(id, {
-      hash: await hashApiKey(plaintext),
-      prefix: keyPrefix(plaintext),
-    })
-    if (updated === undefined) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
-    // ⚠️ 重置后同时**清空用量**：新密钥不该继承旧密钥的配额消耗
-    //（否则用户「重置一下」发现还是超限，会以为重置没生效）。
-    await pool.resetApiKeyUsage(id)
-    const usage = await pool.getApiKeyUsage(id)
-    return json({ key: plaintext, record: toApiKeyView(updated, usage) })
-  }
-
-  if (path === '/admin/apikeys/remove' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
-    const id = typeof body.id === 'string' ? body.id : ''
-    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
-    const removed = await pool.removeApiKey(id)
-    // ⚠️ 删除不存在的条目返回 404（而不是静默 ok）——
-    // 静默成功会让用户以为删掉了，刷新后它又回来了。
-    if (!removed) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
-    return json({ ok: true })
-  }
-
-  if (path === '/admin/apikeys/reset-usage' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
-    const id = typeof body.id === 'string' ? body.id : ''
-    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
-    const okReset = await pool.resetApiKeyUsage(id)
-    if (!okReset) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
-    return json({ ok: true })
-  }
-
   // ── 删除账号（连带凭据；不可逆，故要求显式确认字段） ──
   // ── 按账号启用/停用（面板的「停用 / 启用」按钮） ──
   //
   // ⚠️ 与 `/admin/accounts/remove` 的区别：这个**可逆**，故**不需要 confirm**。
   // 用户点错了再点一次就好，加确认反而烦。
+  /**
+   * 单账号的**防封覆盖**（`/admin/accounts/safety`）。
+   *
+   * ## 为什么是账号级（用户 2026-10-22 要求）
+   *
+   * 用户原话：「我希望这个功能放到账号那里，因为我目前只是不想给 qd 限制，
+   * 防封开关也是，我希望我可以每个账号不同设置」。
+   *
+   * 不同上游的风控模型完全不同（`workbuddy` 要伪装、`qodercn` 用官方凭据
+   * 实测 20 并发零损伤），一个全局开关只能让两边互相迁就。
+   *
+   * ## 协议
+   *
+   * - 字段**不出现** ⇒ 保持原样（与 `setSafetyConfig` 同一纪律）；
+   * - 字段给 `null` ⇒ **删除该覆盖**，回到「沿用全局」；
+   * - 字段给值 ⇒ 覆盖（`0` / `false` 是合法值，不是「没设置」）。
+   *
+   * ⚠️ 返回体里带上 `effective`（合并后的**实际生效**值）：
+   * 面板据此回显，用户能直接看到「这个号现在到底受不受限制」，
+   * 而不是自己去推断全局值加覆盖的结果。
+   */
+  if (path === '/admin/accounts/safety' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      uid?: unknown; realm?: unknown; patch?: unknown
+    }
+    if (typeof body.uid !== 'string' || body.uid === '') {
+      return json({ error: { message: 'uid 必填', type: 'invalid_request_error' } }, 400)
+    }
+    if (body.patch === null || typeof body.patch !== 'object' || Array.isArray(body.patch)) {
+      return json({ error: { message: 'patch 必须是对象', type: 'invalid_request_error' } }, 400)
+    }
+    const realm = typeof body.realm === 'string' && body.realm !== '' ? body.realm : 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const result = await pool.setAccountSafety(body.uid, body.patch as Record<string, unknown>)
+    if (result === undefined) {
+      return json({ error: { message: '账号不存在', type: 'not_found' } }, 404)
+    }
+    // 合并后的实际生效值（面板回显用）
+    const effective = resolveSafetyFor(await pool.getSafetyConfig(), result.override)
+    return json({
+      ok: true,
+      uid: body.uid,
+      realm,
+      override: result.override,
+      effective,
+      // ⚠️ 越界字段**必须如实回报**，不能静默忽略 ——
+      // 静默会让用户以为「已经设上了」，而这个开关的意义就是控制行为。
+      ...(result.rejected.length > 0 ? { rejected: result.rejected } : {}),
+    })
+  }
+
+  /** 读单账号的防封覆盖 + 实际生效值（面板打开弹窗时用）。 */
+  if (path === '/admin/accounts/safety' && request.method === 'GET') {
+    const uid = url.searchParams.get('uid') ?? ''
+    if (uid === '') {
+      return json({ error: { message: 'uid 必填', type: 'invalid_request_error' } }, 400)
+    }
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const account = accounts.find((a) => a.uid === uid)
+    if (account === undefined) {
+      return json({ error: { message: '账号不存在', type: 'not_found' } }, 404)
+    }
+    const global = await pool.getSafetyConfig()
+    return json({
+      ok: true,
+      uid,
+      realm,
+      override: account.safetyOverride ?? {},
+      global,
+      effective: resolveSafetyFor(global, account.safetyOverride),
+    })
+  }
+
+
   if (path === '/admin/accounts/toggle' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as {
       uid?: string; realm?: string; disabled?: boolean
@@ -1528,6 +1648,79 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const ok = await pool.setAccountDisabled(body.uid, body.disabled, Date.now())
     if (!ok) return json({ error: { message: '账号不存在' } }, 404)
     return json({ ok: true, uid: body.uid, disabled: body.disabled, realm })
+  }
+
+  /**
+   * 手动刷新余额快照（`POST /admin/accounts/balance`）。
+   *
+   * ## 为什么需要这个端点
+   *
+   * 余额由 cron **每小时**刷一次。但用户点开面板时想要的是**此刻**的数字，
+   * 而「刚签到完 / 刚充了额度 / 刚被扣了一大笔」这三种场景下等一小时太久。
+   *
+   * ⚠️ 与 cron 用**同一段逻辑**（`refreshAccountBalances`）：
+   * 两处各写一份必然慢慢分叉（本项目已吃过「只修一半」的亏多次）。
+   *
+   * ⚠️ 上游是**只读**的（`billing/meter/get-user-resource`，不消耗配额），
+   * 但**本地会写状态**：余额三元组 + 采样史（`updateBalance`），
+   * 以及「余额恢复 ⇒ 解冻 hard 冷却」（`clearHardIfRecovered`，**只清这一维**）。
+   * 原注释写的是「不改任何账号状态」—— 那是 `clearHardIfRecovered` 落地前的说法，
+   * 已不成立；留着会让下一个人以为调它不会影响选号。
+   */
+  if (path === '/admin/accounts/balance' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { realm?: string; uid?: string }
+    const now = Date.now()
+    const realms = typeof body.realm === 'string' && body.realm !== '' ? [body.realm] : ['cn', 'global']
+    const results: Array<{ uid: string; provider: string; ok: boolean; credits?: number; error?: string }> = []
+
+    for (const realm of realms) {
+      const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+      const accounts = await pool.listAccounts(realm, now)
+      for (const account of accounts) {
+        if (typeof body.uid === 'string' && body.uid !== '' && account.uid !== body.uid) continue
+        const providerId = account.provider ?? DEFAULT_PROVIDER
+        // ⚠️ 同 cron：buddy 必须用绑定版（它的 balance 闭包依赖 env）。
+        const template = findProvider(providerId)
+        const provider = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : template
+        // 没有余额端点的家如实跳过，不编造 0。
+        if (provider?.balance === undefined) {
+          results.push({ uid: account.uid, provider: providerId, ok: false, error: '该供应商无余额端点' })
+          continue
+        }
+        try {
+          const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+          if (credential === undefined) {
+            results.push({ uid: account.uid, provider: providerId, ok: false, error: '凭据不可读' })
+            continue
+          }
+          const b = await provider.balance(credential, AbortSignal.timeout(20_000))
+          await pool.updateBalance(account.uid, now, {
+            credits: b.total,
+            expiring: b.expiring,
+            earliestExpiry: b.earliestExpiry,
+          })
+          // 🔴 余额恢复 ⇒ 解冻 `hard`（402 余额耗尽）冷却。**必须显式调用**：
+          // `updateBalance` 刻意只写额度、不碰惩罚态（见该方法注释），
+          // 所以「充值后自动恢复」这件事此前全仓从未实现 —— 用户充了钱仍被锁到次日 04:00。
+          // ⚠️ 只清这一维（breaker/soft/restricted 各有各的现实原因，见 `clearHardIfRecovered`）。
+          // ⚠️ 失败**不改变**余额刷新结论（余额已经落盘了），故单独兜住并留痕。
+          await pool.clearHardIfRecovered(account.uid, b.total, now).catch((error: unknown) => {
+            console.warn('[balance] 解冻 hard 冷却失败：', error instanceof Error ? error.message : String(error))
+          })
+          results.push({ uid: account.uid, provider: providerId, ok: true, credits: b.total })
+        } catch (error) {
+          // ⚠️ 失败**不写 0**：查不到 ≠ 没钱了。
+          results.push({
+            uid: account.uid,
+            provider: providerId,
+            ok: false,
+            error: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160),
+          })
+        }
+      }
+    }
+
+    return json({ ok: true, refreshed: results.filter((r) => r.ok).length, results })
   }
 
   if (path === '/admin/accounts/remove' && request.method === 'POST') {
@@ -1572,13 +1765,27 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const loginRealm = body.realm ?? (providerId === WORKBUDDY_INTL.id ? 'global' : 'cn')
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(loginRealm))
 
-    if (providerId === 'qoder') {
+    // ── Qoder（国际版 / 中国版：协议同一份，仅产品配置不同）──
+    //
+    // ⚠️ 两个变体走**同一段**处理逻辑，只把 variant 传下去 ——
+    // 参考实现明确记录「不存在『CN 要另写一份协议』的情况」
+    //（\`qoder-product.ts:176-180\`），复制一份实现会让每个已记录的缺陷修两遍。
+    //
+    // ⚠️ 会话里必须记下 variant（\`session.productId\`）：轮询时
+    // \`pollQoderLogin\` 靠它重建产品配置（token 端点与 clientId 都不同），
+    // 丢了就会拿中国版的票去国际版换令牌 —— 那是必然失败且报错难懂。
+    if (providerId === 'qoder' || providerId === 'qodercn') {
       const { startQoderLogin } = await import('./providers/qoder.js')
-      const session = await startQoderLogin('qoder')
+      const variant = providerId === 'qodercn' ? 'qodercn' : 'qoder'
+      const session = await startQoderLogin(variant)
       const state = crypto.randomUUID()
       // 会话存 DO（**不返回 verifier 给前端**：那是换取令牌的秘密）
-      await pool.saveLoginSession(state, { provider: 'qoder', kind: 'qoder', session }, Date.now() + 15 * 60 * 1000)
-      return json({ ok: true, provider: 'qoder', state, authUrl: session.loginUrl })
+      await pool.saveLoginSession(
+        state,
+        { provider: variant, kind: 'qoder', session },
+        Date.now() + 15 * 60 * 1000,
+      )
+      return json({ ok: true, provider: variant, state, authUrl: session.loginUrl })
     }
     if (providerId === 'zcode') {
       const { startZcodeLogin } = await import('./providers/zcode.js')
@@ -1601,7 +1808,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       const ticketId = crypto.randomUUID()
       const state = generateCodeArtsLoginState()
       // 回调地址取**本次请求的 origin** —— 自定义域与 workers.dev 都自动正确。
-      const callbackUrl = buildCodeArtsCallbackUrl(url.origin, state)
+      const callbackUrl = buildCodeArtsCallbackUrl(publicOrigin(env, url), state)
       const { loginUrl } = buildCodeArtsLoginUrl(callbackUrl, ticketId)
       const expiresAt = Date.now() + CODEARTS_LOGIN_STATE_TTL_MS
       // ⚠️ `expiresAt` 也存进载荷：回调回写 secret 时要沿用它（否则每次回跳
@@ -2495,6 +2702,210 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   //
   // 只对**声明了 checkin: true** 的供应商执行 —— 其余家显式跳过并说明原因，
   // 不静默忽略（用户需要知道「为什么这家没签」）。
+  // ── 永久积分锁（防止临期额度烧完后静默消耗花钱买的永久积分） ──
+  //
+  // ⚠️ per-provider 开关，**锁的不是 provider 本身**：有临期额度的账号照常可选，
+  // 被滤掉的只是「**只剩**永久额度」的那些。
+  if (path === '/admin/permanent-locks' && request.method === 'GET') {
+    // ⚠️ 锁表存在 cn 分片（与供应商设置同一纪律：这是全局开关，与 realm 无关）
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    return json({ locks: await pool.getPermanentLocks() })
+  }
+
+  if (path === '/admin/permanent-locks' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { provider?: unknown; locked?: unknown }
+    const provider = typeof body.provider === 'string' ? body.provider : ''
+    if (provider === '') return jsonError(400, 'provider 必填', 'invalid_request_error')
+    if (typeof body.locked !== 'boolean') return jsonError(400, 'locked 必须是 boolean', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const locks = await pool.setPermanentLock(provider, body.locked)
+    // ⚠️ **必须镜像到 global 分片**（真实缺陷）：`pick()` 读的是**账号所在分片**
+    // 自己的存储，而 WorkBuddy 国际版的账号在 global —— 只写 cn 时国际版的锁
+    // 永远不生效，照样烧永久积分。cn 仍是权威（GET 读它），这里整表覆盖同步，
+    // 顺带修复旧版本只写了 cn 的历史数据（任意切换一次锁即同步）。
+    const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    await globalPool.replacePermanentLocks(locks)
+    return json({ ok: true, provider, locked: body.locked, locks })
+  }
+
+  // ── 指定账号（per-provider，存在账号所在分片） ──
+  //
+  // GET  /admin/pins                         → { pins: [{ realm, provider, uid, mode, nickname }] }
+  // POST /admin/pins { realm, uid, mode }     → 把该账号设为其供应商的指定账号
+  // POST /admin/pins { realm, provider, uid: '' } → 取消该供应商的指定
+  if (path === '/admin/pins' && request.method === 'GET') {
+    const requested = url.searchParams.get('realm') ?? ''
+    const realms = requested === '' ? ['cn', 'global'] : [requested]
+    const out: Array<{ realm: string; provider: string; uid: string; mode: string; nickname: string }> = []
+    for (const realm of realms) {
+      const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+      const pins = await pool.getPins()
+      for (const [provider, pin] of Object.entries(pins)) {
+        const account = await pool.getAccount(pin.uid)
+        out.push({ realm, provider, uid: pin.uid, mode: pin.mode, nickname: account?.nickname ?? '' })
+      }
+    }
+    return json({ pins: out })
+  }
+
+  if (path === '/admin/pins' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      realm?: unknown; provider?: unknown; uid?: unknown; mode?: unknown
+    }
+    const realm = typeof body.realm === 'string' && body.realm !== '' ? body.realm : 'cn'
+    if (realm !== 'cn' && realm !== 'global') return jsonError(400, 'realm 只能是 cn 或 global', 'invalid_request_error')
+    const uid = typeof body.uid === 'string' ? body.uid.trim() : ''
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    if (uid === '') {
+      const provider = typeof body.provider === 'string' ? body.provider : ''
+      if (provider === '') return jsonError(400, '取消指定需要 provider', 'invalid_request_error')
+      const pins = await pool.clearPin(provider)
+      return json({ ok: true, realm, provider, pinned: null, pins })
+    }
+    const mode = body.mode === undefined ? 'only' : body.mode
+    if (mode !== 'only' && mode !== 'prefer') {
+      return jsonError(400, 'mode 只能是 only（只用它）或 prefer（优先用它）', 'invalid_request_error')
+    }
+    // 调用方带了 provider 时由 DO 校验一致（不一致**不写入**），
+    // 防止「以为指定给 A 家、其实落到 B 家」
+    const expected = typeof body.provider === 'string' ? body.provider : undefined
+    const result = await pool.setPin(uid, mode, expected)
+    if (!result.ok) {
+      return result.code === 'not_found'
+        ? jsonError(404, `${result.error}（realm=${realm}）`, 'not_found')
+        : jsonError(400, result.error, 'invalid_request_error')
+    }
+    return json({ ok: true, realm, provider: result.provider, pinned: { uid, mode }, pins: result.pins })
+  }
+
+  // ── 限时补偿积分（wb 面板上那个「立即领取」按钮） ──
+  //
+  // ⚠️ 这是**一次性写操作**，故刻意**不**接进自动签到 / cron：
+  //   活动是限时的（过了 end_time 就作废），误触没有第二次机会。
+  //   参考实现对此有同样的纪律（详见 upstream/compensation.ts 模块头）。
+  //
+  // 两个端点分开：
+  //   GET  /admin/compensation          → 只查状态（安全，可反复调）
+  //   POST /admin/compensation/claim    → 真的领取（一次性）
+  if (path === '/admin/compensation' && request.method === 'GET') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const only = url.searchParams.get('provider') ?? DEFAULT_PROVIDER
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const results: Array<Record<string, unknown>> = []
+
+    for (const account of accounts) {
+      const providerId = account.provider ?? DEFAULT_PROVIDER
+      if (providerId !== only) continue
+      if (account.disabled) {
+        results.push({ uid: account.uid, ok: false, detail: '账号已禁用' })
+        continue
+      }
+      const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      if (credential === undefined) {
+        results.push({ uid: account.uid, ok: false, detail: '账号缺少凭据' })
+        continue
+      }
+      // ⚠️ 凭据字段是**驼峰** accessToken（ProviderCredential），不是 snake_case。
+      const accessToken = credential.accessToken
+      if (accessToken === undefined || accessToken === '') {
+        results.push({ uid: account.uid, ok: false, detail: '凭据缺少 accessToken' })
+        continue
+      }
+      try {
+        const status = await fetchCompensationStatus({ uid: account.uid, accessToken }, env)
+        results.push({
+          uid: account.uid,
+          nickname: account.nickname,
+          ok: true,
+          // ⚠️ undefined ⇒ 上游**没有这个活动**或形态不认识。
+          // 如实标出来，不要编成 active:false（那是「活动已过期」的语义，不一样）。
+          available: status !== undefined,
+          status: status ?? null,
+        })
+      } catch (error) {
+        results.push({
+          uid: account.uid,
+          ok: false,
+          detail: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return json({ results, now: Date.now() })
+  }
+
+  if (path === '/admin/compensation/claim' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      realm?: string
+      provider?: string
+      uids?: unknown
+    }
+    const realm = body.realm ?? 'cn'
+    const only = body.provider ?? DEFAULT_PROVIDER
+    // uids 缺省 ⇒ 领**全部可领**的账号；显式传 [] ⇒ 一个都不领
+    const wanted = Array.isArray(body.uids)
+      ? body.uids.filter((x): x is string => typeof x === 'string')
+      : undefined
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const results: Array<Record<string, unknown>> = []
+
+    for (const account of accounts) {
+      const providerId = account.provider ?? DEFAULT_PROVIDER
+      if (providerId !== only) continue
+      if (wanted !== undefined && !wanted.includes(account.uid)) continue
+      if (account.disabled) {
+        results.push({ uid: account.uid, ok: false, detail: '账号已禁用' })
+        continue
+      }
+      const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      if (credential === undefined) {
+        results.push({ uid: account.uid, ok: false, detail: '账号缺少凭据' })
+        continue
+      }
+      // ⚠️ 凭据字段是**驼峰** accessToken（ProviderCredential），不是 snake_case。
+      const accessToken = credential.accessToken
+      if (accessToken === undefined || accessToken === '') {
+        results.push({ uid: account.uid, ok: false, detail: '凭据缺少 accessToken' })
+        continue
+      }
+      try {
+        // ⚠️ 领之前先查一次：已经领过的**不要**白打上游（一次性写操作尤其要克制），
+        // 也避免把「已领取」误报成「领取失败」。
+        const status = await fetchCompensationStatus({ uid: account.uid, accessToken }, env)
+        if (status === undefined) {
+          results.push({ uid: account.uid, ok: false, detail: '查不到补偿状态（上游无此活动或形态已变）' })
+          continue
+        }
+        if (status.claimed) {
+          results.push({ uid: account.uid, ok: true, alreadyClaimed: true, detail: '该账号此前已领取' })
+          continue
+        }
+        if (!status.active) {
+          results.push({ uid: account.uid, ok: false, detail: '补偿活动已结束' })
+          continue
+        }
+        const r = await claimCompensation({ uid: account.uid, accessToken }, env)
+        results.push({
+          uid: account.uid,
+          nickname: account.nickname,
+          ok: true,
+          claimed: r.claimed,
+          alreadyClaimed: r.alreadyClaimed,
+          creditNum: status.creditNum,
+          detail: r.message,
+        })
+      } catch (error) {
+        results.push({
+          uid: account.uid,
+          ok: false,
+          detail: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return json({ results, now: Date.now() })
+  }
+
   if (path === '/admin/checkin/all' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as { realm?: string; provider?: string }
     const realm = body.realm ?? 'cn'
@@ -2513,6 +2924,34 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       const provider = findProvider(providerId)
       if (provider === undefined) {
         results.push({ uid: account.uid, provider: providerId, ok: false, detail: '未知供应商' })
+        continue
+      }
+      // 国际版没有签到接口：每日活跃积分靠「跑完一条网页端 agent 会话」，
+      // 单个账号就要 ~35 个子请求、十几秒到两分钟 —— 不能在这个请求里串行跑，
+      // 改为**入队 TaskRunner**（每账号独立 alarm 预算），结果见 `/admin/tasks/status`。
+      if (isIntlWorkbuddy(account)) {
+        if (account.lastCheckinDay === cstDay(Date.now())) {
+          results.push({
+            uid: account.uid, provider: providerId, nickname: account.nickname,
+            ok: true, alreadyDone: true, detail: '今日已完成网页端活跃打卡',
+          })
+          continue
+        }
+        try {
+          const r = await startRun(env, {
+            uid: account.uid, nickname: account.nickname, realm: account.realm, accessToken: '', plan: 'intlDaily',
+          })
+          results.push({
+            uid: account.uid, provider: providerId, nickname: account.nickname,
+            ok: true, queued: r.queued,
+            detail: '已入队网页端活跃打卡（约 1–2 分钟跑完，结果见 /admin/tasks/status）',
+          })
+        } catch (error) {
+          results.push({
+            uid: account.uid, provider: providerId, nickname: account.nickname,
+            ok: false, detail: `入队失败：${error instanceof Error ? error.message : String(error)}`,
+          })
+        }
         continue
       }
       if (!provider.capabilities.checkin || provider.checkin === undefined) {
@@ -2674,7 +3113,28 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         body: JSON.stringify({
           model,
           messages: [{ role: 'user', content: '1' }],
-          max_tokens: 1,
+          /**
+           * 🔴 **不能给 1**（2026-10-21 实测缺陷）。
+           *
+           * 面板上出现过这样的探测结果：
+           * ```
+           * 探测: upstream_problem
+           * 失败 · 1467ms · 上游返回了空响应（既没有正文/思考内容…）
+           * 上游原文片段: …"model":"hy4-preview"…"delta":{"content":"","reasoning…
+           * ```
+           * 而那个账号的状态是「正常」、积分充足 —— **探测自己报了假警**。
+           *
+           * 原因：`hy4-preview` 是**推理模型**，`max_tokens: 1` 的那 1 个 token
+           * 全被用在「思考」上，正文必然是空串。而网关的「空响应」兜底
+           * （`server.ts` 的 `content === '' && reasoning_content === ''`）
+           * 在 reasoning 也为空时就会如实报「上游返回了空响应」
+           * ⇒ 探测把「我给的预算太小」误报成「上游有问题」。
+           *
+           * ⇒ 给一个能让推理模型「思考完还留一点给正文」的预算。
+           * 32 足够：探测只问一句「1」，正常模型 1-2 个 token 就答完，
+           * 推理模型也能产出非空 reasoning（判据已把 reasoning 算作内容）。
+           */
+          max_tokens: 32,
           stream: false,
         }),
       })
@@ -2755,7 +3215,29 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const cleared = await pool.clearModelCooldowns(realm, body.uid, body.model)
     // 同时清账号级熔断/冷却（排查「明明健康却选不到号」时用）
     const resetCount = await pool.clearCooldowns(realm, body.uid)
-    return json({ ok: true, realm, cleared, resetCount })
+    /**
+     * 🔴 **「清空冷却」必须连两道全局闸门一起解**（2026-10-21 审查补，M5 指出高危）。
+     *
+     * ## 缺陷
+     * 两道闸门（IP 级 WAF / 11140 波次暂停）是**分片级**状态，
+     * 只有 `clearWafGate()` / `clearRestrictionGate()` 能解，
+     * 而本端点原来只清 `modelCooldowns` + `clearCooldowns`（账号级），**不碰闸门**。
+     *
+     * ⇒ 用户点「清空冷却」看到 toast 成功、列表里账号也确实「正常」，
+     * 但请求仍然**全部失败**，最长 30 分钟（波次暂停的窗口）。
+     * 这是最难查的一类：UI 说好了，链路说没好。
+     *
+     * ## 为什么只在「整个分片」时解
+     * 传了 `uid` 表示「只处理这一个号」，此时去解全分片闸门属于**越权副作用**
+     *（用户以为只动了一个号，实际放开了整片）。故只在 `uid` 缺省时解。
+     */
+    let gatesCleared = false
+    if (body.uid === undefined || body.uid === '') {
+      await pool.clearWafGate().catch(() => undefined)
+      await pool.clearRestrictionGate().catch(() => undefined)
+      gatesCleared = true
+    }
+    return json({ ok: true, realm, cleared, resetCount, gatesCleared })
   }
 
   // ── 供应商目录（面板用：显示每家的能力与登录阻塞原因） ──
@@ -2800,6 +3282,26 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ ok: true, order, disabled })
   }
 
+  // ── 防封（风控规避）配置 ──
+  //
+  // ⚠️ 与 `/admin/config/routing` **同款双分片镜像**：配置读的是「发起该请求的
+  // realm」，只写 cn 会让国际版账号那一侧读到旧值（与永久积分锁同一个坑）。
+  if (path === '/admin/config/safety' && request.method === 'GET') {
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const config = await cnPool.getSafetyConfig()
+    return json({ ok: true, config })
+  }
+  if (path === '/admin/config/safety' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const config = await cnPool.setSafetyConfig(body)
+    const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    await globalPool.setSafetyConfig(config)
+    // 立刻失效网关侧缓存：否则面板点完还要等 TTL 才看到效果，用户会以为没保存。
+    resetSafetyConfigCache()
+    return json({ ok: true, config })
+  }
+
   // ── 路由与调度策略配置 ──
   if (path === '/admin/config/routing' && request.method === 'GET') {
     const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
@@ -2810,6 +3312,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
     const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
     const config = await cnPool.setRoutingConfig(body)
+    // ⚠️ 必须镜像到 global 分片：国际版账号在那里选号 / 记冷却，
+    // 只写 cn 会让「负载均衡模式」「软冷却时长」对国际版账号不生效（与永久积分锁同一个坑）。
+    const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    await globalPool.setRoutingConfig(config)
+    resetMaxRotateCache()
     return json({ ok: true, config })
   }
 
@@ -2817,6 +3324,115 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   if (path === '/admin/models/builtin' && request.method === 'GET') {
     const models = getBuiltinModels()
     return json({ ok: true, data: models, total: models.length })
+  }
+
+  // ═══════════════════ 自定义 API Key（子密钥） ═══════════════════
+  //
+  // ## 为什么子密钥必须只有主密钥能管
+  //
+  // 这几个端点全部在下面的「先过 admin 鉴权」段落之后，故天然只认主密钥 ——
+  // 子密钥连**列列表**都不行。否则一把泄漏的子密钥可以自己给自己扩容。
+  //
+  // ## 明文只在两个地方出现
+  //
+  // ① 创建响应；② 重置响应。之后**永不回显**（库里只有哈希）。
+  // 这是刻意的：若列表能回显明文，那么任何一次面板 XSS / 屏幕截图
+  // 就等于密钥泄漏 —— 而用户本来只需保存一次。
+
+  if (path === '/admin/apikeys' && request.method === 'GET') {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const records = await pool.listApiKeys()
+    const usages = await pool.listApiKeyUsages()
+    const now = Date.now()
+    const keys = records.map((r) => {
+      let u = usages[r.id] ?? emptyApiKeyUsage()
+      // ⚠️ 面板展示要反映**当前窗口**：窗口已过期就展示归零后的值，
+      // 否则用户会看到「上一窗口用满了」而实际新窗口是空的（误判成超额）。
+      if (isWindowExpired(u, r.limits, now)) u = resetUsageWindow(u, now)
+      return toApiKeyView(r, u)
+    })
+    // 最近创建的在前（新加的更容易找到）
+    keys.sort((a, b) => b.createdAt - a.createdAt)
+    return json({ keys, now })
+  }
+
+  if (path === '/admin/apikeys' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const name = typeof body.name === 'string' && body.name.trim() !== '' ? body.name.trim().slice(0, 60) : '未命名'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    // ⚠️ 生成→哈希→存库；明文只在本次响应里返回。
+    const plaintext = generateApiKey()
+    const record = await pool.addApiKey({
+      name,
+      hash: await hashApiKey(plaintext),
+      prefix: keyPrefix(plaintext),
+    })
+    // 创建时就可以带上限制（面板的「新建」表单支持一次填完）
+    const limits = normalizeApiKeyLimits(body.limits)
+    const saved = await pool.updateApiKey(record.id, { limits })
+    if (saved === undefined) return jsonError(500, '创建后回读失败', 'internal_error')
+    return json({
+      // ⚠️ **只在这里出现一次**（面板必须提示用户立即复制）
+      key: plaintext,
+      record: toApiKeyView(saved, emptyApiKeyUsage()),
+    })
+  }
+
+  if (path === '/admin/apikeys/update' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const patch: { name?: string; enabled?: boolean; limits?: ReturnType<typeof normalizeApiKeyLimits> } = {}
+    if (typeof body.name === 'string' && body.name.trim() !== '') patch.name = body.name.trim().slice(0, 60)
+    if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
+    if (body.limits !== undefined) patch.limits = normalizeApiKeyLimits(body.limits)
+    const updated = await pool.updateApiKey(id, patch)
+    if (updated === undefined) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    const usage = await pool.getApiKeyUsage(id)
+    return json({ ok: true, record: toApiKeyView(updated, usage) })
+  }
+
+  // ⚠️ 重命名端点路径带 `reset` + POST：语义上「生成新的密钥材料」
+  // 是**不可逆**的操作（旧 Key 立刻失效），不能是 GET。
+  if (path === '/admin/apikeys/reset' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const plaintext = generateApiKey()
+    const updated = await pool.updateApiKey(id, {
+      hash: await hashApiKey(plaintext),
+      prefix: keyPrefix(plaintext),
+    })
+    if (updated === undefined) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    // ⚠️ 重置后同时**清空用量**：新密钥不该继承旧密钥的配额消耗
+    //（否则用户「重置一下」发现还是超限，会以为重置没生效）。
+    await pool.resetApiKeyUsage(id)
+    const usage = await pool.getApiKeyUsage(id)
+    return json({ key: plaintext, record: toApiKeyView(updated, usage) })
+  }
+
+  if (path === '/admin/apikeys/remove' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const removed = await pool.removeApiKey(id)
+    // ⚠️ 删除不存在的条目返回 404（而不是静默 ok）——
+    // 静默成功会让用户以为删掉了，刷新后它又回来了。
+    if (!removed) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    return json({ ok: true })
+  }
+
+  if (path === '/admin/apikeys/reset-usage' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: unknown }
+    const id = typeof body.id === 'string' ? body.id : ''
+    if (id === '') return jsonError(400, 'id 必填', 'invalid_request_error')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const okReset = await pool.resetApiKeyUsage(id)
+    if (!okReset) return jsonError(404, `找不到 id 为「${id}」的 API Key`, 'not_found')
+    return json({ ok: true })
   }
 
   // ── 按供应商列模特（面板用） ──
@@ -2854,7 +3470,21 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         //（也避免在 refresh_token 已失效时反复尝试续期 —— 那是**终态**，
         // 重试只会浪费一次请求）。判据与 `pick()` 的健康检查保持一致。
         if (a.disabled === true) continue
-        if (a.until > Date.now() || a.breakerUntil > Date.now()) continue
+        /**
+         * 🔴 判据必须与 `pick()` **完全一致**（2026-10-21 审查补，M5 指出）。
+         *
+         * 原注释自称「与 `pick()` 的健康检查保持一致」，但只查了三个字段，
+         * **漏了 `restrictedUntil`（上游封号）与 `degradeUntil`（连续业务失败降权）**。
+         * ⇒ 这两种号会被排到队列前面去白打上游，第一步就失败，
+         * 用户看到「模型列表又报登录态过期」，而池里明明有好号。
+         *
+         * 这正是本段注释上一段在描述的那个缺陷（「选号策略不一致」）的**另一半**：
+         * 换了「逐个尝试」解决了「第一个是坏号」，但坏号的**定义**仍然不同。
+         */
+        // ⚠️ 直接复用 `healthy()`，不再手抄一份判据（2026-10-21 审查补，重复实现专项）。
+        // 手抄的代价已经付过一次（漏了 `restrictedUntil`/`degradeUntil`）；
+        // 下次 `healthy()` 加第 6 个维度时，这里会自动跟上，不用靠人记得。
+        if (!healthy(a, Date.now())) continue
         candidates.push({ pool: candidatePool, uid: a.uid })
       }
     }
@@ -3057,12 +3687,58 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ ok: true, realm, note: '已解除 IP 级拦截（若实际是账号级问题，相关账号仍处于各自的冷却中）' })
   }
 
+  // ── 11140 账号级限制波次：查询与人工解除 ──
+  //
+  // 与 IP 级 gate **分开**（判据不同，见 AccountPoolDO 的 RESTRICTION_* 注释）。
+  // 同样必须留人工纠正入口：波次暂停是「保守停手」，若实际是误判
+  //（比如多个号同时因别的原因返回了形似 11140 的错误），用户要能立刻恢复。
+  if (path === '/admin/restriction/status' && request.method === 'GET') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const status = await pool.restrictionGateStatus(Date.now()).catch(() => null)
+    if (status === null) return json({ realm, active: false, until: 0, recentUids: 0, unsupported: true })
+    return json({ realm, ...status, windowMs: 15 * 60_000, threshold: 2 })
+  }
+
+  if (path === '/admin/restriction/clear' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { realm?: string; uid?: string }
+    const realm = body.realm ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    // 带 uid ⇒ 解除**该账号**的 restrictedUntil（确认误判时用）；
+    // 不带 ⇒ 只清波次暂停。两层语义不同，不能混成一个动作。
+    if (typeof body.uid === 'string' && body.uid !== '') {
+      const outcome = await pool.clearAccountRestriction(body.uid)
+      if (!outcome.found) {
+        return json({ error: { message: `账号不存在：${body.uid}`, type: 'not_found' } }, 404)
+      }
+      return json({
+        ok: true,
+        realm,
+        uid: body.uid,
+        cleared: outcome.cleared,
+        note: outcome.cleared
+          ? '已解除该账号的上游限制标记与失败计数（仅用于确认误判时）'
+          : '该账号本来就没有上游限制标记（失败计数已清零）',
+      })
+    }
+    await pool.clearRestrictionGate()
+    return json({
+      ok: true,
+      realm,
+      note: '已解除账号级限制波次暂停（若账号确实被上游标记，它们各自的 restrictedUntil 仍然生效；传 uid 可解除单个账号）',
+    })
+  }
+
   // ── 账号导入（兼容 Go 的 auths/*.json 双形态） ──
   if (path === '/admin/import' && request.method === 'POST') {
     let payload: unknown
     try {
-      payload = await request.json()
-    } catch {
+      // 导入放宽到 32 MiB（要一次塞多个 auths/*.json），但**仍然有上限**。
+      payload = await readJsonCapped(request, MAX_IMPORT_BYTES)
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        return json({ error: { message: error.message, type: 'payload_too_large' } }, 413)
+      }
       return json({ error: { message: '请求体必须是合法 JSON', type: 'invalid_json' } }, 400)
     }
 
@@ -3151,7 +3827,40 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     }
 
     // ⚠️ 只回 uid/nickname 等非敏感字段，**绝不回 token**
-    return json({ ok: imported.length > 0, imported, skipped })
+    /**
+     * 🔴 **一条都没导入时不能回 200**（2026-10-21 审查补，M5 指出）。
+     *
+     * 原来无论成不成，都回 `200 + {ok:false, imported:[], skipped:[...]}`。
+     * 而面板的 `useAction` 只认 HTTP 状态：`L()` 在 `!res.ok` 时才抛错，
+     * 于是**一条都没导入也照弹「账号已导入」**，`skipped[].reason` 全库无人读。
+     *
+     * 用户以为导入成功，列表里却没有新账号 —— 只能怀疑「是不是要刷新」。
+     *
+     * 面板包装器（`web/src/lib/api.ts` 的 `api()`）在非 2xx 时会抛
+     * `ApiError(status, body)` 并读 `body.error.message`，所以这里按标准
+     * 错误信封返回，提示能一路显示到 toast 上。
+     *
+     * 状态码用 **422**：请求格式是对的，只是内容全都不可用（不是 400 语法错）。
+     */
+    if (imported.length === 0) {
+      const first = skipped[0]
+      const why = first === undefined
+        ? '没有解析出任何账号'
+        : `第一条原因：${first.reason}`
+      return json(
+        {
+          error: {
+            message: `没有导入任何账号（${skipped.length} 条被跳过）。${why}`,
+            type: 'import_failed',
+          },
+          ok: false,
+          imported,
+          skipped,
+        },
+        422,
+      )
+    }
+    return json({ ok: true, imported, skipped })
   }
 
   // ── 凭据状态（**不回 token**，只回是否已存 + 脱敏提示） ──
@@ -3171,6 +3880,251 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   }
 
   // ── 账号列表 ──
+  /**
+   * 账号当前状态诊断（五维度冷却总览）。
+   *
+   * ## 为什么需要它（用户明确要求）
+   * 用户的原话是「能不能加一个显示冷却时间的功能，因为我看会返回当前模型达到冷却，
+   * 冷却到什么时候」。而 `/admin/accounts` 虽然已经回传了 `until` / `breakerUntil` /
+   * `restrictedUntil` / `modelCooldowns`，但那是**原始时间戳**，用户得自己减、
+   * 自己认字段 —— 且五个维度彼此正交，看单个字段无法回答「现在到底能不能用」。
+   *
+   * 本端点把它们汇总成一句人话 + 结构化明细，判据全部复用 `isActive()` / `healthy()`
+   *（不另写一套，避免本项目反复踩的「双判据」坑）。
+   */
+  if (path === '/admin/accounts/diagnose' && request.method === 'GET') {
+    /**
+     * ⚠️ **不传 realm 时必须聚合全部分片**（2026-10-21 修）。
+     *
+     * 早先是 `?? 'cn'` —— 于是 `curl /admin/accounts/diagnose` 只回 `cn` 分片的号，
+     * **`workbuddy`（国际版，realm=`global`）整个消失**，看起来像「号丢了」。
+     * 实测踩到：排查时以为 workbuddy 的 3 个号不见了，其实是没查 global 分片。
+     *
+     * ⚠️ 面板的账号列表没这个问题（它按 `realm` 分别请求 `/admin/accounts`），
+     * 但本端点面向**运维/排障**，默认就该给出全景。
+     */
+    const requested = url.searchParams.get('realm')
+    const realms = requested === null || requested === '' ? ['cn', 'global'] : [requested]
+    const now = Date.now()
+    const accounts = []
+    for (const realm of realms) {
+      const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+      accounts.push(...(await stub.listAccounts(realm, now)))
+    }
+    return json({
+      realm: realms.length === 1 ? realms[0] : 'all',
+      realms,
+      now,
+      accounts: accounts.map((a) => diagnoseAccount(a, now)),
+    })
+  }
+
+  /**
+   * 主动探测：**真的打一次上游**，回答「这个号现在到底能不能用」。
+   *
+   * ## 与 `/admin/accounts/diagnose` 的分工
+   * - `diagnose` 只看**库里已有的记录**（冷却/熔断/限制）⇒ 廉价、无副作用；
+   * - `probe` 真的发一次最小请求 ⇒ 能发现「库里没记录但其实已经不可用」
+   *   （如凭据悄悄失效、上游对该号静默降级）。
+   *
+   * ## 关键取舍：**不临时清除冷却**
+   * 曾考虑探测前清冷却、探测后恢复，但：
+   *   ① 恢复需要重放 `applyFailure`，会**干扰真实的指数退避计数**（把 streak 打乱）；
+   *   ② 探测中途失败（超时/客户端断开）会让账号**永久停在"无冷却"状态**，
+   *      相当于把保护关掉了 —— 代价远大于收益。
+   * ⇒ 采用**只读探测**：不改池状态，若账号正冷却则在 `note` 里如实说明
+   *   「本次探测反映上游真实状态，但网关仍不会派单」。
+   *
+   * ## 分类复用现有判据
+   * `verdict` 由 `classify()` + `mapErrorToPunishment()` 推出，不另写一套。
+   */
+  if (path === '/admin/accounts/probe' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      uid?: unknown
+      model?: unknown
+      realm?: unknown
+    }
+    const explicitRealm = typeof body.realm === 'string' && body.realm !== '' ? body.realm : undefined
+    const onlyUid = typeof body.uid === 'string' && body.uid !== '' ? body.uid : undefined
+    const wantedModel = typeof body.model === 'string' && body.model !== '' ? body.model : undefined
+
+    /**
+     * 🔴 **realm 不能盲目默认成 `cn`**（2026-10-21 实测缺陷）。
+     *
+     * 面板点「探测」时报过：
+     * ```
+     * 探测失败: 账号不存在：workbuddy:500b0019-3be3-493a-81b0-2330131e8939
+     * ```
+     * 而该账号明明在列表里、状态「正常」。
+     *
+     * ## 根因：**uid 的归属 realm 因 provider 而异**
+     * | provider | realm | uid 形态 |
+     * |---|---|---|
+     * | `buddy`（国内版） | `cn` | `358a60c4-…`（**无前缀**） |
+     * | `workbuddy`（国际版） | **`global`** | `workbuddy:500b0019-…` |
+     * | `zcode` | `cn` | `zcode:603917…` |
+     * | `qodercn` | `cn` | `qodercn:01a154b3-…` |
+     *
+     * 而 `/admin/accounts` 返回的账号对象**不含 `realm` 字段**，
+     * 面板无法把它传回来 ⇒ 服务端必须自己解析。
+     *
+     * ## 处置
+     * 未显式指定 realm 时，先在 `cn` 找；**找不到再找另一个 realm**。
+     * 这与本文件既有的 `otherRealm = realm === 'cn' ? 'global' : 'cn'` 模式一致
+     *（见 `src/index.ts:440` 附近的同类处理）。
+     */
+    let realm = explicitRealm ?? 'cn'
+    let stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const now = Date.now()
+    let all = await stub.listAccounts(realm, now)
+    let targets = onlyUid === undefined ? all : all.filter((a) => a.uid === onlyUid)
+
+    if (onlyUid !== undefined && targets.length === 0 && explicitRealm === undefined) {
+      const other = realm === 'cn' ? 'global' : 'cn'
+      const otherStub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(other))
+      const otherAll = await otherStub.listAccounts(other, now)
+      const otherTargets = otherAll.filter((a) => a.uid === onlyUid)
+      if (otherTargets.length > 0) {
+        realm = other
+        stub = otherStub
+        all = otherAll
+        targets = otherTargets
+      }
+    }
+
+    if (onlyUid !== undefined && targets.length === 0) {
+      return jsonError(400, `账号不存在：${onlyUid}`, 'invalid_request')
+    }
+
+    /**
+     * 单账号探测的**超时上限**（2026-10-21 补，此前完全没有超时）。
+     *
+     * ## 为什么必须有
+     * 探测内部走 `handleChatCompletions` —— 那是**真实网关链路**，
+     * 会经历上游排队。qoder 的排队预算已按用户要求提到 **60 秒**，
+     * 而本端点**串行**探测 N 个账号 ⇒ 最坏 N × 60 秒。
+     * 实测 3 个账号时浏览器/curl 早就断开，服务端却还在等。
+     *
+     * ## 为什么 30 秒
+     * 探测的目的是「**快速判断这个号现在能不能用**」，不是跑完整对话。
+     * 30 秒足够正常上游响应（实测 healthy 约 1.4-1.8 秒），
+     * 又能把「排队/挂死」快速暴露成 `verdict: 'timeout'`。
+     * 这比让用户干等 3 分钟更有用。
+     *
+     * ## 传播链（已核实）
+     * `Request.signal` → `handleChatCompletions` 用 `request.signal`
+     * → 上游 `client.ts` 用 `AbortSignal.any([options.signal, timeoutSignal])`
+     * ⇒ 超时会**真正中断上游请求**，不是只让 await 返回。
+     *
+     * 超时抛出的 `AbortError` 由下方 catch 的
+     * `/timeout|abort|timed out/i` 判据归为 `verdict: 'timeout'`。
+     */
+    const PROBE_TIMEOUT_MS = 30_000
+
+    /** 每个账号一条结果的累加器。 */
+    const results: Array<Record<string, unknown>> = []
+    for (const acct of targets) {
+      const providerId = acct.provider ?? DEFAULT_PROVIDER
+      const model = wantedModel ?? `${providerId}/auto`
+      const stateBefore = diagnoseAccount(acct, Date.now())
+      const startedAt = Date.now()
+
+      // ⚠️ 串行探测：单账号池下并发打上游只会加重风控（本项目的核心教训之一）。
+      // 用内部 Request 走真实网关链路，等价于一次真实调用但拿到结构化结果。
+      const probeReq = new Request('https://internal/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${env.API_KEY ?? ''}` },
+        // ⚠️ 超时：见上方 `PROBE_TIMEOUT_MS` 的说明。缺了它，串行探测最坏 N×60 秒。
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: '1' }],
+          /**
+           * ⚠️ **不能给 1**：`hy4-preview` 这类**纯推理模型**会把预算全用在
+           * `reasoning_content` 上，`content` 恒为空 ⇒ 网关「空响应」兜底触发
+           * ⇒ 探测误报 `upstream_problem`（而账号其实健康）。
+           * 32 足够：普通模型 1-2 个 token 答完，推理模型也能产出非空 reasoning。
+           */
+          max_tokens: 32,
+          stream: false,
+        }),
+      })
+
+      let ok = false
+      let detail = ''
+      let verdict = 'healthy'
+      try {
+        const gatewayResult = await handleChatCompletions(probeReq, env, realm, ctx)
+        if (gatewayResult.response.ok) {
+          ok = true
+        } else {
+          const errJson = (await gatewayResult.response.json().catch(() => ({}))) as {
+            error?: { message?: string }
+          }
+          detail = errJson.error?.message ?? `HTTP ${gatewayResult.response.status}`
+          // 复用错误分类：把「谁的错」翻成用户能行动的四类
+          //
+          // ⚠️ **必须把 `credit_exhausted` 算作账号问题**（2026-10-21 修）：
+          // 它的处置是「充值/换号」，与「稍后重试」完全相反。
+          // 早先漏了它 ⇒ 用户看到「稍后重试」而实际永远好不了。
+          //
+          // ⚠️ **模型级限流必须算作 `model_problem`**：像 qoder 的 `110`
+          // （日次数上限）分类是 `rate_limited`，但 `refineModelScoped` 会把它
+          // 细化成 `dimension: 'model'` —— 只有该模型不可用，账号本身健康。
+          // 若笼统报 `upstream_problem`，用户会去换账号（白费功夫），
+          // 而正确做法只是**换个模型**。
+          const { kind } = classify(gatewayResult.response.status, detail)
+          if (
+            kind === 'auth_error'
+            || kind === 'request_illegal'
+            || kind === 'credit_exhausted'
+          ) {
+            verdict = 'account_problem'
+          } else if (
+            kind === 'model_unavailable'
+            || kind === 'model_denied'
+            || refineModelScoped(kind, detail).dimension === 'model'
+          ) {
+            verdict = 'model_problem'
+          } else {
+            verdict = 'upstream_problem'
+          }
+        }
+      } catch (error) {
+        detail = error instanceof Error ? error.message : String(error)
+        verdict = /timeout|abort|timed out/i.test(detail) ? 'timeout' : 'upstream_problem'
+      }
+
+      results.push({
+        uid: acct.uid,
+        provider: providerId,
+        nickname: acct.nickname ?? '',
+        model,
+        ok,
+        latencyMs: Date.now() - startedAt,
+        verdict,
+        detail: detail.slice(0, 300),
+        stateBefore: { summary: stateBefore.summary, healthy: stateBefore.healthy, blockedBy: stateBefore.blockedBy },
+        note:
+          stateBefore.healthy
+            ? ''
+            : `账号当前处于「${stateBefore.summary}」，本次探测反映上游真实状态，但网关仍不会派单`,
+      })
+    }
+
+    const tally = { total: results.length, healthy: 0, account_problem: 0, model_problem: 0, upstream_problem: 0, timeout: 0 }
+    for (const r of results) {
+      const v = String(r['verdict'] ?? '')
+      if (v === 'healthy') tally.healthy += 1
+      else if (v === 'account_problem') tally.account_problem += 1
+      else if (v === 'model_problem') tally.model_problem += 1
+      else if (v === 'timeout') tally.timeout += 1
+      else tally.upstream_problem += 1
+    }
+
+    return json({ realm, probedAt: Date.now(), results, summary: tally })
+  }
+
   if (path === '/admin/accounts' && request.method === 'GET') {
     const realm = url.searchParams.get('realm') ?? 'cn'
     const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
@@ -3213,6 +4167,26 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         lastErr: a.lastErr,
         fails: a.fails,
         breakerUntil: a.breakerUntil,
+        // ⚠️ 必须暴露：账号级限制（11140）是**上游标记**，与 breakerUntil（我们自己
+        // 怀疑它不行）语义不同。不暴露的话，面板上「被封的号」看起来和健康号一模一样 ——
+        // 线上实测踩过：库里 rst=2h 已写入，但 /admin/accounts 不返回该字段，
+        // 于是误判「三个号都没被封」。记账失效是**静默**的，这条字段就是唯一的显示出口。
+        restrictedUntil: a.restrictedUntil,
+        /**
+         * 🔴 **`degradeUntil` 必须暴露**（2026-10-21 审查补，M5 指出高危）。
+         *
+         * ## 缺陷
+         * `AccountPoolDO` 有「连续 5 次业务失败 ⇒ 降权 10 分钟不派单」的机制
+         *（`degradeUntil`），但本白名单**没有它** ⇒ 面板**连字段都拿不到**。
+         *
+         * ⇒ 后果是**自相矛盾**：侧栏角标走 `counts()/healthy()` 把这个号算进
+         * 「冷却中」，而账号列表因为拿不到字段，显示这个号**「正常」**。
+         * 用户看到「角标说 3 个冷却 / 列表说 0 个异常」，无法定位是哪个号。
+         *
+         * 与 `restrictedUntil` 是**同一类缺陷**（记账有、显示出口没有），
+         * 只是那个已修、这个漏了 —— 又一处「只修一半」。
+         */
+        degradeUntil: a.degradeUntil,
         softStreak: a.softStreak,
         // ⚠️ 不只给模型名，还要给**到期时间与原因** ——
         // 面板的「模型限流」弹窗要显示「还剩多久 / 为什么被限」，
@@ -3232,7 +4206,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const body = (await request.json().catch(() => ({}))) as {
       uid?: string
       realm?: string
-      plan?: 'daily' | 'growth'
+      plan?: PlanName
       includeRealChat?: boolean
     }
     if (typeof body.uid !== 'string' || body.uid === '') {
@@ -3261,7 +4235,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       nickname: account.nickname,
       realm: account.realm,
       accessToken: credential.accessToken,
-      plan: planName,
+      plan: planForProvider(account, planName),
       ...(body.includeRealChat === undefined ? {} : { includeRealChat: body.includeRealChat }),
     })
     return json(result)
@@ -3281,7 +4255,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const body = (await request.json().catch(() => ({}))) as {
       uid?: string
       realm?: string
-      plan?: 'daily' | 'growth'
+      plan?: PlanName
       includeRealChat?: boolean
     }
     if (typeof body.uid !== 'string' || body.uid === '') {
@@ -3305,7 +4279,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       nickname: account.nickname,
       realm: account.realm,
       accessToken: credential.accessToken,
-      plan: body.plan ?? 'daily',
+      plan: planForProvider(account, body.plan ?? 'daily'),
       ...(body.includeRealChat === undefined ? {} : { includeRealChat: body.includeRealChat }),
     })
     return json(result)
@@ -3411,23 +4385,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           // ⚠️ **请求侧仍然接受裸名**（回退到默认供应商，见 `splitModelName`）：
           // 已有的客户端配置不会因为这个改动而失效，只是目录里不再列它。
           // 兼容与无歧义两件事分开处理 —— 目录负责「说清楚」，路由负责「不breaking」。
-          // ⚠️ 补三个目录展示字段（一处收口，**所有**供应商条目都经过这一行）：
-          //   · `priceFactor` —— **优先用 provider 解析出的真实倍率**
-          //     （buddy 的 `credits`、lobsterai 的 `costMultiplier`、trae 的
-          //      `consumption_rate`）；只有该家没提供时才退回「从模型名抠」——
-          //     名字里通常不写倍率（抠出来 39/46 是空）。
-          //     `Infinity` = 没标倍率（**不等于**免费），`0` 才是免费。
-          //   · `providerName` —— 该家展示名（`Buddy（国内版）`），光给 id 认不出中文别名。
-          //   · `realm` —— 该账号**实际所在**分片（不按 providerId 猜）。
-          data.push({
-            ...base,
-            id: `${providerId}/${m.id}`,
-            // ⚠️ 归一成「数字或 null」：`Infinity` 经 JSON 会变 null 但语义含混，
-            // 故在这里显式转换（见 priceFactorOrNull 的说明）。
-            priceFactor: priceFactorOrNull(m.priceFactor ?? priceFactorFromName(m.name || m.id)),
-            providerName: provider.name,
-            realm: picked.realm,
-          })
+          data.push(annotateModelEntry({ ...base, id: `${providerId}/${m.id}` }, providerId))
         }
       } catch (error) {
         // ⚠️ 逐家兜错：一家失败不该让整个目录 500（用户可能只想用另一家）
@@ -3464,36 +4422,30 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       // ⚠️ `name` **必须给**：面板「模型」页有「名称」列，
       // 缺了就是**整列空白**（实测反馈：19 个 aggregate 条目名称列全空，
       // 看起来像渲染失败）。`VirtualModel` 本来就有 `name` 字段，只是没往外发。
-      // ⚠️ 聚合条目也要补 `priceFactor` / `providerName` / `realm`，
-      // 否则那几列对聚合行**全是空白**（与普通条目不一致，看着像坏了）。
-      //   · `priceFactor`：取所有候选里**最小**的（即最便宜渠道）；
-      //     一个候选都没有倍率时返回 `Infinity` ⇒ 经 `priceFactorOrNull` 变 `null`（未标注）。
-      //   · `providerName`：显示「聚合（跨渠道）」而不是留空；
-      //   · `realm`：聚合跨分片汇总，标 `'*'`。
-      const cheapestOf = (cands: ReadonlyArray<{ price: number }>): number => {
-        const vals = cands.map((c) => c.price).filter((n) => Number.isFinite(n))
-        return vals.length === 0 ? Number.POSITIVE_INFINITY : Math.min(...vals)
-      }
-      data.push({
-        id: `${AGGREGATE_PROVIDER_ID}/${AGGREGATE_AUTO}`,
-        object: 'model',
-        owned_by: AGGREGATE_PROVIDER_ID,
-        name: '自动选择（临期优先）',
-        priceFactor: priceFactorOrNull(cheapestOf(virtuals.flatMap((v) => v.candidates))),
-        providerName: '聚合（跨渠道）',
-        realm: '*',
-      })
+      data.push(
+        annotateModelEntry(
+          {
+            id: `${AGGREGATE_PROVIDER_ID}/${AGGREGATE_AUTO}`,
+            object: 'model',
+            owned_by: AGGREGATE_PROVIDER_ID,
+            name: '自动选择（临期优先）',
+          },
+          AGGREGATE_PROVIDER_ID,
+        ),
+      )
       for (const v of virtuals) {
-        data.push({
-          id: `${AGGREGATE_PROVIDER_ID}/${v.key}`,
-          object: 'model',
-          owned_by: AGGREGATE_PROVIDER_ID,
-          // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
-          name: v.name || v.key,
-          priceFactor: priceFactorOrNull(cheapestOf(v.candidates)),
-          providerName: '聚合（跨渠道）',
-          realm: '*',
-        })
+        data.push(
+          annotateModelEntry(
+            {
+              id: `${AGGREGATE_PROVIDER_ID}/${v.key}`,
+              object: 'model',
+              owned_by: AGGREGATE_PROVIDER_ID,
+              // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
+              name: v.name || v.key,
+            },
+            AGGREGATE_PROVIDER_ID,
+          ),
+        )
       }
     } catch (error) {
       errors.push({
@@ -3509,12 +4461,21 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         'no_available_account',
       )
     }
-    // ⚠️ 子密钥要**过滤模型目录**：只留它被允许的。
-    // 不过滤的话用户能看到 100 个模型、挑一个、然后被 403 ——
-    // 「看得见但用不了」比「看不见」更让人困惑。主密钥不过滤。
-    const visible = v1Auth?.kind === 'subkey'
-      ? data.filter((m) => modelAllowed(String(m.id), v1Auth.record.limits.models))
-      : data
+    /**
+     * 🔴 **子密钥的模型白名单必须作用于目录本身**（2026-10-21 审查补，安全面专项）。
+     *
+     * 原来这个分支**从未引用 `subkeyRecord`**（`grep subkeyRecord` 只在两个 POST
+     * 分支里出现），于是受限子密钥 `GET /v1/models` 能拿到部署方的**全量**目录
+     *（含未授权模型、`?realm=global` 的另一分片）—— 而同一个 key 打 chat 却被 403。
+     *
+     * 后果不是「能白用模型」（POST 侧确实拦），而是**信息暴露**：
+     * 受限方据此精挑被禁模型去试探，也暴露了内部模型规划。
+     */
+    const allowlist = subkeyRecord?.limits.models ?? []
+    const visible = allowlist.length === 0
+      ? data
+      : data.filter((m) => modelAllowed(String(m.id ?? ''), allowlist))
+
     return json({
       object: 'list',
       data: visible,
@@ -3526,11 +4487,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // ── OpenAI 兼容：对话（**流式 SSE 透传**） ──
   if (path === '/v1/chat/completions' && request.method === 'POST') {
     const realm = url.searchParams.get('realm') ?? 'cn'
-    // ⚠️ 子密钥必须在**这里**鉴权：模型白名单要从请求体读 model，
-    // 而请求体只能读一次（读两遍会报 Body already used）。
-    const guard = await guardV1(request, env, v1Auth)
-    if (guard.denied !== undefined) return guard.denied
-    const result = await handleChatCompletions(request, env, realm, ctx, guard.key)
+    // 🔴 子密钥的**模型白名单**在这里判（2026-10-21 审查补，M6 指出高危）。
+    // 详见下方 `subkeyModelDenied` 的说明。
+    const denied = await subkeyModelDenied(request, subkeyRecord)
+    if (denied !== undefined) return denied
+    const result = await handleChatCompletions(request, env, realm, ctx)
     // ⚠️ 流式响应必须**原样返回** —— 不要在这里包装或缓冲，
     // 那会破坏逐字输出并可能超出 CPU 预算。
     return result.response
@@ -3545,15 +4506,94 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // 依据：参考实现 `openai-gateway/responses.ts:12-16`。
   if (path === '/v1/responses' && request.method === 'POST') {
     const realm = url.searchParams.get('realm') ?? 'cn'
-    // 同 Chat 路径：子密钥鉴权与模型白名单都在 `guardV1` 里收口。
-    const guard = await guardV1(request, env, v1Auth)
-    if (guard.denied !== undefined) return guard.denied
-    const result = await handleResponses(request, env, realm, ctx, guard.key)
+    // 同 Chat 路径：子密钥的模型白名单在这条协议上也要判（否则换个协议就绕过）。
+    const denied = await subkeyModelDenied(request, subkeyRecord)
+    if (denied !== undefined) return denied
+    const result = await handleResponses(request, env, realm, ctx)
     // 同 Chat 路径：流式响应**原样返回**，不在这里包装或缓冲。
     return result.response
   }
 
   return json({ error: { message: 'not found', path } }, 404)
+}
+
+/**
+ * 子密钥**模型白名单**校验（2026-10-21 审查补，M6 指出高危）。
+ *
+ * ## 缺陷：三维限制只接通了一维
+ * 子密钥支持三维限制：IP / **模型** / token 配额。
+ * 但 `authenticate()` 只在鉴权那一刻调用一次，而**那一刻模型名还未知**
+ *（在请求体里）⇒ 它被传入 `model = ''` ⇒ 模型检查**恒被跳过**。
+ *
+ * 源码里原本有一句注释「真正的模型校验见下方 chat 分支」，
+ * 而**那个分支从来不存在** —— 注释描述了一个没有实现的校验点。
+ *
+ * ⇒ 用户给子密钥配了「只允许 X 模型」，实际**任何模型都能用**。
+ * 这是**安全项**，不是显示问题。
+ *
+ * ## 为什么用 `clone()` 而不是改造 `handleChatCompletions`
+ * 请求体是一次性的流。`clone()` 只在**存在子密钥**时才发生（主密钥路径零开销），
+ * 且网关自己也有体积上限保护。这样改动集中在入口，不用把 `ApiKeyRecord`
+ * 一路透传进 provider 层。
+ *
+ * ⚠️ 只判 `models` 非空的子密钥；空数组 = 不限制（`modelAllowed` 的既有语义）。
+ */
+async function subkeyModelDenied(
+  request: Request,
+  record: ApiKeyRecord | undefined,
+): Promise<Response | undefined> {
+  if (record === undefined) return undefined
+  const rules = record.limits.models
+  if (rules.length === 0) return undefined
+  // ⚠️ 同样要**有上限地读**：这里会 clone 一份 body，
+  // 若上游限制缺失，同一份 120 MiB 会在内存里驻留两份（安全面专项实测）。
+  const probe = request.clone()
+  const body = (await readJsonCapped(probe).catch(() => undefined)) as { model?: unknown } | undefined
+  const model = typeof body?.model === 'string' ? body.model : ''
+  /**
+   * 🔴 **拿不到模型名就直接 400**（2026-10-21 审查补，安全面专项）。
+   *
+   * 原来是「不拦，交给下游报错」—— 那是 **fail-open**：`{"model":123}` 这种
+   * 非字符串会让白名单校验整条跳过（实测拿到的是「没有可用账号」而不是 403）。
+   * 当前下游恰好也按 `typeof === 'string'` 取值，所以还不可利用；
+   * 但只要任何一层将来对空模型名做默认回填，这条立刻变成真实绕过。
+   *
+   * 与 `/v1/responses` 对齐：`model 必填`。
+   */
+  if (model === '') {
+    return json(
+      { error: { message: 'model 必填，且必须是字符串', type: 'invalid_request_error' } },
+      400,
+    )
+  }
+  if (modelAllowed(model, rules)) return undefined
+  return json(
+    {
+      error: {
+        message: `该 API Key 不被允许使用模型「${model}」`,
+        type: 'permission_error',
+      },
+    },
+    403,
+  )
+}
+
+/**
+ * 按供应商修正计划名：国际版（workbuddy.ai）只有网页端活跃打卡这一个计划
+ *（`daily`/`growth` 全是国内版协议，对它只会白跑一轮失败）。
+ */
+function planForProvider(account: { provider?: string; realm: string }, requested: PlanName): PlanName {
+  return isIntlWorkbuddy(account) ? 'intlDaily' : requested
+}
+
+/**
+ * 是否国际版 workbuddy.ai 账号。
+ *
+ * ⚠️ 必须同时看 realm：升级前的老账号状态缺省 `provider: 'workbuddy'`
+ *（`pool/state.ts::createAccountState`），它们其实是 cn 分片里的国内版账号。
+ */
+function isIntlWorkbuddy(account: { provider?: string; realm: string }): boolean {
+  return account.provider === WORKBUDDY_INTL.id && account.realm === 'global'
 }
 
 /**
@@ -3569,7 +4609,7 @@ async function startRun(
     nickname: string
     realm: string
     accessToken: string
-    plan: 'daily' | 'growth'
+    plan: PlanName
     /** ⚠️ 显式开启才会跑「需要真实对话」的任务（会消耗配额）。 */
     includeRealChat?: boolean
   },
@@ -3584,7 +4624,7 @@ async function startRun(
     accessToken: input.accessToken,
   }
   const stub = env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(input.uid))
-  await stub.start(input.uid, steps, context, Date.now())
+  await stub.start(input.uid, steps, context, Date.now(), input.plan)
   return {
     ok: true,
     queued: steps.length,
@@ -3603,7 +4643,7 @@ async function startRun(
  * 改时点只改这张表，**不需要重新部署 wrangler 配置**。
  */
 interface ScheduleJob {
-  plan: 'daily' | 'growth'
+  plan: PlanName
   includeRealChat?: boolean
 }
 
@@ -3654,6 +4694,40 @@ const REFRESH_LEAD_MS = 3_600_000
  * 上游没给过期时间的情形。**不拿它去续期**（无从判断该不该续），
  * 留待请求路径的 401 兜底。
  */
+/**
+ * 把后台任务（续期 / 余额刷新）的失败写进**面板日志**，而不是只进 console
+ * （2026-10-21 审查补，M6 指出）。
+ *
+ * ## 缺陷
+ * 这两处的失败原来只有 `console.error` —— 面板「日志」页**一条都看不到**。
+ * 用户的体验是：某账号的登录态悄悄失效、余额悄悄变成 0，
+ * 而面板上一切正常，只能靠 `docker logs` 才发现。
+ *
+ * ## 为什么只记失败
+ * 日志是 200 条的环形缓冲。每到整点、每个账号记一条成功，
+ * 一小时就能把整个环刷掉 —— 真正要看的失败反而被挤没了。
+ */
+function logBackgroundFailure(
+  pool: DurableObjectStub<AccountPoolDO>,
+  input: { uid: string; provider: string; action: string; message: string },
+): void {
+  void pool
+    .appendLog({
+      id: Math.random().toString(36).slice(2, 10),
+      time: Date.now(),
+      type: 'error',
+      model: input.action,
+      provider: input.provider,
+      uid: input.uid,
+      status: 500,
+      durationMs: 0,
+      tokens: { input: 0, output: 0, total: 0 },
+      stream: false,
+      error: input.message,
+    })
+    .catch(() => undefined)
+}
+
 async function refreshExpiringCredentials(env: Env, now: number): Promise<void> {
   for (const realm of ['cn', 'global']) {
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
@@ -3690,43 +4764,125 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
       } catch (error) {
         // ⚠️ 如实记原因。**不惩罚账号** —— 续期失败可能是网络抖动，
         // 而请求路径的 401 兜底仍会兜住真正失效的凭据。
-        console.error(
-          `[cron] ${providerId} ${account.uid} 主动续期失败：`,
-          error instanceof Error ? error.message : String(error),
-        )
+        const message = error instanceof Error ? error.message : String(error)
+        console.error(`[cron] ${providerId} ${account.uid} 主动续期失败：`, message)
+        // 🔴 同时写进面板日志（否则用户只能去 `docker logs` 里找）。
+        logBackgroundFailure(pool, {
+          uid: account.uid,
+          provider: providerId,
+          action: 'cron:refresh',
+          message: `主动续期失败：${message}`,
+        })
       }
     }
+  }
+}
+
+/**
+ * 刷新所有账号的**余额快照**（`credits` / `creditsExpiring` / `creditsEarliestExpiry`）。
+ *
+ * ## 🔴 为什么必须做（2026-10-20 实测确证）
+ *
+ * 这三个字段此前**只在 `revive()` 里写入**，正常流程无刷新入口 ⇒ 恒为 0。
+ * 实测：面板显示两个账号 `credits=0`，而直连上游
+ * `v2/billing/meter/get-user-resource` 拿到的是 **2870 / 3514**（充足）。
+ *
+ * 后果（不是显示问题，是行为错）：
+ *   1. **永久积分锁失效** —— 判据是 `credits > 0`，恒 0 就永不命中，
+ *      本该拦下的「只剩永久额度」账号照样被选中、照样烧不可撤回的积分；
+ *   2. `expiry` 策略（默认）按 `creditsExpiring` 排序 ⇒ 键全等 ⇒ 退化成 uid 轮转；
+ *   3. `random` 策略的加权退化成等权。
+ *
+ * ## 设计取舍
+ *
+ * - **逐个 try**：一个账号查余额失败不能中断整轮（与续期扫描同口径）。
+ * - **失败不写 0**：查不到就保持原值。把「查不到」写成「没钱了」是**有害**的
+ *   —— 会让永久积分锁误锁、也会让面板显示假的 0。
+ * - **跳过不支持的家**：`provider.balance === undefined` 直接跳过
+ *   （opencode 无余额端点）。
+ * - **停用账号也刷新**：用户可能只是临时停用，余额仍需准确（且不消耗请求配额
+ *   —— 这是只读端点）。但为省上游调用，**优先只刷启用中的**。
+ */
+async function refreshAccountBalances(env: Env, now: number): Promise<void> {
+  let refreshed = 0
+  let failed = 0
+  let skipped = 0
+
+  for (const realm of ['cn', 'global']) {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, now)
+    for (const account of accounts) {
+      const providerId = account.provider ?? DEFAULT_PROVIDER
+      // ⚠️ **必须用绑定版**：`findProvider()` 返回的是未绑定的模板，
+      // 而 buddy（国内版）的 `balance()` 闭包捕获了 `env`（用来决定计费域）。
+      // 拿模板去调会抛 `Cannot read properties of undefined (reading 'UPSTREAM_CHAT_BASE')`
+      // —— 实测踩到：3 个 buddy 账号的余额刷新全部失败。
+      const template = findProvider(providerId)
+      const provider = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : template
+      if (provider?.balance === undefined) {
+        skipped += 1
+        continue
+      }
+
+      let credential: ProviderCredential | undefined
+      try {
+        credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+      } catch {
+        skipped += 1
+        continue
+      }
+      if (credential === undefined) {
+        skipped += 1
+        continue
+      }
+
+      try {
+        const b = await provider.balance(credential, AbortSignal.timeout(20_000))
+        await pool.updateBalance(account.uid, now, {
+          credits: b.total,
+          expiring: b.expiring,
+          earliestExpiry: b.earliestExpiry,
+        })
+        // 🔴 余额恢复 ⇒ 解冻 `hard`（402 余额耗尽）冷却（与 `/admin/accounts/balance`
+        // 同一段逻辑，两处各写一份必然分叉）。余额为 0 / 仍在冷却的其它维度一律不动，
+        // 细节见 `AccountPoolDO.clearHardIfRecovered`。
+        // ⚠️ 失败不影响本轮「刷新成功」的结论：余额已经落盘了。
+        await pool.clearHardIfRecovered(account.uid, b.total, now).catch((error: unknown) => {
+          console.warn(`[cron] ${providerId} ${account.uid} 解冻 hard 冷却失败：`, error instanceof Error ? error.message : String(error))
+        })
+        refreshed += 1
+      } catch (error) {
+        // ⚠️ 如实记录，且**不写 0** —— 查不到 ≠ 没钱了。
+        failed += 1
+        const message = error instanceof Error ? error.message : String(error)
+        console.warn(`[cron] ${providerId} ${account.uid} 余额刷新失败（保持原值）：`, message)
+        // 🔴 同时写进面板日志（与续期失败同处理）。
+        logBackgroundFailure(pool, {
+          uid: account.uid,
+          provider: providerId,
+          action: 'cron:balance',
+          message: `余额刷新失败（保持原值）：${message}`,
+        })
+      }
+    }
+  }
+
+  if (refreshed + failed + skipped > 0) {
+    console.log(`[cron] 余额刷新完成：成功 ${refreshed} / 失败 ${failed} / 跳过 ${skipped}`)
   }
 }
 
 async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   const now = Date.now()
 
-  /**
-   * 读面板里的两个调度开关（`/admin/config/routing`）。
-   *
-   * ## 🔴 为什么必须有它（这两个开关此前是「能改但不生效」）
-   *
-   * - `autoTaskCron`：面板写着「自动每日任务调度」，而 `scheduled()` **从来没读过它**
-   *   ⇒ 用户关掉它，cron 照旧每小时跑任务。VPS 上真正能停的是
-   *   `AUTO_TASK_CRON=false` 环境变量 —— 两套开关各管一半，最容易误判。
-   * - `autoRefreshCredential`：面板写着「凭据主动刷新」，而 `refreshExpiringCredentials`
-   *   **无条件执行** ⇒ 关掉它也没用。
-   *
-   * ⚠️ 读失败时**按「开启」处理**（保守：宁可多跑一次，也不要因为一次 DO 抖动
-   * 让当天的签到悄无声息地停掉 —— 那会变成「今天的积分没拿到」这种事后才发现的损失）。
-   */
-  let autoTaskCron = true
-  let autoRefresh = true
+  // 面板「路由与调度」里的两个开关。读失败按默认（都开）处理，绝不因此整轮跳过。
+  let routing = { autoTaskCron: true, autoRefreshCredential: true }
   try {
     const cfg = await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')).getRoutingConfig()
-    autoTaskCron = cfg.autoTaskCron !== false
-    autoRefresh = cfg.autoRefreshCredential !== false
-  } catch {
-    // 用上面的保守默认值
+    routing = { autoTaskCron: cfg.autoTaskCron !== false, autoRefreshCredential: cfg.autoRefreshCredential !== false }
+  } catch (error) {
+    console.error('[cron] 读路由配置失败，按默认处理：', error instanceof Error ? error.message : String(error))
   }
-  if (env.AUTO_TASK_CRON === 'false') autoTaskCron = false
-  if (env.AUTO_REFRESH_CREDENTIAL === 'false') autoRefresh = false
 
   // ⚠️ **主动续期扫一遍（每个整点都做，与是否有任务时点无关）。**
   //
@@ -3745,14 +4901,41 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   //
   // ⚠️ 扫到失败**不抛**：一条 cron 不能因为某个账号续期失败就整体不跑
   //（那会让任务分发也一起停掉）。逐账号 try，如实记日志。
-  if (autoRefresh) {
+  if (!routing.autoRefreshCredential) {
+    console.log('[cron] 「凭据主动刷新」已在面板关闭，跳过续期扫描')
+  } else {
     try {
       await refreshExpiringCredentials(env, now)
     } catch (error) {
       console.error('[cron] 主动续期整体失败：', error instanceof Error ? error.message : String(error))
     }
-  } else {
-    console.log('[cron] 面板已关闭「凭据主动刷新」，本次跳过续期扫描')
+  }
+
+  // ⚠️ **余额快照也必须每个整点刷**（与续期同理，不能只在被调用时才更新）。
+  //
+  // 这两件事**必须都做**：续期管「凭据还能不能用」，余额管「还有多少额度」。
+  // 后者是永久积分锁与 `expiry` 策略的判据来源 —— 不刷新它们就等于
+  // 这两个功能从未生效（见 `refreshAccountBalances` 的注释）。
+  //
+  // ⚠️ 放在续期**之后**、`plan === undefined` 的 return **之前**：
+  // 这样即使某个整点没有任务，余额也保持新鲜。
+  try {
+    await refreshAccountBalances(env, now)
+  } catch (error) {
+    console.error('[cron] 余额刷新整体失败：', error instanceof Error ? error.message : String(error))
+  }
+
+  // 🔴 **会话表清理**（2026-10-21 审查补，M6 指出两个 pruner 零调用者）。
+  // `sessions` / `login_sessions` 都是「登录时插一行、过期也不删」——
+  // 没有这一步，表只增不减，长期运行后查询变慢、库文件膨胀。
+  // 放在每个整点（与续期/余额同频）：一次全表 DELETE，开销可忽略。
+  try {
+    const pruned =
+      await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')).pruneStaleSessions(now)
+      + await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global')).pruneStaleSessions(now)
+    if (pruned > 0) console.log(`[cron] 清理过期会话 ${pruned} 条`)
+  } catch (error) {
+    console.error('[cron] 会话清理失败：', error instanceof Error ? error.message : String(error))
   }
 
   const hour = hourUtc8(now)
@@ -3765,13 +4948,11 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
     console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点无任务，已做完续期扫描`)
     return
   }
-  if (job === undefined) return
-  // ⚠️ 面板开关在这里生效（此前 `scheduled()` 从不读它，关掉照跑）。
-  // 注意：**续期已经执行过了**，这里只决定「要不要派发任务」。
-  if (!autoTaskCron) {
-    console.log(`[cron] 面板已关闭「自动每日任务调度」，UTC+8 ${hour} 跳过任务派发`)
+  if (!routing.autoTaskCron) {
+    console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点有任务（${plan}），但「自动每日任务」已在面板关闭，跳过`)
     return
   }
+  if (job === undefined) return
 
   const realm = 'cn'
   const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
@@ -3789,6 +4970,41 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
     const includeRealChat = isBuddy ? (job.includeRealChat ?? false) : false
 
     try {
+      /**
+       * 🔴 **按日去重**（2026-10-21 审查补，M6 指出「同一函数两套判据」）。
+       *
+       * 国际版的扇出（`fanOutIntlDailyChat`）会跳过「今天已成功」的账号，
+       * 而**国内这条循环没有**。于是只要 cron 在同一个小时窗口里被触发两次
+       *（进程恰在整点后 2 分钟内重启 —— `lastDispatchedHour` 是**进程内**变量，
+       * 重启即归零），`growth` 计划（含 5 个真实对话）就会**再烧一遍配额**。
+       *
+       * 修法：与「上一次已跑完同一计划且落在今天（UTC+8）」的账号直接跳过。
+       * 日键用 `utc8DayKey` —— 与项目其它日界（签到、额度）同一条纪律，
+       * 不能用本机时区。
+       *
+       * ⚠️ 只对 **cron 扇出**去重，**不影响**面板上的「手动执行」：
+       * 用户点了就是要现在再跑一遍，那是显式意图。
+       */
+      // ⚠️ **读状态失败不得阻止任务**：去重是「优化」，漏跑才是「故障」。
+      // 若这里抛错并被外层 catch 吞掉，该账号今天就不会跑了 —— 方向反了。
+      let alreadyDoneToday = false
+      try {
+        const status = await env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(account.uid)).status(account.uid)
+        alreadyDoneToday =
+          status !== undefined
+          && status.finished
+          && status.plan === planToRun
+          && utc8DayKey(status.startedAt) === utc8DayKey(now)
+      } catch (error) {
+        console.warn(
+          `[cron] 读 ${account.uid} 的运行状态失败，改为直接入队（去重让位于不漏跑）：`,
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+      if (alreadyDoneToday) {
+        console.log(`[cron] 账号 ${account.uid} 今天已跑完 ${planToRun}，跳过（防重复烧配额）`)
+        continue
+      }
       await startRun(env, {
         uid: account.uid,
         nickname: account.nickname,
@@ -3802,6 +5018,39 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
       console.error(`[cron] 账号 ${account.uid} 入队失败：`, error instanceof Error ? error.message : String(error))
     }
   }
+
+  // 国际版（workbuddy.ai）每日活跃打卡：只在签到时点（9/21）跑，当天已成功的跳过。
+  // 两个时点 = 一次重试机会；按北京时间日去重，无论上游按哪个时区换日都每天至多一次。
+  if (job.plan === 'daily') {
+    try {
+      await fanOutIntlDailyChat(env, now)
+    } catch (error) {
+      console.error('[cron] 国际版活跃打卡扇出失败：', error instanceof Error ? error.message : String(error))
+    }
+  }
+}
+
+/** 给 global 分片里今天还没打卡的 workbuddy 账号入队 `intlDaily`。 */
+async function fanOutIntlDailyChat(env: Env, now: number): Promise<number> {
+  const realm = 'global'
+  const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+  const accounts = await pool.listAccounts(realm, now)
+  const today = cstDay(now)
+  let queued = 0
+  for (const account of accounts) {
+    if (account.disabled || !isIntlWorkbuddy(account)) continue
+    if (account.lastCheckinDay === today) continue
+    try {
+      await startRun(env, {
+        uid: account.uid, nickname: account.nickname, realm: account.realm, accessToken: '', plan: 'intlDaily',
+      })
+      queued += 1
+    } catch (error) {
+      console.error(`[cron] 国际版账号 ${account.uid} 打卡入队失败：`, error instanceof Error ? error.message : String(error))
+    }
+  }
+  if (queued > 0) console.log(`[cron] 国际版活跃打卡：入队 ${queued} 个账号`)
+  return queued
 }
 
 export default {
@@ -3810,4 +5059,4 @@ export default {
 }
 
 // 未被使用的导出保留给后续步骤（第 6 步的网关需要），避免 tree-shaking 误删注释里的说明。
-export { cliChatHeaders, resolveUpstream }
+export { annotateModelEntry, cliChatHeaders, resolveUpstream }

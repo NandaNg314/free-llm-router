@@ -37,6 +37,9 @@ import { migrate, readProgress, writeProgress } from '../store/db.js'
 import { executeAction, type ActionContext, type ActionResult } from './actions.js'
 import { GAP, needsCredentialFetch, effectiveAccessToken, type RunContext, type RunState, type TaskStep } from './steps.js'
 
+/** 「多久没动过」即判上次运行已被打断（见 `start()` 里的说明）。 */
+const STALE_RUN_MS = 30 * 60_000
+
 export class TaskRunnerDO extends DurableObject<Env> {
   /** 当前运行状态（内存镜像；权威副本在 SQLite）。 */
   private run: RunState | undefined
@@ -56,18 +59,78 @@ export class TaskRunnerDO extends DurableObject<Env> {
    * 幂等：若已有未完成的运行，**不覆盖**，直接返回当前状态 ——
    * 避免 Cron 重复触发把队列重置成初始态（Go 侧靠 `q.running` 防重入）。
    */
-  async start(uid: string, steps: TaskStep[], context: RunContext, now: number): Promise<RunState> {
+  async start(
+    uid: string,
+    steps: TaskStep[],
+    context: RunContext,
+    now: number,
+    /**
+     * 计划名（`daily` / `growth` / `intlDaily` …）。
+     *
+     * 🔴 **必须传**（2026-10-21 审查补，M6 #8）：`RunState.plan` 此前**从未被写入**，
+     * 于是任务日志里每一行的计划名都恒为 `daily` —— 用户分不清「这次跑的是签到
+     * 还是含 5 个真实对话的 growth」，也就无法判断配额被谁烧掉。
+     *
+     * 它同时是**按日去重**的键：cron 扇出要跳过「今天已经跑完同一计划」的账号，
+     * 没有 plan 就无法区分「今天跑过 growth」和「今天只跑过签到」。
+     */
+    plan?: string,
+  ): Promise<RunState> {
     const existing = await this.load(uid)
+    /** 判死时记下的原因，要带进**新一轮**（否则面板只看到「凭空重来」）。 */
+    let staleNote = ''
     if (existing !== undefined && !existing.finished && existing.queue.length > 0) {
-      return existing
+      /**
+       * 🔴 **陈旧运行必须判死，否则永久卡死**（2026-10-21 审查补，M6 指出高危）。
+       *
+       * ## 缺陷链（三步一起才致命）
+       * 1. `storage.ts` 在**执行前**就 `DELETE system_alarms`；
+       * 2. 进程在执行中被**重启/被杀**（不是抛异常，走不到兜底重排）
+       *    ⇒ `restorePendingAlarms` **扫不到记录**，任务不会续跑；
+       * 3. 本函数看到「未完成且有队列」就**直接 return**，且**不重排 alarm**。
+       *
+       * ⇒ 该账号的任务**永久停在「进行中」**：面板一直转圈，
+       *   点「手动执行」返回 ok:true 却什么都不做，只能手改 SQLite 才能恢复。
+       *
+       * ## 修法
+       * 用 `updatedAt` 判「多久没动过」。超过阈值即认定那次运行已被打断，
+       * **先把它标成失败收尾**（面板能看到原因，而不是永远转圈），再开新一轮。
+       * 阈值给足（30 分钟）：正常单步远小于它，只有真被打断才会命中。
+       */
+      const age = now - existing.updatedAt
+      if (age < STALE_RUN_MS) {
+        /**
+         * 🔴 **早退也必须保证「有活着的 alarm」**（2026-10-21 审查补，并发专项）。
+         *
+         * alarm 触发时适配层会**先删掉** `system_alarms` 那行（见
+         * `src/server/storage.ts` 的 `triggerAlarm`）。若进程恰在那一步执行中
+         * 被重启/OOM 杀掉，这行就永远回不来了 —— 而这里原本**只看 age 就早退**，
+         * 于是：返回 `ok:true`、什么都不做、也不排 alarm ⇒ 任务永久静默卡死
+         *（只能手改 SQLite，或等到 30 分钟后**再有一次** `start()` 才被判死重开）。
+         *
+         * 幂等语义不变：仍返回同一个运行状态，只是确保它**还能被推进**。
+         */
+        if (existing.queue.length > 0 && (await this.ctx.storage.getAlarm()) === null) {
+          await this.ctx.storage.setAlarm(now)
+        }
+        return existing
+      }
+      staleNote =
+        `上次运行停在整个 ${Math.round(age / 1000)} 秒无进展（多半是重启打断），已判超时并重开`
+      existing.finished = true
+      existing.lastError = staleNote
+      existing.updatedAt = now
+      await this.save(existing)
     }
 
     const state: RunState = {
       uid,
+      plan,
       queue: steps,
       done: [],
       finished: false,
-      lastError: '',
+      // 判死重开时把原因带过来，面板能看到「为什么重来」，而不是凭空重置。
+      lastError: staleNote,
       startedAt: now,
       updatedAt: now,
     }
@@ -93,8 +156,11 @@ export class TaskRunnerDO extends DurableObject<Env> {
     if (state === undefined) return
     state.queue = []
     state.finished = true
+    state.cancelRequested = true
     state.lastError = 'cancelled'
     await this.save(state)
+    // ⚠️ 删 alarm 只是「不再排新的」；**正在执行的那一步**仍会跑完 ——
+    // 它结束时靠 `cancelRequested` 发现自己被取消（见 `alarm()` 收尾处）。
     await this.ctx.storage.deleteAlarm()
   }
 
@@ -132,6 +198,12 @@ export class TaskRunnerDO extends DurableObject<Env> {
       await this.save(state)
       return
     }
+
+    /**
+     * 记录「本步开始前 `done` 的长度」。
+     * 取消并发保护要用它算出「本步新增了哪些 done 条目」（见收尾处的重读逻辑）。
+     */
+    const doneBefore = state.done.length
 
     let result: ActionResult
     try {
@@ -199,6 +271,26 @@ export class TaskRunnerDO extends DurableObject<Env> {
       } catch {}
     }
 
+    /**
+     * 🔴 **回写前先看「期间有没有人取消」**（2026-10-21 审查补，并发专项）。
+     *
+     * `state` 是**进入本步之前**的旧快照；本步可能 `await` 几十秒
+     *（真实对话可达 45s+），期间用户点了取消 —— `cancel()` 写下的
+     * `finished=true / queue=[]` 会被下面这行 `save(state)` 整体覆盖，
+     * 接着还会**重排 alarm**，剩下的步骤照跑。
+     *
+     * 修法：从 **storage 重读**（绕过内存缓存），发现 `cancelRequested`
+     * 就只把本步结果并进 `done`，其余一切以取消为准，且**不再排 alarm**。
+     */
+    const fresh = await this.loadFresh(state.uid)
+    if (fresh?.cancelRequested === true) {
+      fresh.done = [...fresh.done, ...state.done.slice(doneBefore)]
+      fresh.updatedAt = now
+      fresh.lastError = 'cancelled'
+      await this.save(fresh)
+      return
+    }
+
     await this.save(state)
 
     // 排下一步：用本步声明的 delayMs 表达反风控间隔。
@@ -215,6 +307,16 @@ export class TaskRunnerDO extends DurableObject<Env> {
     if (uid === undefined) return undefined
     this.run = await this.load(uid)
     return this.run
+  }
+
+  /**
+   * 从 **storage 强制重读**（不使用 `this.run` 缓存）。
+   *
+   * ⚠️ 只用于「检查期间是否有人改过状态」这类并发判定 ——
+   * 常规读路径仍走 `loadCurrent()` 的缓存，否则每步都多一次 SQLite 往返。
+   */
+  private async loadFresh(uid: string): Promise<RunState | undefined> {
+    return await this.load(uid)
   }
 
   private async load(uid: string): Promise<RunState | undefined> {

@@ -19,15 +19,16 @@
 - **服务**：`https://<你的域名>`（备用 `<worker 名>.<你的子域>.workers.dev`）
 - **面板**：`https://<你的域名>/panel/`
 - **全部核心能力已用真实账号端到端验证**：凭据加密、任务自动化（growth 计划 23/23 成功）、
-  OpenAI 兼容流式/非流式网关 + **Responses API**、**13 家供应商**、
+  OpenAI 兼容流式/非流式网关 + **Responses API**、**15 家供应商**、
   **聚合路由**（跨渠道临期优先）、用量四窗口、面板 + 安全头。
-- **625 条单测通过**（`npm test`）；`npm run typecheck` 通过。
-- **最新一轮（2026-10-20）**：修复**国际服渠道指纹两次换判据**（11-128 会话头族 + 设备头
+- **703 条单测通过**（`npm test`）；`npm run typecheck` 通过。
+- **最新一轮（2026-10-20 晚）**：重写**模型级冷却**为「验证式阶梯」并修 6 处真缺陷 ——
+  文案子串判据误锁 6 小时、坐实计数被剪枝归零、`ProviderError` 绕过 `classify()`、
+  `11‑128` 的 U+2011 连字符、502 包裹信封被吃成 `server`、中文重置时刻从未被解析。
+  见 **§9.21**。
+- **上一轮（2026-10-20 下午）**：修复**国际服渠道指纹两次换判据**（11-128 会话头族 + 设备头
   429 `14003`），连带修掉字符串业务码误解析、渠道拦截被当限流轮换、provider 路径误罚熔断、
   冷池报错误导四个放大器缺陷，见 §9.20。
-- **2026-10-18**：新增 **VPS 生产形态**（`dist/server.mjs` + `node:sqlite`，
-  与 Workers 并存）；移植上游子密钥 / 裸名别名 / 计费倍率；修「配置页能改但不生效」4 项、
-  面板「查进度被藏掉」与「网格隐式行塌陷」两个功能不可达缺陷，见 §9.19。
 - **2026-10-15**：修复「限流不换号」（SSE `data:` 前缀致 6004 误判为
   `unknown` 而 break）+ 国内版↔国际版跨渠道容灾（含 4 个自引入的死循环/body 复用缺陷，
   见 §9.17）。
@@ -63,8 +64,8 @@
 
 | 参考项目 | 语言/规模 | 对本项目的价值 | 能否直接移植 |
 |---|---|---|---|
-| `../workbuddy2api-panel` | Go / ~21k 行非测试代码 | **任务协议的权威来源**：25 个任务动作、4 套客户端指纹、领奖路径、幂等判据、真实对话回执 | ❌ 不能。Go 二进制无法在 Workers 运行；且其依赖 23 处文件系统读写、`net/http` 长驻服务、6 处进程内 cron、`go-redis` TCP 客户端 |
-| `../deepseek-harness-codearts` | TypeScript / ~68k 行 | **聚合网关的实现范式**：`src/openai-gateway/*` 已把「多 provider → OpenAI 兼容」做完整，且**对宿主的耦合面收敛为 4 个方法** | ⚠️ 部分。网关层可整体借鉴；但它是 DSH 插件，`src/index.ts` 等强耦合宿主 |
+| `<参考项目>/workbuddy2api-panel` | Go / ~21k 行非测试代码 | **任务协议的权威来源**：25 个任务动作、4 套客户端指纹、领奖路径、幂等判据、真实对话回执 | ❌ 不能。Go 二进制无法在 Workers 运行；且其依赖 23 处文件系统读写、`net/http` 长驻服务、6 处进程内 cron、`go-redis` TCP 客户端 |
+| `<参考项目>/deepseek-harness-codearts` | TypeScript / ~68k 行 | **聚合网关的实现范式**：`src/openai-gateway/*` 已把「多 provider → OpenAI 兼容」做完整，且**对宿主的耦合面收敛为 4 个方法** | ⚠️ 部分。网关层可整体借鉴；但它是 DSH 插件，`src/index.ts` 等强耦合宿主 |
 
 **关键结构性发现（决定了本项目的架构）**：
 `deepseek-harness-codearts` 的 `src/openai-gateway/server.ts:20-25` 定义了 `LlmRuntimeLike` 接口，网关对 DSH 的真实依赖只有四个方法 —— `listProviders()` / `listModels(provider)` / `resolveModelInfo(provider, model)` / `stream(options)`（外加可选的 `attachments.saveImage`）。
@@ -94,7 +95,7 @@
 
 ### 2.4 为什么任务引擎必须是 Durable Object
 
-这是本项目**最容易做错、代价最高**的一个决定。依据来自 Go 侧的实测数据（`../workbuddy2api-panel`）：
+这是本项目**最容易做错、代价最高**的一个决定。依据来自 Go 侧的实测数据（`<参考项目>/workbuddy2api-panel`）：
 
 | 常量 | 值 | 出处 |
 |---|---|---|
@@ -163,7 +164,7 @@
 
 ### 3.1 使用边界（不可协商）
 
-参考项目 `../workbuddy2api-panel` 的 README 明确声明其定位是**个人自用账号管理**，并明确反对：批量注册小号、账号池出租、付费 API 中转、二次打包售卖。
+参考项目 `<参考项目>/workbuddy2api-panel` 的 README 明确声明其定位是**个人自用账号管理**，并明确反对：批量注册小号、账号池出租、付费 API 中转、二次打包售卖。
 
 本项目**继承该边界**，并在实现上体现：
 
@@ -178,7 +179,7 @@
 | 不做 | 原因 |
 |---|---|
 | 移植 Go 项目全部功能 | Go 侧 21k 行含大量部署态能力（Docker、面板、归档），与 serverless 目标无关 |
-| 支持全部 provider | ✅ **已做 13 家**（第 8 步 + 第 9 轮，含腾讯国内版 + 国际版双变体）。`loomy` 曾于 `9ac653f` 删除，**第 9 轮已重新接入**（短信登录）。未接登录的家其推理仍可用「导入凭据」 |
+| 支持全部 provider | ✅ **已做 15 家**（含腾讯国内版 / 国际版、Qoder 国际版 / 中国版两组同源变体）。`loomy` 曾于 `9ac653f` 删除，**第 9 轮已重新接入**（短信登录）。未接登录的家其推理仍可用「导入凭据」 |
 | ~~zcode 签到~~ | 已确认**不可行**（需 headful Chromium 过阿里云 captcha）；推理不受影响 |
 | 管理面板的完整复刻 | 面板功能多；第一版只做**能验证闭环的最小 API** |
 | `Expert_Philanthropy` 任务 | 需真实捐款，Go 侧已实测无法绕过（`internal/panel/autotask.go:19`） |
@@ -282,7 +283,7 @@ src/
 
 ## 六、必须遵守的协议事实（来自 Go 侧实测）
 
-> 这一节是本项目**最有价值的部分**。全部来自 `../workbuddy2api-panel` 的实测结论，重写时**不要重新踩**。
+> 这一节是本项目**最有价值的部分**。全部来自 `<参考项目>/workbuddy2api-panel` 的实测结论，重写时**不要重新踩**。
 
 ### 6.1 四套客户端指纹（同一端点，不同判据）
 
@@ -554,7 +555,7 @@ TaskRunner DO
 | 5. 任务引擎动作 | ✅ **完成**：11 个零消耗动作 + 领奖闭环。**真实账号 growth 计划 23/23 全部成功** |
 | 6. 聚合网关 | ✅ **完成**：`/v1/models` + 流式/非流式 `/v1/chat/completions`（含工具调用）+ 已接入账号池 |
 | 7. Web 面板 | ✅ **完成**：`/panel/` 上线，**6 视图**（积分包页已按用户要求删除），CSP 严格 |
-| 8. 多供应商 | ✅ **完成**：接入统一 `Provider` 接口。**第 9 轮后为 13 家**（含重新接入的 `loomy` 与新增的 `gemini`） |
+| 8. 多供应商 | ✅ **完成**：接入统一 `Provider` 接口。**第 9 轮后为 13 家**（含重新接入的 `loomy` 与新增的 `gemini`），后续增加 `meoo` 与 `qodercn`，**现为 15 家** |
 
 ### 9.1b 第 9 轮改造（2026-10-08/09）：Responses API + 续期缺陷 + 面板管理
 
@@ -3012,11 +3013,10 @@ data: {"code":6004,"msg":"模型限流，建议切换其他模型，reset at …
 
 #### 部署记录
 
-- 部署到 Cloudflare 账号：
-  `https://<worker 名>.<你的子域>.workers.dev`（线上自定义域 `<你的域名>`）；
-- 版本 ID `9e6d21e8-…`；588 单测 + `typecheck` + `deploy --dry-run` 全通过；
-- 已推送到 `origin`（`NandaNg314/free-llm-router`），提交 `ad78ddc`；
-- **推送前隐私自检**：全文扫描 `cfat_` / Token / Account ID / 自定义域 / 账号邮箱
+- 部署到 CF 账号：`https://<worker 名>.<你的子域>.workers.dev`（线上自定义域 `<你的域名>`）；
+- 版本 ID `<部署版本 ID>`；588 单测 + `typecheck` + `deploy --dry-run` 全通过；
+- 已推送到 `origin`，提交 `ad78ddc`；
+- **推送前隐私自检**：全文扫描 CF API Token / Account ID / 自定义域 / 账号邮箱
   均**零命中**（唯一命中在 gitignore 的 `.playwright-mcp/` 里）。
 
 ### 9.18 长上下文大请求触发 Workers Free 10ms CPU 超限（503 Service Unavailable）与极致优化（2026-10-15）
@@ -3028,7 +3028,7 @@ data: {"code":6004,"msg":"模型限流，建议切换其他模型，reset at …
 通过开启 `wrangler tail --status error` 实测抓获真实错误现场：
 ```
 POST https://<你的域名>/v1/chat/completions - Exceeded CPU Limit @ 2026/10/15 22:03:06
-  (log) [pick:workbuddy] 选中账号 uid=workbuddy:a58f38df-30f3-439f-859a-b3e8f10fb3db realm=global tried=1
+  (log) [pick:workbuddy] 选中账号 uid=workbuddy:<账号 uid> realm=global tried=1
  [ERROR] Error: Worker exceeded CPU time limit.
 
 POST https://<你的域名>/v1/chat/completions - Exceeded CPU Limit @ 2026/10/15 22:03:15
@@ -3067,9 +3067,9 @@ POST https://<你的域名>/v1/chat/completions - Exceeded CPU Limit @ 2026/10/1
 
 - 单元测试：`node --test` 运行 1176 条测试用例 **100% 通过（0 失败）**；
 - 类型检查：`npm run typecheck` 零报错；
-- 已成功部署至 Cloudflare 大号：
+- 已成功部署至 Cloudflare 账号：
   - Worker URL: `https://<worker 名>.<你的子域>.workers.dev`（线上绑定域名 `<你的域名>`）；
-  - 当前版本 ID: `d55553af-87fa-4e20-9173-6861e89b3261`；
+  - 当前版本 ID: `<部署版本 ID>`；
 - 通过 `wrangler tail` 重新监听，错误已清零。
 
 #### 后续复查：CPU 超限仍有间歇性复现（2026-10-15）
@@ -3083,203 +3083,559 @@ Workers CPU 超限是两类故障，必须分开判断。
 
 ---
 
-### 9.19 VPS 生产形态 + 上游功能同步 + 面板真实缺陷（2026-10-18）
-
-**测试基线：605 条单测通过；`tsc` 0 错误；VPS 线上实测。**
-
-#### 一、VPS 生产形态（新增，与 Workers 并存）
-
-| 项 | 值 |
-|---|---|
-| 入口 | `src/server/index.ts`（`npm run build:node` → `dist/server.mjs`） |
-| 存储 | `node:sqlite`（`src/server/storage.ts` 适配 `DurableObjectStorage` 接口） |
-| DO 模拟 | `src/server/namespace.ts`（进程内实例池 + `pruneIdle` 回收 + alarm 落盘恢复） |
-| 部署 | Docker 容器，**只 bind mount `dist/server.mjs` 与 `data/`** |
-
-⚠️ **面板资源已作为 Text 模块打进 `server.mjs`** ⇒ 更新只替换一个文件。
-⚠️ 升级前必须备份 `data/router.db`（含加密凭据）。
-
-#### 二、从上游 fork 移植（UI 未移植）
-
-| 项 | 关键点 |
-|---|---|
-| **子密钥** | `store/apikeys.ts`（纯函数）+ `gateway/authz.ts`（守卫）；DO 9 个方法；5 个 `/admin/apikeys*` 端点 |
-| **裸名别名** | `BARE_MODEL_ALIASES`；⚠️ **必须在 `splitModelName` 之前判定**，否则 `aggregate` 被当成未知供应商 |
-| **计费倍率** | buddy `credits` / lobsterai `costMultiplier`+`limitedFreeActive` / trae `display_contact_config`（**字符串化 JSON**，需 `JSON.parse`） |
-| **opencode** | 冷启动必须主动 `await refreshCapabilities()`；`isFree` 取兜底表与 models.dev 并集 |
-| **`/v1/models`** | 补 `priceFactor` / `providerName` / `realm`（含聚合条目） |
-
-⚠️ **VPS 专属改动（上游没有）**：`clientIpOf` 回退 `x-forwarded-for` **最后一跳**。
-取第一跳可被客户端伪造 ⇒ IP 白名单形同虚设。
-
-⚠️ **`priceFactor` 语义铁律**：出口统一 `priceFactorOrNull()` ——
-**有限数字或 `null`**。`JSON.stringify(Infinity)` 得到 `null`，字段还在但语义含混，
-客户端无法区分「未标注」与「字段坏了」；而 `null` 明确表示未标注（**不等于免费**），`0` 才是免费。
-
-#### 三、修复「配置页能改但不生效」（4 项，全部是静默失效）
-
-| 字段 | 缺陷 |
-|---|---|
-| `strategy` | **`expiry` 分支从未实现**；且 `cachedRoutingConfig` 只在读配置时赋值 ⇒ VPS 重启后恒用硬编码默认值 |
-| `maxRetries` | 网关两条路径都写死 `MAX_ROTATE = 3`，无消费方 |
-| `softCooldownSeconds` | `applyFailure` 写死 60s |
-| `autoTaskCron` / `autoRefreshCredential` | `scheduled()` 从不读它们，关掉照跑 |
-
-修法：`AccountPoolDO` 构造时 `blockConcurrencyWhile` 预加载配置；补 `expiry` 实现；
-网关从配置读换号预算；`scheduled()` 读两个开关（并与 `AUTO_*` 环境变量 AND）。
-
-#### 四、面板两个真实缺陷（都不是「样式不好看」，是**功能不可达**）
-
-**a. `.panel:has(> .out:empty) { display: none }` 把标题与按钮一起藏掉**
-
-用户原话「我们前端没有这个查进度」。实测：任务中心「每日任务进度」面板首次进入必然为空
-（`#task-status` 还没内容）⇒ 整块面板（含标题、**查进度按钮**、账号下拉）`display: none`、高度 `0`。
-而任务恰恰要跑完才来这里看结果 ⇒ **最该用的时刻它不在**。
-
-⇒ 改为 `.panel:not(:has(> .panel-head)):has(> .out:empty)`：只收掉「既无标题也无工具行」的空面板。
-
-**b. `section.view` 隐式网格行塌成 0 高**
-
-`display: grid` + `align-content: start` 时**隐式行**是 `auto` —— 在 Grid 里 `auto` 表示**可压缩到 0**。
-`.task-cards` 用 `repeat(auto-fit)` 一行撑出 3 列后，后续 `.panel` 落入隐式行被压成 0 高。
-
-⇒ 显式声明 `grid-auto-rows: max-content`。
-⚠️ 这是本项目**第三次**踩「新网格容器没考虑子项尺寸」的坑（前两次是 `main > *`、`.count`）。
-
-#### 五、任务进度的可用性改造
-
-- 支持「**全部账号**」下拉（`__all__` 哨兵；真实 uid 白名单是 `[A-Za-z0-9_-]`，不会撞）
-- 执行每日任务后**自动轮询**（2 秒后开始；仅在 `finished === false` 时续期）
-- 切换视图 / 换账号时 `stopTaskPolling()`（否则旧轮询会把结果写进新账号的框）
-- 失败原因**去重归类**（38 步全 401 刷屏的问题）
-- 显示「本次运行：MM-DD HH:MM → MM-DD HH:MM（N 分钟前结束）」
-
-⚠️ **「一键签到」是同步执行的，不写 TaskRunner 记录**（它不走 DO alarm）。
-界面已明确标注两栏区别 —— 此前用户把「签到成功」与「每日任务旧记录里的 401」当成同一件事，
-误判为「签到成功了但账号是坏的」。
-
-#### 六、部署记录
-
-- 产物 `dist/server.mjs`，经 `scp` 上传 + `docker restart`
-- 每次升级保留 `server.mjs.bak-<日期>` 与 `router.db.bak-<日期>`
-- 线上验证：`/v1/models` 90 个模型（60 个有真实倍率、30 个 `null` 未标注、`Infinity` 零泄漏）；
-  SSE 210 帧 + `[DONE]` 零错误帧；5 路并发流式零串帧；客户端断开 `clientGone=true` 不记失败
-
----
-
-### 9.20 国际服渠道指纹两次换判据：会话头族 + 设备头（2026-10-20，v0.1.2）
-
-**症状**：国际服（`www.workbuddy.ai`）全部 5 个账号同时失败。用户报「今天一用就提示限流」，
-面板/日志里看起来像 429，但上游原始响应是：
-
-```
-HTTP 400 {"code":"11-128","msg":"request illegal",
-  "displayTips":{"en":"This call failed channel verification,
-  possibly because it was not sent from an official client."}}
-```
-
-#### 一、第一条判据：**会话头族**（缺一个就 400）
-
-在 VPS 容器内直连上游做单变量对照（这是定位的关键，不能靠读代码猜）：
-
-| 变体 | 结果 |
-|---|---|
-| 裸头（= 当时的线上口径） | 400 `11-128` |
-| 补 `Accept: text/event-stream` 之外再补会话头族 | **200** |
-| 只把 UA / `X-IDE-Version` 改成 5.8.4 | 400 `11-128`（UA 不是主因） |
-| 会话头族只补前 3 个 | 400 `11-128`；补到第 4 个 | 429 `14003`；补到第 5 个 | **200** |
-
-5 个账号用同一套头**全部** 11-128 ⇒ **上游校验的是请求头，与账号无关**。
-这也直接排除了「账号被封 / 余额耗尽 / IP 被封」三种常见误判。
-
-必须发齐的 5 个（官方桌面端 5.8.4 抓包口径）：
-
-```
-X-Conversation-ID           带连字符 UUID（同一会话恒定）
-X-Conversation-Request-ID   32 位 hex（一轮用户发送内恒定，重试复用）
-X-Root-Request-ID           = 上一行
-X-Conversation-Message-ID   32 位 hex（每请求新生成）
-X-Request-ID                = 上一行
-```
-
-身份头同时换成桌面端 5.8.4：`X-Agent-Intent: craft`、`X-Agent-Type: main`、
-`X-IDE-Version: 5.8.4`、`X-Private-Data: true`、`X-Product: SaaS`、
-UA 为 `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0`（**中段是小写 `workbuddy-ai`**，
-旧的 `WorkBuddy AI` 已失效）。国内服（`copilot.tencent.com`）现行口径实测仍 200，**一个字不动**。
-
-#### 二、第二条判据：**设备头**（`X-Machine-ID` / `X-Session-ID`）
-
-补完会话头族后，单账号全通，但**多账号并发**仍会被按设备维度打成 `14003`：
-
-| 场景 | 结果 |
-|---|---|
-| 3 个账号同时发 | 1 个 200，2 个 429 `14003` |
-| 串行逐号发 | 3/5 通过，2 个 429 |
-| 同号 1.5s 间隔连发 | 首条即 429（设备级限流窗口比想象中紧） |
-| **网关按 `uid` 派生设备头后** | 同一账号可连续 5~6 次 200，约 2~4 秒间隔仍稳定 |
-
-⇒ 补齐 `X-Machine-ID` + `X-Session-ID`（按账号稳定派生的 UUID，见 `intlDeviceHeaders`）。
-**关键**：绝不能在全进程取一次 —— 那会让整池账号共用一台「设备」，比不发更糟。
-
-#### 三、顺带修掉的四个放大缺陷
-
-1. **字符串业务码**：上游回的是 `{"code":"11-128"}`（**字符串**）。旧 `parseEnvelope` 用
-   `Number(raw)` 得 `NaN` ⇒ 整条信封被丢弃 ⇒ 错误文案全丢、分类退化成裸 400。
-   现在归一为 `CHANNEL_BLOCKED_CODE = -108128`（⚠️ 不能写 `-11-128`，那是算术表达式）。
-2. **渠道拦截被当限流轮换**：buddy 路径与 provider 路径都会逐个换号重试 ⇒ 一次请求放大成 5 次
-   上游失败。现在 `kind === 'channel_blocked'` 直接 break。
-3. **provider 路径只看状态码**：11-128 是 400，被归成 `unknown` ⇒ `failureKind` 落 `breaker`
-   ⇒ 连续 3 次把健康账号熔断 30 分钟。现改用共享 `classify()`。
-4. **冷池报错误导**：全池冷却时 `pick()` 返回空，用户看到「没有可用账号（请先登录/导入凭据）」，
-   而账号一个都没坏。现在有 `lastError` 时必须回放真实原因。
-
-#### 四、会话 ID 的稳定性语义（易错点）
-
-官方客户端：`X-Conversation-ID` 同一对话恒定、`X-Conversation-Request-ID` 一轮恒定、
-消息级 id 每请求新生成。网关若每请求现生成，等于把一次多轮对话拆成上千个「一次性会话」——
-这正是反作弊眼里的非人类形态。故 `deriveIntlConversationId(uid, sessionKey)`：
-
-- 种子**必须含 uid**（同一段会话 id 出现在两个账号的请求里，就是跨账号关联键）；
-- 换号必须换 id（同一个理由）；
-- 会话键为空时退回随机，**不伪造**稳定值。
-
-⚠️ UUID 变体位在**第 9 个字节**（`h[9]`）的高 2 位，写错字节位不会报错，只会产出 variant 非法的假 UUID。
-
-#### 五、部署与验证
-
-- 版本 `v0.1.2`；单测 625 条全绿；`npm run typecheck` 0 报错
-- VPS：备份 `backups/<时间戳>/`（`server.mjs` + `router.db`）→ `scp` → `docker restart`
-- 线上验证：国内服 3 连发全 200；国际服在所有冷却清空后 10 秒间隔 10 连发全 200，
-  5 个账号在 `log:ring` 里都有成功记录
-
-#### 六、国际服的真实吞吐窗口（实测曲线，务必按这个设冷却）
-
-| 间隔 | 结果 |
-|---|---|
-| 同时并发 | 1 个 200，其余 429 |
-| 串行 3 秒 | 3/5 通过 |
-| 串行 8 秒 | 10/10 通过 |
-| 串行 12 秒 | 偶发 429（上游是**滑动窗口**，不是固定间隔） |
-
-⇒ 模型级冷却必须**短**：原实现 60s 起、指数翻倍封顶 10 分钟，一次 429 就把整池关掉十几分钟，
-用户侧表现为「刚修好又全挂」。现改为 **15s 起、封顶 90s**（`AccountPoolDO` 的 `fallbackCooldown`）。
-这不是"绕过限流"，而是让冷却长度与实际窗口匹配。
-
-⚠️ 上游的 14003 是**滑动窗口 + 设备维度**双重约束，客户端单线程一口气写代码时，
-一轮 10 个工具调用的节奏大概率会撞几次。网关会自动换号 + 短冷却重试，用户无感；
-若要用满速，建议客户端把并发控制在 2 以内、或错开 8 秒以上。
-
----
-
 ## 十、参考文件
-
 
 | 用途 | 路径 |
 |---|---|
-| 任务协议权威来源 | `../workbuddy2api-panel/internal/upstream/*.go`、`internal/panel/autotask.go` |
-| 账号池状态机参考 | `../workbuddy2api-panel/internal/pool/*.go` |
-| 网关实现范式 | `../deepseek-harness-codearts/src/openai-gateway/*.ts` |
-| 上游错误分类参考 | `../workbuddy2api-panel/internal/upstream/client.go` |
+| 任务协议权威来源 | `<参考项目>/workbuddy2api-panel/internal/upstream/*.go`、`internal/panel/autotask.go` |
+| 账号池状态机参考 | `<参考项目>/workbuddy2api-panel/internal/pool/*.go` |
+| 网关实现范式 | `<参考项目>/deepseek-harness-codearts/src/openai-gateway/*.ts` |
+| 上游错误分类参考 | `<参考项目>/workbuddy2api-panel/internal/upstream/client.go` |
 | Workers 限额 | https://developers.cloudflare.com/workers/platform/limits/ |
 | DO 限额 | https://developers.cloudflare.com/durable-objects/platform/limits/ |
 | Node 兼容性 | https://developers.cloudflare.com/workers/runtime-apis/nodejs/ |
+
+---
+
+## §10 渠道拦截码 11‑128 的三层静默失效（2026-10-19 实测修复）
+
+这一条**比它看起来严重得多**：它让「渠道指纹不被认可」被误判成「出口 IP 被封」，
+进而触发 IP 级全局停服。三层缺陷**叠在一起**，每层单独都能让功能失效。
+
+### 层 1：`replaceAll(a, a)` 是空操作，而单测写成「输入 === 期望值」
+
+`upstream/report.ts` 与 `gateway/payload.ts` 各有一份脱敏函数，实现都是：
+
+```ts
+return body.replaceAll('11‑128', '11‑128')   // 两个参数**一字不差**
+```
+
+替换结果与输入**逐字节相等** ⇒ 脱敏从未生效。而单测写的是
+`assert.equal(sanitize('错误码 11‑128'), '错误码 11‑128')` ——
+**输入与期望值一样**，所以它**永远通过**，把这个缺陷锁了整整一个版本。
+
+⚠️ **断言必须验证「确实发生了变化」**（`assert.notEqual(out, input)`），
+而不是「输出等于某个字面量」。当输入与期望值相同时，断言的信息量是零。
+
+### 层 2：源码里 42 处把真实错误码写错了
+
+真实错误码是 **`11‑128`**（带 ASCII 连字符 U+002D），而源码里**大面积**写成
+**`11‑128`**（少一个连字符）。两者渲染出来**肉眼无法分辨**。
+
+⚠️ 更糟的是 `code: 11‑128` 这种写法在 JS 里是**算术表达式**（`11 - 128 = -117`），
+而不是字符串 —— 它从来就不是那个错误码。
+
+### 层 3（最深）：`parseEnvelope` 用 `Number()` 吞掉了字符串码
+
+上游真实报文：`{"code":"11‑128","msg":"Illegal API invocation from an unapproved channel"}`
+—— 注意 `code` 是**字符串**。
+
+而 `parseEnvelope` 当时做的是 `Number(raw)` ⇒ `Number("11‑128")` = **`NaN`**
+⇒ `!Number.isFinite(NaN)` ⇒ **判成「不是信封」并返回 `undefined`**
+⇒ 走「无信封 + 403」分支 ⇒ **`waf_blocked`**（而不是 `channel_blocked`）。
+
+后果链：`waf_blocked` → `noteWaf()` 的 **IP 级**判定 → 凑够 2 个账号
+→ **整个服务停服 60 秒**。这正是用户报的「有的软件能用、有的不能」。
+
+### 修法与纪律
+
+1. `Envelope.code` 改为 `number | string`；`parseEnvelope` **保留原始值**；
+2. 需要数字的地方统一走 `numericCode()`（非数字码返回 `undefined`，
+   **绝不** `Number()` 硬转 —— `NaN` 参与任何比较都是 false，会制造静默缺陷）；
+3. `classify()` **先判字符串形态的渠道拦截码**，再查 `CODE_NUMBER_KIND` 数字表；
+4. 脱敏用**不同码点**：判据是 ASCII `11‑128`，替换值是 U+2011；
+5. **所有涉及该码的地方都用码点构造**：
+   ```ts
+   String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38)   // '11‑128'
+   ```
+   ⚠️ 不在源码里书写完整字面量 —— 编辑器/构建链任一环归一化就会静默失效，
+   而两者**渲染几乎一致**，无法靠肉眼发现。
+
+### 方法论教训（最重要）
+
+**不要在断言里锁源码文本。** 本次有两处测试是
+`assert.ok(/11‑128: 'channel_blocked'/.test(src))` —— 它锁的是**写法**，
+而真实缺陷藏在**行为**里（`parseEnvelope` 把码吞了）。锁文本会让
+「代码看起来对、行为其实是错的」照样通过。已全部改为调 `classify()` 验行为。
+
+⚠️ 且**必须做变异测试**：把修复改回原缺陷，确认断言真的会失败。
+本次三层缺陷各自都做了变异验证。
+
+### 9.20 限时补偿积分（2026-10-19，实测上线）
+
+**新增能力**：WorkBuddy / CodeBuddy 的「限时补偿积分」查询与领取
+（wb 面板上那个**「立即领取」**按钮）。
+
+#### 端点（逆向 + 实测双证据）
+
+| 用途 | 路径 | 要求 `data` |
+|---|---|---|
+| 查状态 | `POST {web}/billing/meter/compensation-status` | **要** |
+| 领取 | `POST {web}/billing/meter/claim-compensation` | **不要** |
+
+⚠️ **没有 `/v2` 前缀**（对比签到是 `/v2/billing/meter/daily-checkin`）——
+这是另一个产品面，按 v2 抄会 404。
+
+⚠️ 走 **`web` base**（`www.workbuddy.cn`）而不是 `billing` / `copilot`：
+参考实现实测三个 host 都能通，但刻意走 webBase —— 网页端发这个请求的站就是它
+（前端 bundle 托管在 `assets.workbuddy.cn`）。把用户中心类请求打到推理站
+没有依据，哪天收窄路由就会静默失效。
+
+#### 🔴 最大的坑：领取成功时**没有 `data` 字段**
+
+真实报文：
+```json
+// 状态：有 data
+{"code":0,"msg":"OK","data":{"claimed":false,"active":true,
+  "credit_num":500,"validity_period":1,"end_time":"2026-10-22 23:59:59"}}
+
+// 领取：**没有 data**
+{"code":0,"msg":"OK","requestId":"…"}
+```
+
+参考实现为此踩过一次并留了记录：5 个账号批量领取、5/5 都是「无 data」形态，
+面板按「缺 data ⇒ 形态不认识」报**「5 个领取失败」**；而随后查 status，
+5/5 都是 `claimed:true, credit_num:500` —— **积分早已到账**。
+
+⇒ **写操作成败只看 `code === 0`**，缺 `data` 不等于失败；
+   但**仍要求有 `code`**（没业务码无法与「网关回了 JSON 错误体」区分，
+   宁可报形态错也不要把未知当成功 —— 一次性写操作尤其不能猜）。
+
+#### 实测结果（本机 3 个国内版账号）
+
+```
+claimed: true, active: true, creditNum: 500,
+validityPeriod: 1, endTime: "2026-10-22 23:59:59"
+```
+
+三个账号**都是 `claimed: true`**（此前已手工领过）。
+调用领取端点时 **3/3 全部跳过并返回「该账号此前已领取」，一次上游写请求都没发** ——
+这正是「领前先查」防护设计的目的。
+
+#### 纪律：**刻意不接进自动任务 / 自动签到**
+
+这是一次性的**限时**活动（过了 `end_time` 就作废），不是每日可领的能力。
+本项目对「一次性 / 有代价动作」的纪律是**默认不自动执行**
+（同 `Expert_Philanthropy` 需真实捐款那类）。
+
+⇒ 只提供 ① 只读状态查询、② 用户**显式点击**的一次领取。
+`cron` 与自动签到链路里**不调用** `claimCompensation`。
+
+#### 面板
+
+任务中心新增「限时补偿积分」卡片，**两个按钮分离**：
+
+- 「查状态」= 只读，可反复点；
+- 「领取」= 一次性写操作，带 `confirm` 二次确认。
+
+⚠️ 两者都**遍历 `cn` + `global` 两个 realm** —— 与 `loadAccounts` 同一纪律：
+只查 `cn` 会让国际版账号静默消失（本项目在账号列表上已吃过一次这个亏）。
+
+⚠️ 面板对「查不到」与「没有补偿」**如实区分**：
+`available: false` 时提示「查不到补偿活动（可能是接口形态变化，不是"没有"）」——
+前者可能是接口变了，后者是业务语义，两者该采取的行动完全不同。
+
+### 9.21 冷却被误锁与「重置时刻」失效（2026-10-20，实测五处真缺陷）
+
+本轮起点是用户一句「账号明明是好的但就是用不了」。顺着这条线拆出**五个独立缺陷**，
+其中四个是「一次误判被放大成数小时不可用」，一个是「上游明说了几点恢复却没人听」。
+
+#### ① `reason.includes('not found')` 匹配面过宽 → 一次失败锁 6 小时
+
+模型级冷却的「是不是该后端没有此模型」判据原本靠**文案子串**：
+
+```ts
+const isNotAvailable =
+  input.reason?.includes('11102') ||
+  input.reason?.includes('service info not found') ||
+  input.reason?.includes('not found')   // ← 过宽
+```
+
+第三个条件几乎匹配一切「找不到」的文案。而这类文案**恰恰也会由我方模型名前缀拼错触发**
+（见 §9 的聚合前缀事故：`aggregate/xxx` 被原样发给上游 ⇒ 上游回 11102）。
+于是一个**纯粹自己写错**的模型名，被记成「上游没有该模型」，锁死 6 小时。
+
+**实机证据**：`default-model` / `deepseek-v4.1-flash-sg` 被锁 5.56h，
+而它们连续 3 次真实调用**全部 200**。
+
+**修法**：判据从「文案反推」改为**结构化传参**。
+调用方在拿到 `classify()` 的 `kind` 时就已经知道语义，直接传 `modelCause: 'absent' | 'denied' | 'busy'`，
+`AccountPoolDO` 不再解析任何文案。
+
+> 教训：**永远不要用错误文案的子串去决定持久化惩罚**。文案是展示层，随时会改、会撞。
+
+#### ② `pruneExpired` 删条目 → 坐实计数永远归零
+
+第一版「验证式阶梯」把 `hits` 存在冷却条目内部。而 `pruneExpired` 会把**过期**条目整体删除
+⇒ `hits` 随之归零 ⇒ 阶梯**永远停在首档**。
+
+实测：连打 3 次真不存在的模型，`hits` 恒为 1，冷却永远只有 2 分钟。
+这既浪费请求（每 2 分钟白撞一次），又永远升不到能真正止损的长冷却。
+
+**修法**：坐实计数移到**账号级** `modelConfirm` 表，与冷却条目解耦；真实成功时清零。
+
+#### ③ `ProviderError` 绕过了 `classify()` → 业务码语义整条丢失
+
+8 家 provider 的 `chat()` 在非 2xx 时**抛 `ProviderError`**，而不是返回 `Response`
+（只有 opencode 返回）。于是网关的 `!upstream.ok` 分支 —— 也就是**唯一**调用 `classify()` 的地方 ——
+**永远走不到**。后果是这些错误被一律压成 `lastError = {502, message}`、记成传输层失败：
+
+- 业务码语义丢失（11158/11102/6004 全部退化成一句「网络错」）；
+- 写不进模型维度负缓存；
+- 不触发正确的换号策略。
+
+**修法**：`catch` 分支里认出 `ProviderError` 后，把它的 `message` 交给 `classify()`
+（该函数本来就是按文本解析业务码的），只有解析不出业务码时才退回传输层语义。
+
+⚠️ 顺带修了 `parseEnvelope` 的两个前提过强：
+- 要求整串以 `{` 开头 ⇒ 中文包裹（`供应商「X」请求失败：{...}`）解析不出；
+- 不认转义引号（`{\"code\":11158}`）⇒ 内层 JSON 解析失败。
+
+现在用**栈式扫描**从任意位置取配对 `{}`，且**先解转义再配平**
+（顺序很重要：若先配平，`\"` 会被误判成字符串边界，括号深度立刻错位）。
+
+#### ④ `11‑128` 的连字符是 U+2011，不是 ASCII `-`
+
+`11‑128` 的真实字节是 `31 31 E2 80 91 31 32 38` —— 中间那个是 **U+2011（非断连字符）**。
+而旧正则 `/^\d+-\d+$/` 只认 ASCII `-` ⇒ 这个码**始终匹配不上**，
+`parseEnvelope` 返回 `undefined`，整条信封被丢弃、最终落回 `server`(5xx)。
+
+> 教训：「看起来一样的字符」是最容易埋雷的地方。处理外部码值时，
+> 要么用 `\u` 范围显式接受全角/连字符变体，要么先做统一归一化。
+
+#### ⑤ 5xx 判在业务码之前 → 502 包裹的信封被吃成 `server`
+
+上游在网关侧出错时会用 **502 包裹业务信封**：
+
+```
+HTTP 502 + {"code":11158,"msg":"model [x] is not allowed for user type [...]"}
+```
+
+旧实现 `if (httpStatus >= 500) return server` 排在信封解析之前 ⇒ 这类一律成 `server`
+（**账号级**、喂熔断）。连续几次就把好账号熔断掉 —— 这是「号好却用不了」的第二条来源。
+
+**修法**：**已知业务码优先于 5xx**。判据刻意保持够窄：
+只有信封里的 `code` 属于 `CODE_KIND` 才越过 5xx；真网关故障（HTML / 无信封 / 未知码）仍落 `server`。
+
+#### ⑥ 上游「重置时刻」只认英文 → 中文文案的时间从未被用上
+
+这是本轮**最讽刺**的一处：代码里写着「上游知道真实的重置墙钟，我们不该自己猜」，
+而解析器只匹配英文：
+
+```ts
+/reset at (\d{4})-(\d{2})-(\d{2})...\s*UTC([+-])(\d{1,2})/
+```
+
+国内服给的是**中文**：
+
+```
+您的使用量已超出频率限制，将在 2026-10-21 13:16:46 UTC+8 重置，您也可以切换其他模型继续使用。
+```
+
+⇒ `resetAt` **一次都没被解析出来**，一直走猜的退避。DB 里 reason 存着那句中文、
+`resetAt` 却恒为 0，这就是铁证。
+
+连带第二个问题：那句「您也可以切换其他模型继续使用」明确说明是**模型级**，
+但英文正则不认 ⇒ 判成 `soft`（账号级）⇒ **整个账号被关**，而其实只需换个模型。
+
+**修法**：
+- `parseResetAt` 改三层 fallback，**不把措辞写死**（英文 → 中文 → 任何 `日期时间 + UTC 偏移`）。
+  措辞会变，结构稳定。
+- `refineModelScoped` 补中文模型级判据（`切换其他模型` / `其他模型继续使用` / `换个模型`）。
+
+**实测生效**：清空旧冷却后真实触发 6004，两条冷却正确对齐上游墙钟
+（`13:16:46 UTC+8 → 05:16:46Z`、`21:37:05 UTC+8 → 13:37:05Z`）。
+
+#### ⑦ 意外发现：`credits` 字段从不刷新
+
+查那两个账号的真实余额时发现面板显示 `credits=0`，而直连上游
+`v2/billing/meter/get-user-resource` 拿到的是 **2870 / 3514**（充足）。
+
+查代码：`credits` 只在 `revive()` 里被写入，正常流程**没有任何刷新入口**。
+连带两个后果：
+
+1. `random` 策略的加权 `1 + credits/100` 退化成等权；
+2. **永久积分锁**的判据 `credits > 0` 永不命中 ⇒ 锁形同虚设；
+3. `expiry` 策略（默认）依赖 `creditsExpiring` 排序，该字段同样恒 0 ⇒ 退化成按 uid 轮转。
+
+**未修**（本轮只做诊断与记录）。见 README「已知限制」。
+
+#### 本轮方法论（值得复用）
+
+1. **「一次失败锁多久」是必须显式面对的参数**，不是随手写的常量。
+   原则：**首档冷却要短到误判代价可忽略，长冷却必须靠重复坐实换取**。
+2. **判据用结构、不用文案**。文案是展示层的，会变、会撞、会有同义说法。
+3. **凡是「上游说了但你不用」的字段，都要验一遍真的被解析出来了**
+   —— 本轮 `resetAt` 就是「代码注释写着要用，实际一次没用」。
+4. **同一个错误码可能有多条路径进入**。查一个码的行为，要把所有调用点都列出来
+   （本轮 `classify` 有 4 个调用点，其中 `ProviderError` 那条完全不经过它）。
+5. **验证方法本身也会错**。本轮我一度用 `buddy/grok-4.7` 去验 11158，
+   而那个前缀走国内服、真实返回 11102 —— 差点把正确行为误判成 bug。
+   验行为前先确认「这条请求真的走那条路径」。
+
+### 9.22 余额快照从不刷新（2026-10-20 晚，实测确诊并修复）
+
+#### 症状与发现路径
+
+查两个被限流账号的真实额度时，顺手看了面板：**全部显示 `credits=0`**。
+而直连上游 `v2/billing/meter/get-user-resource` 拿到的是 **2870 / 3514**（充足）。
+
+#### 根因
+
+`credits` / `creditsExpiring` / `creditsEarliestExpiry` 三个字段**只在 `revive()` 里写入**
+（那是「解冻账号」的路径），正常流程**没有任何刷新入口** ⇒ 它们永远停在
+`createAccountState()` 的初始值 0。
+
+#### 后果（不是显示问题，是行为错）
+
+1. **永久积分锁完全失效** —— 判据 `credits > 0 && creditsExpiring === 0`，
+   而 `credits` 恒 0 ⇒ 永不命中 ⇒ 本该拦下的「只剩永久额度」账号照样被选中，
+   照样烧掉**不可撤回**的永久积分。**这个开关从上线起就没生效过。**
+2. **`expiry` 策略（默认）退化** —— 它按 `creditsExpiring` 排序，
+   键全等 ⇒ 最终按 uid 稳定排序 ⇒ 实际是「按 uid 轮转」，
+   没有实现它名字承诺的「临期先烧」。
+3. `random` 策略的加权 `1 + credits/100` 退化成等权。
+
+#### 修法
+
+- **新增 `AccountPoolDO.updateBalance(uid, now, {credits, expiring, earliestExpiry})`**：
+  **只写额度三元组，绝不动惩罚态**。
+  ⚠️ 刻意不复用 `revive()` —— 那个方法会清空冷却/熔断/降权/模型冷却，
+  拿它同步余额等于**每次刷新都偷偷解冻所有账号**，熔断机制形同虚设。
+- **新增 `refreshAccountBalances(env, now)`**，接进 `scheduled` 的整点 cron
+  （放在续期之后、`plan === undefined` 的 return 之前 —— 这样无任务时点也刷）。
+- **新增 `POST /admin/accounts/balance`** 手动触发，**复用同一段逻辑**
+  （两处各写一份必然分叉，本项目已吃过多次「只修一半」的亏）。
+
+三条纪律：
+- **查不到 ≠ 没钱了**：失败保持原值，绝不写 0；
+- **只写额度三元组**，不碰惩罚态；
+- **`buddy` 必须用 `bindBuddy(env)` 的绑定版**。
+
+#### ⚠️ 修复过程中踩到的坑（值得记）
+
+`findProvider('buddy')` 返回的是**未绑定的模板**，而 buddy 国内版的 `balance()`
+闭包捕获了 `env`（用于决定计费域）。拿模板调会抛：
+
+```
+Cannot read properties of undefined (reading 'UPSTREAM_CHAT_BASE')
+```
+
+现象很有迷惑性：**8 个账号里 3 个 buddy 全失败，而 workbuddy / qodercn 正常**
+—— 因为只有 buddy 需要绑定 env。网关里早就有这个模式
+（`providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider`），新代码漏了。
+
+已加测试钉住：`findProvider('buddy').balance()` 必须**抛错**，
+而 `bindBuddy(env).balance()` 不得报 `UPSTREAM_CHAT_BASE` 缺失。
+
+#### ⚠️ 顺带发现的语义陷阱（未改，只记录）
+
+`creditsExpiring` 的窗口是**7 天**（对齐 Go 侧 `expiring_soon`）。
+所以「有 2000 积分、但都在 30 天后到期」的账号，`creditsExpiring === 0`
+⇒ 会被永久积分锁判成「只剩永久额度」⇒ **误锁**。
+
+实测当前 8 个账号**全部**处于这个状态（最早到期 9.2 天后），
+一旦开启该锁会把整池清空。已在 README 加显著警告：
+**开锁前先确认你的额度是否真的只在 7 天内到期**。
+
+更正确的判据应是「按最早到期日判断是否只剩永久额度」，但那需要区分
+「永久积分」与「有时效的赠送积分」的**来源**，而上游的 `get-user-resource`
+只给 `CapacityRemain` / `CycleCapacityRemain`，**没有来源标记** ——
+故这属于**上游数据不足以支撑**的语义，不是实现偷懒。
+
+---
+
+### 9.23 上下文治理 / 会话链 / 消耗熔断 / Qoder 思考档位（2026-10-21，四项同批）
+
+依据两份材料，不是拍脑袋：
+
+1. **workbuddy2api 的封禁事件复盘**
+   （`doc/incident-postmortem-and-hardening-checklist.md`，公开可查）——
+   三次封号前最后一次成功请求分别是 **2552 / 428→434 / 987~993 条消息**，
+   结论之一是「P2 上下文治理：单请求消息数硬上限 + 摘要压缩」与
+   「P2 额度监控：消耗速率异常自动熔断」。
+2. **dsh-our-free-model 的 Qoder 适配实现**（`qoder-product.ts` / `qoder-adapter.ts`）
+   —— 它在 Qoder 渠道上把思考档位做通了，而本项目此前完全没解析。
+
+#### 9.23.1 消息数硬上限（`MAX_CONTEXT_MESSAGES`）
+
+**默认 300，不是复盘建议的 100**，理由写在 `src/env.ts` 常量注释里，摘要：
+
+- 300 仍**低于三次封禁样本中的最小值 434**，还在同一量级防线内；
+- 取 100 的实测后果：`719 条 → 101 条`，一次丢掉 619 条历史。对 agent 场景是
+  实打实的质量损失，而复盘把根因写成**多因素叠加**（无设备指纹 / 会话链缺失 /
+  429 热重试 / 高频），本项目其余几项均已具备，不必单独拉到最紧。
+
+**接线点只有一个**：`handleChatCompletions` 里、`rawBody` 解析与 `deriveSessionKey`
+之后，**早于**聚合分支与两处 `handleProviderChat`。理由：这里是聚合路由、具名
+provider、buddy、`/v1/responses`（经 `responses.ts:888` 内部转调）的**共同入口**。
+分两处写正是本项目「同一个 bug 只修一半」的旧伤。
+
+放在 `deriveSessionKey` **之后**是刻意的：粘性 key 必须由完整历史算出，
+否则裁掉几条就每轮换 key、命中不了上游 prompt cache。
+
+**配对安全**（否则上游 400 `11148`）：保留窗口的左边界向后推进到第一条非 `tool`
+消息；若整段窗口都是 `tool` 结果，则向前回溯到发起这批调用的 `assistant`；
+最后再复用 `cleanupOrphanToolCalls` 同一套 id 交集判据兜底。
+
+**摘要文案必须与当轮条数无关**（这条踩过）：早先文案是「更早的 619 条消息…
+最近 101 条」，两个数字**每轮都在变**，于是 `[首条 system + 摘要]` 这段前缀每轮
+都不同 ⇒ prefix cache 在摘要处断掉、整段历史每轮全价重算。现在只描述「发生过
+截断」这个事实，**数字只进日志**（日志不进上下文）。测试里有一条断言：
+摘要文案**不得出现任何数字**。
+
+#### 9.23.2 会话链路（b3 + `x-conversation-*`）
+
+补 `x-b3-traceid`（32 hex，同会话稳定）/ `x-b3-spanid`（16 hex，每请求新生成）/
+`x-b3-sampled: 1`，以及会话级 message-id / request-id。
+
+- **`X-Conversation-ID` 保持带连字符的 UUIDv4，不是 32 hex**：这是本项目
+  `tests/intl-headers.test.ts` 钉死的官方桌面端实测形态，改成 32 hex 与实测相反。
+- **会话标识只认客户端显式 `user` / `conversation_id`**（沿用
+  `deriveSessionKey`），**绝不从消息内容推断** —— 宁可「不粘」也不能「错误地粘」，
+  错粘会把独立请求压到一处，被上游判成并发踢流。
+- 只接入**国际服**两处组装点（`intlReferenceChatHeaders`、`cliChatHeaders` 的
+  workbuddy 分支），**国内 buddy 分支一字未动**（有测试断言零污染）。
+- **刻意不做 `x-device-token`**：复盘明确「一设备一账号一 token，严禁多账号共用，
+  否则风控连坐」，与本项目多账号池架构直接冲突，风险大于收益。
+
+#### 9.23.3 消耗速率熔断
+
+采样（`AccountState.samples`，上限 6 条，随 state 持久化）+ 纯函数判定，
+命中**复用现有 `applyFailure({kind:'soft'})`**，不新造惩罚态；已在硬冷却时
+不把 `coolKind` 降级成 `soft`。
+
+**默认窗口是 1 小时，不是复盘写的 5 分钟**（这条踩过）：采样的唯一生产调用点是
+`AccountPoolDO.updateBalance`，而它只由**整点 cron** 与面板手动刷新触发 ——
+正常运行时**每小时才一个采样点**。窗口设 5 分钟 ⇒ 窗口内最多命中 1 个采样 ⇒
+比较基准恒等于当前值 ⇒ **检测永远休眠，既不误报也完全不生效**。
+复盘那套 5 分钟/20% 是配合高频轮询 `/v1/credits` 设计的，我们没有那个节奏。
+
+要更细粒度**必须先给网关请求路径加采样点**，只缩窗口会让检测重新失效。
+
+`revive()` 一并清空 `samples`：不清的话，触发熔断前的高消耗采样仍在窗口内，
+下一次 `updateBalance` 会拿它当基准**立刻再锁一次**，用户会看到「点了解冻，
+一分钟后又被锁」且找不到原因。
+
+#### 9.23.4 Qoder 思考档位
+
+**根因**：`parseQoderModelCatalog` 只读了 `is_reasoning`（有没有思考能力），
+**完全没读 `thinking_config.enabled.efforts`**（有哪些档位），于是 11 个 Qoder
+模型在 `/v1/models` 里全部没有 `reasoning_efforts`，客户端也就没有档位选择器。
+
+三个必须记住的口径（照参考实现的实测结论）：
+
+1. **取 `efforts` 的键名不取值**：目录形如
+   `efforts: { xhigh:{}, low:{}, medium:{is_default:true} }`，键即档位 id，
+   按目录原始顺序保存。
+2. **`is_default` 是「默认选中」不是「多选」**：IDE 里是下拉单选。
+3. **「关闭思考」不塞进 `efforts`**：它由独立的 `supportsDisable` 表达，
+   客户端自己会追加 `none`；手动塞会语义重复。
+
+档位必须在客户端白名单内（`none/low/medium/high/xhigh/max`），**不在的会被
+静默丢弃** —— 已加 `EFFORT_WHITELIST` 过滤。默认档位必须落在 `efforts` 内，
+否则客户端会发一个不存在的档位、上游回 `11150`。
+
+**链路要透传到底**：`QoderFallbackModel.efforts → ProviderModel.reasoningEfforts
+→ /v1/models.reasoning_efforts`。早期漏了 `toProviderModels` 这一环，
+档位解析出来了但下游一律看不到（与「倍率漏传导致面板显示 —」同款教训）。
+
+实测（`qodercn/` 8 个模型）：`dmodel [high,max] 默认=max · 可关闭`、
+`dfmodel [high,max,low] 默认=max · 可关闭`。
+
+#### 9.23.5 验证与遗留
+
+- `npm run typecheck` 0 错；`npm test` 764/764（基线 723 + 41 新增）。
+- 线上实测：`719 条 → 101 条 limit=100`（改 300 后 `785 条 → 302 条 limit=300`）；
+  `/v1/models` 54 个模型、其中 8 个 Qoder 模型带档位；真实对话返回
+  `reasoning_content` 非空。
+
+**遗留**：消耗熔断目前只有整点粒度，两次 cron 之间的突发抓不到 —— 需要网关
+请求路径采样点才谈得上分钟级。属于**已知限制**，不是 bug。
+
+---
+
+### 9.24 防封开关化（面板可配，2026-10-21）
+
+§9.23 的四项防封能力里，三项只能靠环境变量 + 重启，会话链甚至**完全没有开关**，
+限速/抖动则**根本不存在**。本节把它们统一成面板上可即时生效的一组配置。
+
+#### 9.24.1 `SafetyConfig`：独立于 `RoutingConfig` 的第二个配置键
+
+存 DO 键 `systemSafetyConfig`，端点 `GET/POST /admin/config/safety`，
+**双分片镜像**（cn + global，与 `/admin/config/routing` 同款；只写 cn 会让国际版
+账号那一侧读到旧值 —— 永久积分锁踩过同一个坑）。
+
+**为什么单独一个键**：两者受众不同 —— `RoutingConfig` 决定「用哪个号」，
+`SafetyConfig` 决定「请求长什么样」。混在一个键里会让「只想调限速」的写入
+也必须携带路由字段，一次漏字段就把路由策略悄悄重置。
+
+| 字段 | 默认 | `0` 的含义 |
+|---|---|---|
+| `sessionTrace` | `true` | 布尔，只认显式 `false` |
+| `maxContextMessages` | 300 | **不限制** |
+| `burnRateWindowMs` | 3600000 | **关闭检测** |
+| `burnRateThresholdPct` | 20 | **关闭检测** |
+| `rateLimitQps` | 0 | **不限速** |
+| `rateJitterMs` | 0 | **不抖动** |
+
+**默认值来自环境变量**（`resolveMaxContextMessages` / `resolveBurnRate`），
+不是硬编码：老部署靠环境变量配过，升级到有面板的版本后若 DO 里还没有值，
+直接换成代码默认会把人家配好的东西**悄悄改回默认**。
+
+**越界/非数一律忽略**（保持原值），且判据只看「是不是范围内的有限数」——
+`0` 是合法关闭值，绝不能写 `Number(x) || 默认`（本项目 §6.8 的老规矩）。
+
+#### 9.24.2 ⚠️ 顺手修掉一个真缺陷：Node 部署读不到 `MAX_CONTEXT_MESSAGES`
+
+写给 `tests/safety-config.test.ts` 的「环境变量回落」用例直接把它抓了出来：
+`src/server/env.ts` 的 `createNodeRuntime` 把 `process.env` 映射进 `Env` 时
+**漏了这一项**（`BURN_RATE_*` 都在，唯独它不在）。
+
+后果是：Workers 部署（平台直接绑定 env）正常，**Docker/Node 部署设了完全无效**，
+而且**没有任何报错** —— 文档里写着这个变量，用户设了却毫无作用。
+这正是本项目反复出现的「同一件事两处实现、只修一处」。
+
+已在映射里补上，并在注释里写明「这条是被哪个测试抓出来的」。
+
+#### 9.24.3 会话链开关：模块级标志位
+
+`sessionTraceHeaders()` 内部只对 **b3 三件套** 加开关，**会话头族恒发**。
+
+**为什么用模块级变量而不是参数**：组装头的调用点有三处（`models.ts` 列目录、
+`buddy.ts` 发对话、内部委派），后者在 provider 内部、拿不到网关层配置；
+要一路透传就得改 `Provider.chat` 的签名 —— 为一个**全局唯一**的开关改一层接口不划算。
+该配置不存在「不同请求要不同值」的情况，故不会读串；**若将来要按账号区分，必须改参数透传**。
+
+⚠️⚠️ **这个开关差点做成一键封站**（写下来备查）：
+第一版实现是「关闭 ⇒ `return {}`，一个头都不发」，看起来更「干净」。
+但 `intlConversationHeaders` 那 5 个头是 v0.1.2 为修「11‑128 渠道拦截被误判成
+限流」而加的**必需头** —— 缺任一个，上游直接回 11‑128，请求根本发不出去。
+也就是说那个版本等于「一键把国际服关掉」，比不做开关更糟。
+
+正确切分：**必需头（会话族）恒发，可选特征（b3）才受开关控制**。
+测试里有一条断言直接钉住「关闭后只少了 b3 三件套、会话头族仍在」，
+并把 11‑128 的原因写在断言旁边，避免以后有人又把它「优化」成 `return {}`。
+
+#### 9.24.4 限速与随机抖动（新增）
+
+`src/gateway/throttle.ts`：按 **uid** 排队（最小间隔 `1000/qps`）+ 请求前随机抖动。
+在 `provider.chat()` 与续期后的重试**各调一次**（同一账号继续排队）。
+
+**为什么按账号而不是全局**：上游风控看的是**单个账号**的节奏；全局 QPS 会把
+多账号池的总吞吐压到单账号水平，白白浪费池子。
+
+**默认全关**：限速是刹车不是加速，开了吞吐必然下降，只在被 429 咬过之后才值得开。
+
+⚠️ **已知限制（诚实记录）**：状态在进程内存 `Map` 里。Node 单容器准确；
+Cloudflare Workers 多 isolate ⇒ 每 isolate 一份，合并 QPS 会**高于**配置值。
+要精确得放进 DO（每次请求多一次往返），成本高于收益，故不做。
+
+#### 9.24.5 生效链路
+
+面板 POST → DO 落库（双分片）→ `resetSafetyConfigCache()` 立刻失效网关缓存
+→ 下一次请求 `safetyConfigFor()`（10 秒 TTL）读到新值 →
+把 `sessionTrace` / 限速参数推给模块级开关。
+裁剪上限则直接在 `handleChatCompletions` 里用 `safety.maxContextMessages`。
+
+**读配置失败绝不抛给请求**：回落环境变量。配置链路挂了不该让网关 500。

@@ -168,3 +168,607 @@ test('过期的模型冷却被剪枝后不算限流', () => {
   assert.equal(modelExempt(s, now), false)
   assert.equal(Object.keys(s.modelCooldowns).length, 0, '过期条目应被删除')
 })
+
+test('🔴 11140（账号级限制）必须**单次即生效**且默认不换号', async () => {
+  // ## 两条独立的口径，都来自 workbuddy2api-hub #422/#425 的真实事故
+  //
+  // ### 1. 单次即罚
+  // `breaker` 要连续 3 次失败才冷却，语义是「我们自己怀疑这个号不行」。
+  // 而 11140 是上游**明确标记**（"this account has been restricted"），
+  // 用 breaker 意味着前 2 次继续把请求打到一个已被封的号上。
+  // 故 `request_illegal` 走独立的 `restricted` 维度，一次即罚、固定 2 小时。
+  //
+  // ### 2. 默认不换号
+  // 事故原文：11140 上「冷却该号后立刻换下一个号继续同一请求」，
+  // 一个请求最多遍历整个池子，**用户 7 个号在一次任务里全被封**。
+  // 社区红线：「看到 11140 立即停手，解封前严禁换号继续打同一设备」。
+  const { mapErrorToPunishment } = await import('../src/gateway/server.ts')
+  const p = mapErrorToPunishment('request_illegal')
+  assert.equal(p.punish, true, '11140 必须罚号（不罚就等于继续用被封的号）')
+  assert.equal(p.dimension, 'restricted', '11140 必须是独立的账号级限制维度，不能复用 breaker')
+  assert.equal(p.rotate, false, '11140 **默认不换号**（换号会把池子逐个拖进设备级限制）')
+
+  // 反向对照：11128（渠道指纹）也不换号，但**不罚号** —— 罚的是请求指纹，不是账号。
+  const ch = mapErrorToPunishment('channel_blocked')
+  assert.equal(ch.punish, false, '11128 罚的是渠道指纹，不该罚账号')
+  assert.equal(ch.rotate, false, '11128 不换号（同样的指纹打给更多号也没用）')
+
+  // 常规 5xx 仍然换号 —— 别把「不换号」误伤到正常轮转。
+  assert.equal(mapErrorToPunishment('server').rotate, true, '5xx 仍应换号')
+})
+
+test('🔴 受限账号**选不到**（restrictedUntil 参与健康判定，且老数据自动兼容）', async () => {
+  const { createAccountState, healthy, normalizeAccountState, RESTRICTED_HOLD_MS } = await import(
+    '../src/pool/state.ts'
+  )
+  const now = 1_000_000
+
+  // 新号默认不受限
+  const fresh = createAccountState({ uid: 'u1', nickname: 'n', realm: 'cn', provider: 'buddy' })
+  assert.equal(fresh.restrictedUntil, 0, '新账号默认 restrictedUntil=0')
+  assert.equal(healthy(fresh, now), true, '新账号可选')
+
+  // 受限期内**必须**不可选（这是「不派单给已被封的号」的唯一保障）
+  const limited = { ...fresh, restrictedUntil: now + RESTRICTED_HOLD_MS }
+  assert.equal(healthy(limited, now), false, '受限期内必须选不到')
+
+  // 到期后自动恢复（不需要人工清状态）
+  assert.equal(healthy(limited, now + RESTRICTED_HOLD_MS + 1), true, '到期后应自动恢复')
+
+  // 老数据（没有该字段）绝不能被判成受限
+  const legacy = normalizeAccountState({ uid: 'u2', nickname: 'n', realm: 'cn', provider: 'buddy' })
+  assert.ok(legacy !== undefined)
+  assert.equal(legacy!.restrictedUntil, 0, '缺字段的老记录必须补 0，不能读成 undefined/NaN')
+  assert.equal(healthy(legacy!, now), true, '老记录应仍然可选')
+})
+
+test('🔴 11140 波次判定：同号重复不算波次，不同号达标才整池暂停', async () => {
+  // 依据 workbuddy2api-hub #425：同一区域 900s 内 2 个**不同**账号被限制
+  // ⇒ 暂停该区域派发 1800s。判「几个不同的号被打标」，
+  // 一个号反复撞不构成波次（它自己已被 restrictedUntil 挡住）。
+  //
+  // 这里直接对纯逻辑做断言（DO 的 storage 依赖不便在单测里造假）：
+  // 只钉住「阈值与窗口的语义」，实现细节留给集成。
+  const { RESTRICTED_HOLD_MS } = await import('../src/pool/state.ts')
+
+  // 单账号口径是 2 小时（与整池暂停的 30 分钟刻意不同，见常量注释）
+  assert.equal(RESTRICTED_HOLD_MS, 2 * 60 * 60 * 1000, '单账号限制冷却应为 2 小时')
+
+  // 该常量必须**大于** IP 级 WAF 的 60s 窗口：账号级风控是小时级现象，
+  // 用分钟级去试探只会重复撞墙（社区红线「立即停手」）。
+  assert.ok(RESTRICTED_HOLD_MS > 60_000, '账号级冷却必须长于 IP 级窗口')
+
+  // 源码层面确认波次常量存在且取值合理（防止有人调成 60 秒把风控当抖动）
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  const m = /const RESTRICTION_POOL_HOLD_MS = ([^\n]+)/.exec(src)
+  assert.ok(m !== null, '必须有 RESTRICTION_POOL_HOLD_MS 常量')
+  assert.match(m![1]!, /30 \* 60 \* 1000/, '整池暂停应为 30 分钟')
+  assert.match(src, /RESTRICTION_WAVE_THRESHOLD = 2/, '波次阈值为 2 个不同账号')
+})
+
+test('🔴 回归：normalizeAccountState 必须**显式**携带每个字段（漏一个就静默丢惩罚）', async () => {
+  // ## 这是线上真实踩到的 bug，不是假想
+  //
+  // `normalizeAccountState` 是**逐字段重建**对象的（`{ ...num(...) }`），
+  // 没列出的字段**不会**从 `base` 继承 —— 老记录读出来是 `undefined`。
+  //
+  // 加 `restrictedUntil` 时忘了在这一行里补上，后果链：
+  //   读老记录 → restrictedUntil === undefined
+  //   → `Math.max(undefined, x)` === NaN
+  //   → 写进 SQLite 再读回 === 0
+  //   → 表现「11140 罚了却看不出罚」，且账号继续被派单。
+  //
+  // 所以这里用「新账号状态 → 序列化 → normalize」往返，
+  // **逐字段**比对：任何一个字段丢失都会被这条断言抓住。
+  const { createAccountState, normalizeAccountState } = await import('../src/pool/state.ts')
+
+  const fresh = createAccountState({ uid: 'u-roundtrip', nickname: 'n', realm: 'cn', provider: 'buddy' })
+  // 给所有数值字段灌上有辨识度的非零值，避免「0 默认值掩盖丢失」
+  const filled = {
+    ...fresh,
+    until: 111,
+    breakerUntil: 222,
+    degradeUntil: 333,
+    restrictedUntil: 444,
+    fails: 5,
+    retryCount: 2,
+    consecutiveFails: 3,
+    errTotal: 7,
+  }
+  const back = normalizeAccountState(JSON.parse(JSON.stringify(filled)))
+  assert.ok(back !== undefined, '往返后应能解析')
+
+  for (const [k, want] of Object.entries({
+    until: 111,
+    breakerUntil: 222,
+    degradeUntil: 333,
+    restrictedUntil: 444,
+    fails: 5,
+    retryCount: 2,
+    consecutiveFails: 3,
+    errTotal: 7,
+  })) {
+    assert.equal(
+      (back as unknown as Record<string, number>)[k],
+      want,
+      `normalizeAccountState 丢了字段 ${k}（逐字段重建最容易漏新增字段）`,
+    )
+  }
+
+  // 老记录（压根没有该字段）必须补成 0，绝不能是 undefined/NaN
+  const legacy = normalizeAccountState({ uid: 'u-legacy', nickname: 'n', realm: 'cn', provider: 'buddy' })
+  assert.equal(legacy!.restrictedUntil, 0, '缺字段必须补 0')
+  assert.ok(Number.isFinite(legacy!.restrictedUntil), '缺失字段绝不能被读成 NaN')
+})
+
+test('🔴 回归：/admin/accounts 必须暴露 restrictedUntil（否则"被封"在面板上隐形）', async () => {
+  // ## 线上真实踩到
+  //
+  // 数据库里 rst 明明已写入（sqlite 直接查：1792564552799 = +2h），
+  // 但 `/admin/accounts` 的序列化是**逐字段列举**的，漏了 restrictedUntil。
+  // 后果：面板上「被上游限制的号」与健康号长得一模一样，
+  // 我据此误判过一次「三个号都没被封」，实际三个全受限。
+  //
+  // 记账失效是**静默的**，这个字段是唯一的显示出口 —— 所以用源码级断言钉住它。
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/index.ts', 'utf8')
+  assert.match(
+    src,
+    /restrictedUntil:\s*a\.restrictedUntil/,
+    '/admin/accounts 必须返回 restrictedUntil，否则前端看不到账号被上游限制',
+  )
+  // 同时确认它没被写成别的账号字段（复制粘贴最容易错）
+  assert.doesNotMatch(
+    src,
+    /restrictedUntil:\s*a\.breakerUntil/,
+    'restrictedUntil 不能错接成 breakerUntil（两者语义不同）',
+  )
+})
+
+test('🔴 延迟记账：全池同样失败**不得**记熔断（否则上游抖动会放大成半小时不可用）', async () => {
+  // ## 依据 qoder2api-hub #65 的 C 点（"连锁熔断"）
+  //
+  // 缺陷形态：每个请求遍历 N 个号，每号失败各记 1 次 `fails`；
+  // 3 个请求后所有号 breaker 30 分钟。而熔断期内**没有成功请求来复位计数**，
+  // 所以上游恢复后号池仍然不可用 —— 故障被我们自己延长了。
+  //
+  // 修复：breaker/degrade 延迟记账，只在「换号后成功了」时结算；
+  // 全失败则丢弃。判据是"换号成功"而不是"这个号失败了"。
+  //
+  // 这里做源码级守卫（行为层需要真 DO，单测不便造）：
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+
+  // ① 必须存在 blame 收件箱，且只收累加型维度
+  // ⚠️ 2026-10-21 扩展：blame 原先只收 breaker/degrade。后来发现**单账号池的 soft
+  // 也必须延迟**（否则唯一路径被掐断 60 秒，用户报「审查时被误判打断」）。
+  // ⚠️ 不钉死类型字面量：S4 抽出了具名的 `BlameEntry`（补 `resetAt`）。
+  // 要守的是「存在 blame 收件箱且初始为空数组」，不是「类型必须写成内联形状」。
+  assert.match(src, /const blame: (?:Array<\{[^}]*FailureKindForBlame|BlameEntry\[\]) = \[\]/,
+    'breaker/degrade（及单账号池下的 soft）必须走延迟记账')
+
+  // ② 这两个维度不得直接 applyFailure
+  assert.match(
+    src,
+    /if \(punishKind === 'breaker' \|\| punishKind === 'degrade' \|\| \(punishKind === 'soft' && deferSoft\(\)\)\) \{\s*blame\.push/,
+    'breaker/degrade（及单账号池的 soft）应先入 blame，而不是立即记账',
+  )
+
+  // ③ 成功时必须结算
+  assert.match(src, /settleBlame\(pool, blame, Date\.now\(\)\)/,
+    '首帧成功时必须结算 blame')
+
+  // ④ 全失败时必须丢弃并留日志（实现已抽成 discardBlame()，文案随之变化）
+  assert.match(src, /discardBlame\(blame, '全池同样失败'\)/,
+    '全池失败时必须丢弃 blame 并打日志，不能静默记熔断')
+
+  // ⑤ 有明确上游证据的维度**仍然立即记**（不能被误改成延迟）
+  assert.match(src, /\.applyFailure\(\{\s*uid: candidate\.uid,\s*kind: punishKind,/,
+    'restricted/model/soft 等仍应立即记账（它们有上游证据，不靠换号反推）')
+})
+
+test('🔴 cosy 版本可被环境变量覆盖（签名载荷里的版本，不能硬编码锁死）', async () => {
+  // 背景：`QODER_COSY_VERSION` 不只是 `Cosy-Version` 头 —— 它被写进
+  // `prepareQoderInfer` 的签名载荷，改错会让上游回 403 Signature invalid。
+  // 上游升级 CLI（qoder2api-hub PR #75 指出 1.1.75）时若只能改代码重新发版，
+  // 运维会很被动；但盲改默认值又会破坏签名。折中：打开覆盖入口，默认值不动。
+  const mod = await import('../src/providers/qoder-wasm.ts')
+  assert.equal(typeof mod.cosyVersion, 'function', '必须有 cosyVersion() 覆盖入口')
+
+  const prev = process.env.QODER_COSY_VERSION
+  try {
+    // 默认：没有环境变量时用内置常量
+    delete process.env.QODER_COSY_VERSION
+    assert.equal(mod.cosyVersion(), mod.QODER_COSY_VERSION)
+
+    // 空串/空白视为未设置，不能把空版本号发上去（会签出非法载荷）
+    process.env.QODER_COSY_VERSION = '   '
+    assert.equal(mod.cosyVersion(), mod.QODER_COSY_VERSION, '空白值必须回落到默认')
+
+    // 显式覆盖生效且去空白
+    process.env.QODER_COSY_VERSION = ' 1.1.75 '
+    assert.equal(mod.cosyVersion(), '1.1.75')
+  } finally {
+    if (prev === undefined) delete process.env.QODER_COSY_VERSION
+    else process.env.QODER_COSY_VERSION = prev
+  }
+})
+
+test('🔴 误判可人工解冻：clear 端点必须支持按 uid 解除单个账号限制', async () => {
+  // ## 线上真实踩到
+  //
+  // 模型下线 / WAF 403 被误判成「账号级限制」后，三个号各被锁 2 小时。
+  // 而 `/admin/restriction/clear` 只清「波次暂停」，**不动账号自身状态** ——
+  // 于是确认误判后也解不开，只能干等自然过期。面板上没有第二个出口。
+  //
+  // 双层语义必须分开（不能混成一个动作）：
+  //   - 不带 uid：清波次暂停（整池层面的止血）
+  //   - 带 uid  ：清该账号的 restrictedUntil + fails（确认误判后的解冻）
+  const { readFileSync } = await import('node:fs')
+
+  const idx = readFileSync('src/index.ts', 'utf8')
+  assert.match(idx, /body\.uid/, 'clear 端点必须接受 uid')
+  assert.match(idx, /clearAccountRestriction/, 'clear 端点必须能清单个账号的限制')
+
+  const pool = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  assert.match(pool, /async clearAccountRestriction\(uid: string\)/,
+    'AccountPoolDO 必须有 clearAccountRestriction')
+  // 必须真的把 restrictedUntil 归零并落盘，不能只返回成功
+  assert.match(pool, /state\.restrictedUntil = 0[\s\S]{0,240}writeAccount\(/,
+    'clearAccountRestriction 必须置 0 并写回存储')
+  // fails 也要清：只清 restricted 而留着 fails，下次 5xx 立刻又熔断
+  assert.match(pool, /state\.fails = 0/, '解除限制时应同时清失败计数')
+})
+
+test('🔴 限速配置的**优先级**（面板值静默覆盖环境变量，实测踩过）', async () => {
+  // ## 排查实录（值得记住的失败链）
+  // 现象：容器里注入 `RATE_LIMIT_QPS=0.5`，但连打 4 次耗时都是 ~1s，没有任何延迟。
+  // 我先后误判为：①构建产物没含新代码 ②DO 实例缓存未失效 ③`this.env` 在 DO
+  // 里不可见。**全都不是。**
+  // 真实原因：数据库 `system_kv` 里**早就存了** `systemSafetyConfig`
+  // （`rateLimitQps: 0`），而 `num(raw?.rateLimitQps, ...)` 返回 0 且 0 是合法值
+  // ⇒ 永远走不到环境变量回落。
+  //
+  // 结论：**面板存值 > 环境变量 > 代码默认**。排查"限速不生效"必须先看
+  // `GET /admin/config/safety`，而不是查代码或环境变量。
+  const { readFileSync } = await import('node:fs')
+  const doSrc = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+
+  // 面板值优先：必须是 `num(raw?...) ?? 回落` 的顺序，不能反过来
+  assert.match(
+    doSrc,
+    /rateLimitQps: num\(raw\?\.rateLimitQps, 0, 50\) \?\? resolveRateLimitQps\(this\.env\)/,
+    '面板值必须优先于环境变量（顺序反了会让面板失去作用）',
+  )
+  assert.match(
+    doSrc,
+    /rateJitterMs: num\(raw\?\.rateJitterMs, 0, 10_000\) \?\? resolveRateJitterMs\(this\.env\)/,
+    '抖动同理',
+  )
+
+  const safetySrc = readFileSync('src/gateway/safety.ts', 'utf8')
+  assert.match(safetySrc, /export function resolveRateLimitQps/, '解析函数必须可被 DO 复用')
+  assert.match(safetySrc, /export function resolveRateJitterMs/, '同上')
+  // 默认必须是 0（关闭）：限速改变吞吐，不能升级后自动生效
+  assert.match(safetySrc, /return Number\.isFinite\(n\) && n > 0 \? n : 0/, '非法值回落关闭')
+})
+
+test('🔴 版本号三处必须一致（注释声称有测试钉住，实际并不存在）', async () => {
+  // ## 为什么这条测试是补出来的
+  // `src/version.ts` 的注释写着：
+  //   「必须与 package.json 的 version 一致 —— tests/panel.test.ts 有断言钉住」
+  // 但**该断言并不存在**（`tests/panel.test.ts` 里没有任何 APP_VERSION 检查）。
+  // 于是版本号实际上**三处各写各的**，谁也没钉住谁：
+  //   1. package.json          version
+  //   2. src/version.ts        APP_VERSION
+  //   3. src/panel/web/.../*.js.txt  面板两份硬编码字符串（顶栏 + 侧栏）
+  //
+  // 真实后果：用户看到的界面版本号一直是 0.8.0，而代码已经改了很多轮 ——
+  // 因为面板是**预构建静态资源**，版本字符串被写死在产物里，升级时不跟着走。
+  // 用户直接问我「我看着还是 0.8.0 啊」，就是这个造成的。
+  const { readFileSync, readdirSync } = await import('node:fs')
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8')) as { version: string }
+  const appVer = /APP_VERSION = '([^']+)'/.exec(readFileSync('src/version.ts', 'utf8'))?.[1]
+
+  assert.ok(pkg.version.length > 0, 'package.json 必须有 version')
+  assert.equal(appVer, pkg.version, 'src/version.ts 的 APP_VERSION 必须等于 package.json 的 version')
+
+  // 面板预构建资源里的版本号也必须同步，否则界面上显示旧版本
+  const dir = 'src/panel/web/assets'
+  const bundles = readdirSync(dir).filter((f) => f.endsWith('.js.txt'))
+  assert.ok(bundles.length > 0, '必须能找到面板产物')
+  let found = false
+  for (const b of bundles) {
+    const src = readFileSync(`${dir}/${b}`, 'utf8')
+    // 面板是 React 预构建产物，版本号是两个相邻字符串字面量（不是 v0.9.0 一个串）。
+    //
+    // ⚠️ 有**两种**渲染形态，第一版只认了一种 ⇒ 顶栏那处漏改：
+    //   · 侧栏：`v`,`0.9.1`
+    //   · 顶栏：`控制台 · v`,`0.9.1`   ← 前缀是「控制台 · v」而非「v」
+    // 两种都要抓，否则升级时顶栏留着旧版本号，用户一眼就看到了。
+    for (const m of src.matchAll(/`(?:控制台 · )?v`,`(\d+\.\d+\.\d+)`/g)) {
+      found = true
+      assert.equal(
+        m[1],
+        pkg.version,
+        `面板产物 ${b} 里的版本号 ${m[1]} 与 package.json 的 ${pkg.version} 不一致 —— 界面会显示旧版本`,
+      )
+    }
+  }
+  assert.ok(found, '面板产物里必须能找到渲染版本号（否则说明资源结构变了，这条测试已失效）')
+})
+
+test('🔴 单账号池的 soft 冷却必须延迟（否则唯一路径被掐断 60 秒）', async () => {
+  // ## 用户报障
+  // 「审查的时候会被误判打断」—— 审查是高频并发调用，一次瞬时抖动就让
+  // qodercn（**只有 1 个账号**）进 60 秒软冷却，期间全部请求回 503。
+  // 而账号实测完全健康（successCount 1556、errTotal 仅 9）。
+  //
+  // ## 根因
+  // 延迟记账（blame）只覆盖 breaker/degrade，`soft` 仍然立即记。
+  // 对多账号池那是正确的（罚 A 还能用 B）；但池里只有 1 个号时，
+  // 「立即冷却」= 立即掐断唯一可用路径，冷却换不来任何好处。
+  //
+  // ## 关键陷阱（我第一版写错过）
+  // 判据**不能**用 `tried.length <= 1`：`tried.push` 发生在错误处理**之前**，
+  // 所以「多账号池的第一个号失败」时 tried.length 也是 1 ⇒ 会误判成单账号池
+  // ⇒ 漏记真正的限流。必须用循环外探到的**真实 poolSize**。
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+
+  assert.match(src, /let poolSize = 0/, '必须探测真实池大小')
+  assert.match(src, /poolSize === 1/, '单账号池判据必须是 poolSize === 1')
+  // 反向：不能再用 tried.length 当判据（那是错的）
+  assert.ok(
+    !/deferSoft = \(\): boolean => tried\.length/.test(src),
+    '不得用 tried.length 作判据 —— 它在错误处理前已 push，会误判多账号池',
+  )
+  // soft 必须真的进 blame 分支
+  assert.match(
+    src,
+    /punishKind === 'soft' && deferSoft\(\)/,
+    "soft 在单账号池下必须走延迟记账",
+  )
+  // 探测失败必须回落「不延迟」（保持原纪律），不能放宽
+  assert.match(src, /catch \{\s*poolSize = 0\s*\}/, '探测失败必须回落 0（不启用延迟）')
+  assert.match(src, /type FailureKindForBlame = 'breaker' \| 'degrade' \| 'soft'/, 'blame 类型必须容纳 soft')
+})
+
+test('🔴 网关不得引入并发上限（实测 20 并发含流式全部成功）', async () => {
+  // ## 实测依据（2026-10-21）
+  // 用户实测官方客户端单会话最多 20 并发子代理，判断「只是客户端限制」。
+  // 我们对本网关做了两轮压测（qodercn/dfmodel）：
+  //   · 20 并发非流式   → 20/20 成功，总耗时 1.73s
+  //   · 20 并发 + 流式  → 20/20 成功，总耗时 13.2s
+  // 两轮之后账号零损伤（errTotal 恒 9、until=0、fails=0）。
+  //
+  // ⇒ 瓶颈不在并发能力，在**失败记账策略**。给网关加并发信号量只会自我限制。
+  // 这条测试防止以后有人凭「防封」直觉加一个 MAX_CONCURRENT 之类的开关。
+  const { readFileSync, readdirSync } = await import('node:fs')
+
+  const files: string[] = []
+  const walk = (dir: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const full = `${dir}/${e.name}`
+      if (e.isDirectory()) walk(full)
+      else if (e.name.endsWith('.ts')) files.push(full)
+    }
+  }
+  walk('src')
+
+  // 只查「会挡住**本网关自己请求**」的并发闸门。
+  //
+  // ⚠️ 必须区分两类同名概念：
+  //   · 本地闸门（禁止）：我们主动限自己的并发，如 `MAX_CONCURRENT_REQUESTS`、信号量；
+  //   · **识别上游**的限制（允许）：如 `isZcodeConcurrencyLimited()` —— 那是
+  //     解析上游返回的"并发超限"错误码，作用是**正确应对上游**，不是自我限制。
+  //     第一版正则写得太宽，把后者误报成闸门。
+  const banned = [/MAX_CONCURRENT_REQUESTS/i, /MAX_INFLIGHT/i, /acquireSlot\s*\(/, /semaphore\.acquire/i]
+  for (const f of files) {
+    const src = readFileSync(f, 'utf8')
+    for (const re of banned) {
+      assert.doesNotMatch(
+        src,
+        re,
+        `${f} 出现了并发闸门 ${re} —— 实测网关支持 20 并发（含流式）无失败，` +
+          '不需要为"防封"加并发上限。若确有新证据，请先更新本测试与 throttle.ts 的实测记录。',
+      )
+    }
+  }
+})
+
+test('🔴 两条 chat 路径都必须有延迟记账（本项目「只修一半」踩过 3 次）', async () => {
+  // ## 真实故障链
+  // 0.9.1 只给 **buddy 主循环**加了 blame + deferSoft，漏了 **provider 路径**
+  //（`server.ts:913` 的 `if (providerId !== DEFAULT_PROVIDER)` 分流）。
+  // 而 `qodercn` / `qoder` / `trae` 等**所有带前缀的模型都走 provider 路径**。
+  // 后果：修完 0.9.1 后用户「审查时被打断」的症状**依然复现** —— 因为改的那条
+  // 路径根本不是他实际用的那条。
+  //
+  // ## 本项目「同一个 bug 只修一半」的历史（这是第 3 次）
+  // 1. `developer→system` 归一化只加主路径，provider 路径完全绕过；
+  // 2. SSE `data:` 前缀解析在 server.ts 手写第二份，重犯已修过的 bug；
+  // 3. 本次：延迟记账只加 buddy 路径。
+  //
+  // ⇒ 这条测试的做法是**遍历所有 applyFailure 调用点**，要求每一处要么
+  //    在 blame 分支里，要么被注释明确标记为「立即记账是正确的」。
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('src/gateway/server.ts', 'utf8')
+
+  // ① 必须有两条独立的 blame 数组（buddy 路径 + provider 路径各一条）
+  // ⚠️ 匹配「有两条 blame 收件箱」即可，**不要**钉死类型字面量：
+  // S4 把元素类型抽成了具名的 `BlameEntry`（补 `resetAt`），
+  // 若这里仍匹配 `Array<{ uid: string; kind: FailureKindForBlame`，
+  // 一次纯粹的类型重构就会把这条测试打红 —— 它要守的是「两条路径各一个收件箱」。
+  const blameDecls = [...src.matchAll(/const blame: (?:Array<\{[^}]*FailureKindForBlame|BlameEntry\[\])/g)]
+  assert.ok(
+    blameDecls.length >= 2,
+    `应有两个 blame 收件箱（buddy 路径 + provider 路径），实际 ${blameDecls.length} 个`,
+  )
+
+  // ② 必须有两条 deferSoft（同样两条路径各一条）
+  const deferDecls = [...src.matchAll(/const deferSoft = \(\): boolean => poolSize === 1/g)]
+  assert.ok(deferDecls.length >= 2, `应有两个 deferSoft，实际 ${deferDecls.length} 个`)
+
+  // ③ 每条路径都要在成功时结算、在全失败时丢弃
+  //
+  // 🔴 原来这里是 `settleCalls.length >= 2` 的**全局计数**断言 ——
+  // 2026-10-21 审查（M1）证明它**掩盖了真实缺陷**：
+  // 分支B 的主成功路径与其中一条重试路径**都没有** `settleBlame`，
+  // 但计数仍被「分支A + 分支B 续期重试」两处满足 ⇒ 断言通过、缺陷潜伏。
+  // 后果：provider 路径塞进 `blame` 的 breaker/degrade 失败**永不落账**，
+  // 持续 5xx 的账号永远不进熔断，面板 `fails` 恒 0。
+  //
+  // ⇒ 改为**结构断言**：每一处 `noteSuccess`（= 一次成功）之后都必须紧跟
+  //   一次 `settleBlame`。这样「新增一条成功路径但忘了结算」会立刻被抓到，
+  //   而不是被别处的调用凑够数量掩盖。
+  const noteIdx = [...src.matchAll(/noteSuccess\(/g)].map((m) => m.index ?? -1)
+  const settleIdx = [...src.matchAll(/settleBlame\(pool, blame, Date\.now\(\)\)/g)].map((m) => m.index ?? -1)
+  // ⚠️ 窗口取 1200 字符（不是 400）：本仓库习惯在 `noteSuccess` 与 `settleBlame`
+  // 之间写大段说明注释，实测最长间距 754 字符。窗口太小会**误报**成缺失。
+  // 窗口的意义只是「同一处成功回调内」，不需要精确到字节。
+  const SETTLE_WINDOW = 1200
+  const orphans = noteIdx.filter((i) => !settleIdx.some((j) => j > i && j - i < SETTLE_WINDOW))
+  assert.equal(
+    orphans.length,
+    0,
+    `有 ${orphans.length} 处 noteSuccess 之后缺少 settleBlame（偏移：${orphans.join(', ')}）`
+      + ' —— 成功路径必须结算 blame，否则 breaker/degrade 永不落账',
+  )
+
+  // ④ 每一处成功（`noteSuccess`）之后也必须有**会话粘性绑定**（2026-10-21 审查补，M3 指出）。
+  //
+  // 缺陷：`bindSession` 原来只在**续期重试分支**调用（罕见路径），
+  // 主成功路径一次都不绑 ⇒ 同一会话的后续轮次落到不同账号
+  // ⇒ prompt cache 命中率 0（缓存按账号隔离）+ 指纹在同一对话内跳变。
+  //
+  // 与 ③ 同一类断言（结构而非计数）：新增一条成功路径却忘了绑定会被立刻抓到。
+  // ⚠️ 必须用 `pool\.bindSession`，否则会把 `unbindSession` 也算进来（假通过）。
+  const bindIdx = [...src.matchAll(/pool\.bindSession\(sessionKey/g)].map((m) => m.index ?? -1)
+  const bindOrphans = noteIdx.filter((i) => !bindIdx.some((j) => j > i && j - i < 1500))
+  assert.equal(
+    bindOrphans.length,
+    0,
+    `有 ${bindOrphans.length} 处 noteSuccess 之后缺少 bindSession（偏移：${bindOrphans.join(', ')}）`
+      + ' —— 成功路径必须绑定会话，否则 prompt cache 永远不命中',
+  )
+  // ⚠️ 丢弃日志已抽成 `discardBlame()`（S11），不再有两份手写的模板字符串。
+  // 这里数**调用点**：两条路径各一个循环尾，外加 4 个早退出口 ⇒ 至少 2 处。
+  const discardLogs = [...src.matchAll(/discardBlame\(blame,/g)]
+  assert.ok(discardLogs.length >= 2, `两条路径都应有全失败丢弃日志，实际 ${discardLogs.length} 处`)
+
+  // ④ 死代码守卫：applyFailure 的每一处调用，要么在 else 分支（立即记账），
+  //    要么在 blame 分支里。允许「立即记账」，但不允许**既不在 blame 分支、
+  //    也没有任何注释解释为什么这条路径要立即记**的裸调用。
+  const applyCalls = [...src.matchAll(/\n(\s*)\.applyFailure\(\{/g)]
+  assert.ok(applyCalls.length >= 2, `applyFailure 至少有 2 处调用，实际 ${applyCalls.length}`)
+})
+
+test('🔴 qoder 外层信封（body 套业务码）不得被判成 WAF', async () => {
+  // ## 真实故障（2026-10-21，从数据库 reason 字段挖出）
+  // 持久化的 reason 是 `waf_blocked: WAF blocked (403 without business envelope)`。
+  // 而 `waf_blocked` 的处置是 `punish: true, dimension: 'soft'` ⇒ **账号级冷却 60 秒**，
+  // 单账号池下等于整条链路中断 —— 用户报「审查时被打断」的真正原因。
+  //
+  // 上游真实形态（qoder 加密端点，鉴权失败也回 HTTP 200）：
+  //   data:{"headers":{},"body":"{\"code\":\"105\",\"message\":\"Login expired\"}",
+  //        "statusCodeValue":403}
+  // 顶层**没有 `code`** ⇒ 旧 parseEnvelope 判「不是信封」⇒ isWafBlocked 命中。
+  // 而它其实是 `105 Login expired`（**登录过期**），正确处置是**触发续期**，不该罚号。
+  const { classify, isWafBlocked, parseEnvelope } = await import('../src/upstream/client.ts')
+
+  // ① qoder 外层信封（带 data: 前缀）
+  const withPrefix =
+    'data:{"headers":{},"body":"{\\"code\\":\\"105\\",\\"message\\":\\"Login expired\\"}","statusCodeValue":403}'
+  assert.ok(parseEnvelope(withPrefix) !== undefined, '必须认得 qoder 外层信封')
+  assert.equal(isWafBlocked(403, withPrefix), false, 'qoder 外层信封不是 WAF')
+  assert.equal(classify(403, withPrefix).kind, 'auth_error', '105 Login expired 必须归为 auth_error（要续期）')
+
+  // ② 无 data: 前缀的同一形态
+  const bare =
+    '{"headers":{},"body":"{\\"code\\":\\"105\\",\\"message\\":\\"Login expired\\"}","statusCodeValue":403}'
+  assert.equal(classify(403, bare).kind, 'auth_error', '无前缀形态同样要认出来')
+
+  // ③ **反向守卫：真 WAF 判据不得被放宽**
+  for (const realWaf of ['Forbidden', '<html><body>403 Forbidden</body></html>', '']) {
+    assert.equal(
+      isWafBlocked(403, realWaf),
+      true,
+      `真 WAF 形态必须仍然判为 WAF：${JSON.stringify(realWaf.slice(0, 40))}`,
+    )
+  }
+  // ④ 常规信封不受影响
+  assert.equal(classify(403, '{"code":6004,"msg":"rate"}').kind, 'rate_limited', '普通信封行为不变')
+})
+
+test('🔴 面板资源不得 immutable 缓存（会让用户永远看到旧版本）', async () => {
+  // ## 真实故障（2026-10-21）
+  // 用户报「真的部署了吗，我看这里版本号还是 0.9.2」。
+  // 实测：服务端 `/panel/assets/index-*.js` 已返回 `0.9.5`，
+  // 但响应头是 `cache-control: public, max-age=31536000, immutable`
+  // ⇒ 浏览器**一年内永不重新请求** ⇒ 界面永远显示旧版本。
+  //
+  // 根因：原注释写「文件名带内容哈希，升级后文件名会变」——
+  // **但那是假的**：面板产物是预构建后提交进仓库的，文件名是硬编码的
+  // （`index-Dg0M0nJm.js`），内容变了名字不变。
+  const { readFileSync } = await import('node:fs')
+  const panel = readFileSync('src/panel/index.ts', 'utf8')
+  const idx = readFileSync('src/index.ts', 'utf8')
+
+  // ① 不得再用 immutable —— 只查**真实的 cache-control 字符串字面量**，
+  //    不查注释（本项目注释习惯逐字引用旧值，直接 grep 会误伤）。
+  assert.ok(
+    !/'public, max-age=31536000, immutable'/.test(panel),
+    '面板资源不得使用 immutable 缓存 —— 文件名不随内容变，会永久缓存旧产物',
+  )
+  // ② 必须用 no-cache（允许缓存但强制回源校验）
+  assert.match(panel, /cacheControl: asset\.immutable \? 'no-cache'/, '必须改为 no-cache')
+  // ③ 必须有 ETag，否则 no-cache 等于每次全量重下
+  assert.match(panel, /etag: etagOf\(asset\.body\)/, '必须为面板资源计算 ETag')
+  // ④ 必须支持条件请求回 304
+  assert.match(idx, /if-none-match/, '必须处理 If-None-Match')
+  assert.match(idx, /status: 304/, '内容未变时必须回 304')
+})
+
+test('🔴 normalizeAccountState 必须携带**每一个**字段（生成式，防「加字段忘了同步」）', async () => {
+  // ## 为什么这条必须是生成式的（2026-10-22，S13）
+  //
+  // `normalizeAccountState` 是**逐字段重建**对象 —— 不在它里面列出的字段，
+  // 归一后要么消失、要么拿到默认值。而账号状态是跨版本持久化的，
+  // 所以「给 `AccountState` 加字段却忘了加进 normalize」是一个**必然会发生**的错误，
+  // 而且症状很远：某个读路径上字段变 undefined，在别处才炸。
+  //
+  // 写死一份字段清单是没用的（新字段不会被列进去）。这里用
+  // `createAccountState()` 的产物当**基准**，与「最小输入归一后的产物」比字段集合 ——
+  // 将来谁加了字段忘了同步，这条立刻红。
+  const { createAccountState, normalizeAccountState } = await import('../src/pool/state.js')
+
+  const full = createAccountState({ uid: 'u1', nickname: 'n1', realm: 'cn', provider: 'buddy' })
+  const normalized = normalizeAccountState({ uid: 'u1' })
+  assert.ok(normalized !== undefined, '最小输入也应能归一（缺字段补默认值）')
+
+  const expectKeys = Object.keys(full).sort()
+  const actualKeys = Object.keys(normalized!).sort()
+  const missing = expectKeys.filter((k) => !actualKeys.includes(k))
+  const extra = actualKeys.filter((k) => !expectKeys.includes(k))
+  assert.deepEqual(missing, [], `⚠️ 这些字段没被 normalizeAccountState 携带（归一后会丢）：${missing.join(', ')}`)
+  assert.deepEqual(extra, [], `⚠️ normalizeAccountState 产出了 AccountState 里没有的字段：${extra.join(', ')}`)
+
+  // 归一后**不得有 undefined**：`undefined` 在布尔语境里 falsy、在算术里 NaN，
+  // 会在很远的地方引发难查的故障（这正是 normalize 存在的理由）。
+  const undef = Object.entries(normalized!).filter(([, v]) => v === undefined).map(([k]) => k)
+  assert.deepEqual(undef, [], `⚠️ 归一后仍是 undefined 的字段：${undef.join(', ')}`)
+
+  // 默认值口径必须与 createAccountState 一致（曾出现 workbuddy vs buddy 两套默认）
+  assert.equal(
+    (normalized as { provider?: string }).provider,
+    'buddy',
+    '⚠️ 缺失 provider 的默认值必须是 buddy（与 DEFAULT_PROVIDER 一致）',
+  )
+  assert.equal(
+    (full as { provider?: string }).provider,
+    'buddy',
+    '⚠️ createAccountState 的默认 provider 也必须与 normalize 一致',
+  )
+})

@@ -24,17 +24,27 @@
  *    - `11115`/`11135` 是**请求的问题**，不罚号、也不换号。
  */
 
+import type { UsageRecord } from '../store/usage.js'
 import { resolveUpstream, type Env } from '../env.js'
-import { classify, type ErrorKind } from '../upstream/client.js'
+import { settleSubkeyUsage } from './authz.js'
+// ⚠️ 判据本体已迁到 `upstream/client.ts`（与 `shouldRotate`/`shouldPunish` 同源，
+// 避免两份实现再次漂移）。这里再导出，保持既有引用路径可用。
+export { mapErrorToPunishment }
+import { classify, mapErrorToPunishment, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
-import { prepareChatBody, sanitizeChatBody } from './payload.js'
-import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
+import { cleanupToolPairing, prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
+import { BodyTooLargeError, readJsonCapped } from './body.js'
+import { resolveSafetyFor, safetyConfigFor } from './safety.js'
+import { throttleUpstream } from './throttle.js'
+import { ERROR_CHECK_FRAMES, ERROR_HINT_PATTERN, aggregateSse, createFrameTranslator, detectErrorFrame, doneFrame, errorFrame, isEmptyAssistantTurn, mayHaveUsage, parseSseLine, sseHeaders, translateFrame } from './stream.js'
 import { jsonError, parseRetryAfterMs } from './http.js'
+import {
+  ZERO_OUTPUT_COOLDOWN_MS,
+  describeZeroOutputHit,
+  screenZeroOutputStream,
+} from './zero-output.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
-// ⚠️ 裸名别名（官方拼写 → 聚合规范名）—— 与 canonical-models 共用同一张表，
-// 免得「目录里的规范名」与「路由认识的别名」两处各写一份、慢慢分叉。
-import { aggregateAliasForBareModel } from '../providers/canonical-models.js'
 import { bindBuddy } from '../providers/buddy.js'
 import {
   AGGREGATE_AUTO,
@@ -46,10 +56,22 @@ import {
   type ProviderCatalog,
 } from './aggregate.js'
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
-import { settleUsage, type SubkeyContext } from './authz.js'
 import type { LoginCredential } from '../upstream/auth.js'
-import type { AccountPoolDO } from '../pool/AccountPoolDO.js'
+import type { AccountPoolDO, PickResult } from '../pool/AccountPoolDO.js'
 import { healthyForModel } from '../pool/state.js'
+import type { SafetyOverride } from '../pool/state.js'
+
+/**
+ * 账号池后台写入（处罚 / 记账 / 粘性绑定）的错误处理：不打断主流程，但**必须留日志**。
+ *
+ * ⚠️ 此前这些调用都是 `.catch(() => {})`：写入失败时冷却、熔断、用量**静默丢失**，
+ * 表现为「账号明明坏了还在被选」「对话成功但用量为 0」，且没有任何日志可查。
+ */
+function logPoolError(op: string): (error: unknown) => void {
+  return (error: unknown) => {
+    console.error(`[pool] ${op} 写入失败：`, error instanceof Error ? `${error.name}: ${error.message}` : String(error))
+  }
+}
 
 /**
  * 将 API 请求摘要记录到日志环形缓冲（供管理面板「日志」Tab 实时展示）。
@@ -89,98 +111,160 @@ export function recordLog(
   else void task
 }
 
-/** 单次请求最多换号次数（Go 侧 `MaxRotate` 默认 3）—— 配置读取失败时的兜底。 */
+/** 单次请求最多换号次数（Go 侧 `MaxRotate` 默认 3）。 */
 export const MAX_ROTATE = 3
 
+/** 路由配置「单次请求最大换号重试」的进程内缓存（30 秒），省得每个请求多一次 DO 往返。 */
+let maxRotateCache: { value: number; at: number } | undefined
+const MAX_ROTATE_TTL_MS = 30_000
+
+/** 保存路由配置后调用：本进程立即生效（Workers 其余 isolate 最多 30 秒后生效）。 */
+export function resetMaxRotateCache(): void {
+  maxRotateCache = undefined
+}
+
 /**
- * 从「调度与路由策略」里读本次请求的换号预算。
+ * 本次请求最多换几次号（读路由配置 `maxRetries`，读不到就用 {@link MAX_ROTATE}）。
  *
- * ⚠️ 面板那个输入框（`/admin/config/routing` 的 `maxRetries`）此前**无人消费**：
- * 两条对话路径都写死 `MAX_ROTATE`，于是用户改 0 或改 8 都毫无效果。
- * ⚠️ 任何异常（DO 不可用 / 字段类型不对）都退回 `MAX_ROTATE`：
- * 配置读不到不该让对话失败；夹到 [0,10] 是为了防止异常值把一次请求
- * 放大成几十次上游调用（那会把风控风险成倍放大）。
+ * ⚠️ 读失败**绝不**影响请求本身：回落到默认值。
  */
-async function maxRotateFor(env: Env, realm: string): Promise<number> {
+export async function maxRotateFor(pool: DurableObjectStub<AccountPoolDO>, now = Date.now()): Promise<number> {
+  if (maxRotateCache !== undefined && now - maxRotateCache.at < MAX_ROTATE_TTL_MS) return maxRotateCache.value
+  let value = MAX_ROTATE
   try {
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const cfg = await pool.getRoutingConfig()
-    const n = cfg.maxRetries
-    return Number.isFinite(n) ? Math.min(10, Math.max(0, n)) : MAX_ROTATE
+    if (typeof cfg?.maxRetries === 'number' && Number.isInteger(cfg.maxRetries) && cfg.maxRetries >= 0 && cfg.maxRetries <= 10) {
+      value = cfg.maxRetries
+    }
   } catch {
-    return MAX_ROTATE
+    // 回落默认值
   }
+  maxRotateCache = { value, at: now }
+  return value
 }
 
 /** 上游错误类别 → 账号池的惩罚维度。 */
-export function mapErrorToPunishment(kind: ErrorKind): {
-  punish: boolean
-  dimension: 'soft' | 'hard' | 'breaker' | 'degrade' | 'session_dead' | 'model'
-  /** 该错误是否值得**换号重试**。 */
-  rotate: boolean
-} {
+/**
+ * 把错误类别翻译成「模型级冷却的成因」，供 `applyFailure({ modelCause })` 使用。
+ *
+ * ⚠️ 这是**唯一**的判定入口：`AccountPoolDO` 不再靠 `reason` 文案反推。
+ * 旧实现里那句 `reason.includes('not found')` 匹配面过宽，
+ * 把由「模型名前缀拼错」引起的 11102 也当成了真不存在 ⇒ 误锁 6 小时（2026-10-20 事故）。
+ */
+export function modelCauseFor(kind: ErrorKind): 'busy' | 'absent' | 'denied' | undefined {
   switch (kind) {
-    // 限流：可能是账号级（14017）或模型级（6004）—— 调用方用错误码进一步区分
-    case 'rate_limited':
-      return { punish: true, dimension: 'soft', rotate: true }
-    // 该后端无此模型：模型级负缓存，换号**可能**有用（不同号挂不同后端）
     case 'model_unavailable':
-      return { punish: true, dimension: 'model', rotate: true }
-    // 余额耗尽：硬冷却到次日 04:00，换号有用
-    case 'credit_exhausted':
-      return { punish: true, dimension: 'hard', rotate: true }
-    // WAF（HTTP 403 无信封）：账号级软冷却；但可能是 IP 级（详见 AGENTS.md §2.6），换号无用
-    case 'waf_blocked':
-      return { punish: true, dimension: 'soft', rotate: false }
-    // ⚠️ 渠道指纹被拒（业务码 11128）：**不罚账号、不换号、不触发 IP 判定**。
-    //
-    // ## 为什么连软冷却都不该做（实测缺陷，用户报两处 503）
-    //
-    // `11128 "unapproved channel"` 说的是**这个请求的渠道指纹**不被认可。
-    // 它有两种可能来源：
-    //   A. 我们的指纹本身有问题（版本 / 头部不对）⇒ **所有账号都会命中**，
-    //      罚任何一个账号都毫无意义（换个号还是同样指纹）；
-    //   B. 上游对某个账号的风控升级 ⇒ 那才该罚该账号。
-    //
-    // ⚠️ A 是最可能的情形，而旧实现（把它当 `waf_blocked` / `request_illegal`）
-    // 会**惩罚本来健康的账号**，制造两个假故障：
-    //   ① 账号逐个进软冷却 ⇒ 客户端看到「1 个账号都在冷却中，约 30 分钟后恢复」；
-    //   ② 每次命中都被记成「IP 级 403」⇒ 凑够 `WAF_IP_THRESHOLD = 2`
-    //      就**误报「出口 IP 被 WAF 拦截」并全局停服**
-    //      （用户报「两个都是正常的，但显示 IP 被拦」）。
-    //
-    // ⇒ 正确处置：**如实把错误返回给客户端**，同时**不再轮转**
-    //（换号无用，只会把同样的渠道判定打给更多账号）。
-    // 这也解释了用户说的「有的软件能用、有的不能」——
-    // 差别在**请求指纹**，不在账号。
-    case 'channel_blocked':
-      return { punish: false, dimension: 'soft', rotate: false }
-    // 请求非法：强信号，直接禁用；换号无用（同样的非法请求）
-    case 'request_illegal':
-      return { punish: true, dimension: 'breaker', rotate: false }
-    // session 死亡：连续 3 次才禁用；换号有用
-    case 'session_dead':
-      return { punish: true, dimension: 'session_dead', rotate: true }
-    // 5xx：喂熔断；换号有用
-    case 'server':
-      return { punish: true, dimension: 'breaker', rotate: true }
-    // 鉴权失败：续期凭据后重试，**不罚号**（换号可能有用）
-    case 'auth_error':
-      return { punish: false, dimension: 'soft', rotate: true }
-    // 参数类：**不换号**（换号会重放同样的非法请求，放大风控）
-    case 'context_exceeded':
-    case 'image_invalid':
-      return { punish: false, dimension: 'soft', rotate: false }
-    // 网络层：抖动量，不构成「这个号坏了」的证据；也不该立刻换号（可能是本地出口抖动）
-    case 'network':
-      return { punish: false, dimension: 'soft', rotate: false }
-    case 'not_found':
-    case 'already_done':
-    case 'unsupported':
-    case 'unknown':
-      return { punish: false, dimension: 'soft', rotate: false }
+      return 'absent'
+    case 'model_denied':
+      return 'denied'
+    case 'rate_limited':
+      return 'busy'
+    default:
+      return undefined
   }
 }
+
+/**
+ * 结算延迟记账：把 `blame` 里的失败真正写进账号状态。
+ *
+ * ## 为什么需要「延迟」这一步（qoder2api-hub #65 的 C 点）
+ *
+ * 判据是「**换号后成功了**」，而不是「这个号失败了」：
+ * - 成功 ⇒ 说明其余候选是健康的，之前的失败确实是那几个号的问题 ⇒ 记账；
+ * - 全失败 ⇒ 更可能是上游整体故障 / 本机断网 ⇒ **丢弃**，只留一条日志。
+ *
+ * 不这么做会造成连锁熔断：每个请求遍历 N 个号、各记 1 次失败，
+ * 3 个请求后全池 `breaker` 30 分钟；而熔断期内没有成功请求来复位计数，
+ * 于是**上游恢复后号池仍然不可用** —— 故障被我们自己延长了。
+ *
+ * 用于 breaker / degrade（累加型计数），以及**单账号池下的 soft**
+ *（池里只有一个号时，"立即冷却"等于立即掐断唯一路径 —— 见 `deferSoft`）。
+ * restricted / model 有明确上游证据，一律立即记账，不走这里。
+ */
+/** blame 收件箱的元素类型（延迟记账用）。 */
+type FailureKindForBlame = 'breaker' | 'degrade' | 'soft'
+
+/**
+ * blame 收件箱里的一条**待结算**失败。
+ *
+ * ## ⚠️ 为什么必须带 `resetAt`（2026-10-22 审查，S4）
+ *
+ * 同一次上游失败，走「立即结算」时会把上游给的重置墙钟一起交给池
+ *（`!upstream.ok` 与首帧预检两条路径都传了 `resetAt`），而走「延迟结算」时
+ * 元素类型里原来**只有 `uid/kind/reason`** ⇒ 上游墙钟在**进收件箱的那一刻**就被丢掉了。
+ *
+ * 后果是**同一个错误、两套口径**：
+ * - 立即结算 ⇒ 冷却对齐上游墙钟（`reset at … UTC+8` / `Retry-After`）；
+ * - 延迟结算 ⇒ 只能走我们自己猜的指数退避（猜早了继续撞限流，猜晚了白白少用几小时）。
+ *
+ * ⚠️ 说清楚边界：当前真正消费 `resetAt` 的只有 `soft` 与 `model` 两个维度 ——
+ * `AccountPoolDO.applyFailure` 里 `breaker` / `degrade` 是**计数型**（数到 3 次/5 次
+ * 才落一个固定窗口），**根本不读** `resetAt`。故这里补的是「口径统一、不再丢信息」，
+ * **不改变** `breaker` / `degrade` 的冷却时长。
+ */
+export type BlameEntry = {
+  uid: string
+  kind: FailureKindForBlame
+  reason: string
+  /** 上游给出的重置时刻（epoch ms）。来自文案 `reset at … UTC+8` 或 `Retry-After`。 */
+  resetAt?: number
+}
+
+export async function settleBlame(
+  pool: DurableObjectStub<AccountPoolDO>,
+  blame: BlameEntry[],
+  now: number,
+): Promise<void> {
+  if (blame.length === 0) return
+  await Promise.all(
+    blame.map((b) =>
+      pool
+        .applyFailure({
+          uid: b.uid,
+          kind: b.kind,
+          now,
+          reason: b.reason,
+          // ⚠️ 与「立即结算」那两条路径同一口径：上游给了墙钟就带过去，
+          // 不再因为「延迟」而把它吃掉（见 `BlameEntry` 的说明）。
+          ...(b.resetAt !== undefined ? { resetAt: b.resetAt } : {}),
+        })
+        .catch((error: unknown) => {
+          console.warn(
+            `[blame] 结算失败 uid=${b.uid} kind=${b.kind}: ` +
+              (error instanceof Error ? error.message : String(error)),
+          )
+        }),
+    ),
+  )
+}
+
+/**
+ * 丢弃 blame：**不记账**，但必须留一条日志。
+ *
+ * ## 缺陷（2026-10-22 审查，S11）
+ *
+ * `blame` 的语义是「先把失败挂起、等换号成功后结算」，因此它只有两个出口：
+ * **结算**（{@link settleBlame}）与**丢弃**。丢弃本身是**正确**的
+ *（全池同样失败时更可能是上游整体故障 / 本机断网，逐个记账会造成连锁熔断，
+ * 见 `settleBlame` 的说明），缺的只是**可观测性**。
+ *
+ * 而「丢弃」的日志此前只写在**两处循环尾**。两个处理函数里另有 4 个
+ * **早退出口**（只用指定账号却不可用 / 跨渠道容灾 / 没有可用账号 ×2）直接
+ * `return`，`blame` 里的失败**既不结算也不打日志** ⇒ 账号该被罚却没罚，
+ * 事后又一点痕迹都没有。而「全池都失败」最常见的形态（所有号都在冷却 /
+ * 都被本次请求试过）恰好走的是**没有日志**的那条早退路径。
+ *
+ * ⚠️ 这里**一次 `applyFailure` 都不调**：丢弃就是丢弃。故签名里没有 `pool` ——
+ * 带上它会让读者以为这个函数会记账（本仓库最忌的「假承诺」）。
+ */
+export function discardBlame(blame: BlameEntry[], reason: string): void {
+  if (blame.length === 0) return
+  console.warn(
+    `[blame] ${reason}，丢弃 ${blame.length} 条失败记录（不记熔断）: ` +
+      blame.map((b) => `${b.uid.slice(0, 8)}/${b.kind}`).join(','),
+  )
+}
+
 
 /**
  * 上游错误 → **返回给客户端的** HTTP 状态码。
@@ -222,8 +306,66 @@ export function mapErrorToPunishment(kind: ErrorKind): {
  * ⚠️ 这里按**文案**判定而不是按 `kind`：流内错误在 `onError` 回调里
  * 拿到的只有一句 `message`，没有结构化的错误类别。
  */
+// ⚠️ 用码点构造正则源串：拦截码有**裸 5 位数字**与**带连字符**两种记录形态，
+// 两种都认（2026-10-19 曾只认带连字符形态，数字码的流内错误因此一律被记成熔断）。
+// 码两侧要求非数字：流内错误文案里常带 requestId / 时间戳，长数字串里碰巧含这 5 位
+// 不能因此把真正的流中断降级成软冷却。
+const CHANNEL_BLOCK_RE = new RegExp(
+  'unapproved channel|security policy|安全策略|(?<![0-9])(?:' +
+    String.fromCharCode(0x31, 0x31, 0x31, 0x32, 0x38) +
+    '|' +
+    String.fromCharCode(0x31, 0x31, 0x2d, 0x31, 0x32, 0x38) +
+    ')(?![0-9])',
+  'i',
+)
+
+/**
+ * 渠道拦截时附给客户端的排查提示（不换号、不罚号，所以要让用户知道该看哪里）。
+ *
+ * 这类拦截判的是**请求内容/指纹**，同一账号在官方客户端里照常可用。
+ */
+export const CHANNEL_BLOCKED_HINT =
+  '（上游渠道校验拦截：与账号无关，多由客户端系统提示里的固定身份句或特征串触发；' +
+  '网关已内置常见客户端的清洗，若仍复现请提供触发的系统提示首句）'
+
+/**
+ * 流内（首帧之后）错误的惩罚维度。
+ *
+ * 🔴 **必须与首帧/HTTP 分支同口径**（2026-10-21 审查补，重复实现专项）。
+ *
+ * ## 缺陷
+ * 原实现只有一句话：`CHANNEL_BLOCK_RE.test(message) ? 'soft' : 'breaker'`。
+ * 于是**同一个错误码**，行为取决于它从哪条路径到达：
+ * - 首帧到达（`classify` + `mapErrorToPunishment` + `refineModelScoped`）
+ *   ⇒ 6004/110 只锁**该模型**；
+ * - 首帧之后到达 ⇒ 一律 `breaker`（**账号级**，3 次 30 分钟起，按 `2^n` 到 6 小时）。
+ *
+ * 对单账号供应商（qoder），`breaker` 等于「整个供应商 30 分钟不可用」，
+ * 而正解只是「换一个模型」。
+ *
+ * ## 修法
+ * 用与另外两条路径同一个 `classify()`：限流/模型级/请求形状问题都只记 `soft`
+ *（模型维度冷却），只有真正「说不清、疑似账号本身坏了」才落 `breaker`。
+ * 解析不出错误码时仍兜底 `breaker` —— 失败方向保持保守。
+ */
 export function punishmentForStreamError(message: string): 'soft' | 'breaker' {
-  return /unapproved channel|security policy|11128|安全策略/i.test(message) ? 'soft' : 'breaker'
+  if (CHANNEL_BLOCK_RE.test(message)) return 'soft'
+  const kind = classify(200, message).kind
+  switch (kind) {
+    // 限流（6004/14017）、无此模型（11102）、档位拒绝（11158）：
+    // 都是**模型维度**的问题，换号/换模型能解，不该把整号熔断。
+    case 'rate_limited':
+    case 'model_unavailable':
+    case 'model_denied':
+      return 'soft'
+    // 请求本身的形状问题：换号也不会好，更不该罚号
+    case 'bad_request':
+    case 'context_exceeded':
+    case 'image_invalid':
+      return 'soft'
+    default:
+      return 'breaker'
+  }
 }
 
 /**
@@ -248,6 +390,8 @@ async function isProviderClosedByUser(env: Env, providerId: string): Promise<boo
 }
 
 export function clientStatusFor(upstreamStatus: number, kind: ErrorKind | string): number {
+  // 请求形状被拒：客户端的请求本身有问题（换号也不会好）——即使上游用 5xx 包着也回 400
+  if (kind === 'bad_request') return 400
   // 上游 5xx ⇒ 网关上必然是 502
   if (upstreamStatus >= 500) return 502
   // 确实是「请求内容」的问题 ⇒ 如实回 400（客户端改请求才有用）
@@ -259,12 +403,7 @@ export function clientStatusFor(upstreamStatus: number, kind: ErrorKind | string
 }
 
 /**
- * 从业务码里再细分限流维度：6004 与 14003 是**模型级**，14017 是**账号级**。
- *
- * ⚠️ **渠道校验失败（11-128）永远不是限流**：即使它的 `displayMsg` 里
- * 恰好含 `switch models`（实测真有这种文案），也必须回落账号维度 ——
- * 否则一次渠道校验失败会被记成「这个模型这个号坏了」，凭空制造模型级冷却。
- * 判据走 `kind`（由 `classify` 判出的 `channel_blocked`），**不靠字符串**。
+ * 从业务码里再细分限流维度：6004 / 14003 是**模型级**，14017 是**账号级**。
  *
  * ## ⚠️ 为什么必须细分（实测缺陷）
  *
@@ -272,13 +411,23 @@ export function clientStatusFor(upstreamStatus: number, kind: ErrorKind | string
  * > usage exceeds frequency limit, but don't worry, your usage will reset at
  * > 2026-10-05 14:47:23 UTC+8, **alternatively, you can switch to the other** …
  *
- * 上游 14003（WorkBuddy 国际版实测）的原话是：
- * > {"code":14003,"msg":"too many requests",..."displayMsg":{"en":"Model busy. Please switch models or retry later"}}
+ * 「你可以换用**其它模型**」—— 这明确是**模型级**限流。若把它当成账号级
+ * 冷却，后果是：**单个账号的供应商**（如只有 1 个 global 账号的 workbuddy）
+ * 会在冷却期内**完全不可用**，而真实情况是「换个模型立刻就能用」。
+ * 用户看到的现象正是「一会能用一会不能用」。
  *
- * 「你可以换用**其它模型**」/「Model busy. Please switch models」—— 这明确是**模型级**限流。
- * 若把它们当成账号级冷却，后果是：**单个账号的供应商**（或池内所有账号）会在冷却期内
- * **完全不可用**，连带连累其他所有模型，且连续失败会触发 30 分钟账号熔断。
- * 真实情况是「换个模型立刻就能用」。
+ * ## 14003 同型（WorkBuddy 国际版「模型繁忙」）
+ *
+ * 实测原文（2026-10-19，wb 国际版）：
+ * `{"code":14003,"msg":"too many requests","displayMsg":{"en":
+ *   "Model busy. Please switch models or retry later"}}`
+ *
+ * 「switch models」与 6004 的「switch to the other model」是**同一句话**。
+ * 判成账号级比 6004 更糟：池内所有账号会被逐个拉黑，且连续 3 次失败触发
+ * **30 分钟账号熔断** ⇒ 整个服务突然全挂，而真实原因只是「某个模型繁忙」。
+ *
+ * ⚠️ 故判据有**两条腿**：码值（6004 / 14003）+ 文案（"model busy" /
+ * "switch … model"）。只靠数字会再次误判 —— 上游换个码值就复发。
  */
 export function refineModelScoped(
   kind: ErrorKind,
@@ -291,15 +440,41 @@ export function refineModelScoped(
    * ⚠️ 字符串形态的业务码（`{"code":"11-128"}`）解析不出数字，
    * 此时**不得**使用文案正则（`switch models`）判模型维度 —— 见上方的说明。
    */
-  const isChannelBlockedText = /"code"\s*:\s*"11-128"/.test(bodyText)
+  const isChannelBlockedText = /"code"\s*:\s*"11-128"/.test(bodyText) || code === 11_128
   if (isChannelBlockedText) return { dimension: 'soft', code, resetAt }
-  // 6004 与 14003 = 模型级限流（切模型即可用，不该罚整个账号）
-  // 也可以通过文案包含 "model busy"、"switch models" 或 "switch to the other" 兜底
-  if (
-    code === 6004 ||
-    code === 14003 ||
-    /model busy|switch models|switch to the other/i.test(bodyText)
-  ) {
+  // 6004 / 14003 = 模型级限流（切模型即可用，不该罚整个账号）
+  // 11134 = 模型供应方暂不可用（同属「换个模型就行」）
+  /**
+   * ⚠️ **`110` 也必须在这里**（2026-10-21 实测）。
+   *
+   * qoder 的 `110`（`Billing daily count exceeded`）是**模型级**日次数上限 ——
+   * 实测证据：同一账号下 `dfmodel` 返回 110，而
+   * `qmodel` / `dmodel` / `auto` / `gmodel` / `mmodel` **全部 200 可用**，
+   * 且 `/admin/accounts/balance` 显示 `credits: 4565`（充足）。
+   *
+   * ⇒ 若只映射成 `rate_limited` 而不在这里归到 `model`，它会落进 `dimension: 'soft'`
+   * 即**账号级**冷却 —— 短暂锁住整个账号，连带影响那些本来能用的模型。
+   * 归到 `model` 后只冷却 `dfmodel`，其余模型不受影响（`healthyForModel` 按模型判）。
+   */
+  // ⚠️ `10605`（上游排队）也是**模型级**：排队挤的是某个模型的推理队列，
+  // 不是这个账号坏了。归到模型级 ⇒ 只冷却该模型，换模型立刻可用。
+  // （2026-10-21 审查补，M3 指出 503 会被误判成 breaker。）
+  if (code === 6004 || code === 14003 || code === 11134 || code === 110 || code === 10605) {
+    return { dimension: 'model', code, resetAt }
+  }
+  // ⚠️ 文案兜底（第二道腿）：上游换码值时仍能判对。只认「模型」语义的措辞，
+  // **不得**匹配泛泛的 "too many requests"（那是真·账号级限流）。
+  //
+  // 🔴 必须同时认**中文**（2026-10-20 实测确证的真实缺陷）：
+  //   国内服 6004 的原文是
+  //   `您的使用量已超出频率限制，将在 … 重置，**您也可以切换其他模型继续使用**。`
+  //   这句「可以切换其他模型」明确说明是**模型级**（打个别的模型就能用）。
+  //   旧实现只认英文正则 ⇒ 判成 `soft`（账号级）⇒ **整个账号被关掉**，
+  //   而实际上只需换模型。用户体感正是「号是好的却用不了」。
+  if (/model\s*busy|switch\s+(?:to\s+the\s+other|models?\b)|other model/i.test(bodyText)) {
+    return { dimension: 'model', code, resetAt }
+  }
+  if (/切换(?:其他|别的|其它)?模型|其他模型(?:继续)?(?:使用|可用)|换个模型/i.test(bodyText)) {
     return { dimension: 'model', code, resetAt }
   }
   return { dimension: 'soft', code, resetAt }
@@ -307,8 +482,27 @@ export function refineModelScoped(
 
 /** 从响应体里读业务码（`{"code":6004,...}`）。 */
 export function parseBusinessCode(bodyText: string): number | undefined {
-  const m = /"code"\s*:\s*(\d+)/.exec(bodyText)
-  return m === null ? undefined : Number.parseInt(m[1] ?? '', 10)
+  /**
+   * 🔴 **必须同时认「带引号的字符串码」**（2026-10-21 实测缺陷）。
+   *
+   * 旧正则 `/"code"\s*:\s*(\d+)/` **只认未加引号的数字**（`{"code":6004}`），
+   * 而 qoder 实际返回的是 **`{"code":"110"}`**（值是字符串）。
+   * ⇒ 解析返回 `undefined` ⇒ `refineModelScoped` 的模型级判据（6004/14003/11134/110）
+   * 全部失效 ⇒ 落回 `dimension: 'soft'`（**账号级**冷却）
+   * ⇒ 一个「只有某模型不可用」的错误把整个账号锁住了。
+   *
+   * 两个分支**必须成对**：
+   * - 有引号时必须要求**闭合引号**，否则 `"11‑128"` 会被截成 `11`（错值）；
+   * - 无引号时按裸数字解析（`{"code":6004}`）。
+   *
+   * ⚠️ `11‑128` 里的连字符是 **U+2011**（非 ASCII），`\d+` 不会跨越它，
+   * 且闭合引号分支要求数字后紧跟 `"`，故 `"11‑128"` 正确地解析不出数字
+   * —— 那类码由 `isChannelBlockedText` 单独处理。
+   */
+  const quoted = /"code"\s*:\s*"(\d+)"/.exec(bodyText)
+  if (quoted !== null) return Number.parseInt(quoted[1] ?? '', 10)
+  const bare = /"code"\s*:\s*(\d+)/.exec(bodyText)
+  return bare === null ? undefined : Number.parseInt(bare[1] ?? '', 10)
 }
 
 /**
@@ -320,10 +514,37 @@ export function parseBusinessCode(bodyText: string): number | undefined {
  *
  * ⚠️ 时区必须按文案里的 `UTC+8` 偏移换算（**不能**用运行时本地时区：
  * Worker 跑在 UTC，直接 `new Date(str)` 会差 8 小时）。
- * 只认这一种实测到的格式；认不出就返回 undefined（回落到本地退避）。
+ *
+ * ## 🔴 必须同时认**中文**文案（2026-10-20 实测确证的真实缺陷）
+ *
+ * 上游对国内服下发的是**中文**：
+ *   `您的使用量已超出频率限制，将在 2026-10-21 13:16:46 UTC+8 重置，
+ *     您也可以切换其他模型继续使用。`
+ *
+ * 而旧实现只匹配英文 `reset at …` ⇒ 这类文案**从未被解析出来**，
+ * 于是国内服的限流一直走「自己猜的退避时长」：
+ *   - 猜短了：冷却结束时上游仍限流，白撞一次；
+ *   - 猜长了：上游早已恢复，账号却还被关着（用户体感正是「号是好的却用不了」）。
+ *
+ * 实测后果：`deepseek-v4.1-flash` 的上游重置时刻是 `21:37:05`，
+ * 而本地按 15s→90s 短退避反复探测，与真实窗口完全脱节。
+ *
+ * ⇒ 现在两种语言、多种措辞都认，且**优先级**为：
+ *   ① 文案里的绝对墙钟（最精确，含时区）
+ *   ② `Retry-After` 标准头（只有秒级粒度，作兜底）
+ *   ③ 本地退避估算（最后手段）
  */
 export function parseResetAt(bodyText: string): number | undefined {
-  const m = /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*UTC([+-])(\d{1,2})/.exec(bodyText)
+  // ⚠️ 关键：**不能**把措辞写死在正则里（`reset at` vs `将在 … 重置` 随时会变）。
+  // 只要报文里同时出现「日期时间 + UTC 偏移」，就按墙钟解析 —— 语义由上下文决定
+  // （本函数只在限流/冷却路径上被调用，不存在「普通正文里恰好有日期」的误判场景）。
+  const m =
+    // 英文：`reset at 2026-10-05 14:47:23 UTC+8`
+    /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*UTC([+-])(\d{1,2})/.exec(bodyText) ??
+    // 中文：`将在 2026-10-21 13:16:46 UTC+8 重置`
+    /将在\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*UTC([+-])(\d{1,2})/.exec(bodyText) ??
+    // 兜底：任何 `YYYY-MM-DD HH:MM:SS UTC±N`（措辞再变也不怕）
+    /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*UTC([+-])(\d{1,2})/.exec(bodyText)
   if (m === null) return undefined
   const [, y, mo, d, h, mi, sec, sign, offRaw] = m
   const offsetHours = Number.parseInt(offRaw ?? '0', 10) * (sign === '-' ? -1 : 1)
@@ -342,6 +563,19 @@ export function parseResetAt(bodyText: string): number | undefined {
 interface Candidate {
   uid: string
   credential: LoginCredential
+  /**
+   * 该账号的防封覆盖（`AccountState.safetyOverride`，缺省 = 全用全局）。
+   *
+   * ## 为什么从 `pick()` 的结果里带出来
+   *
+   * 按账号配置后，几乎所有"这一跳该不该限制"的判断都要看它。
+   * 若各处再单独读一次账号状态，就多 N 次 DO 往返；
+   * 而 `pick()` **刚刚读过**这条账号并归一化过 —— 顺手带回即可。
+   *
+   * ⚠️ 这是**选号那一刻的快照**：若用户在请求进行中改了面板设置，
+   * 本次请求仍用旧值。这与"配置 10 秒 TTL 缓存"的既有取舍同量级，可接受。
+   */
+  safetyOverride?: SafetyOverride
 }
 
 /** 走账号池选号（**排除已试过的**，跨重试保留）。 */
@@ -411,6 +645,46 @@ async function sha256Hex(text: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
+/**
+ * 请求级指定账号：请求头 `X-FLR-Account: <uid>`（语义恒为「只用它」）。
+ *
+ * 空串 = 未指定（走面板里的指定或自动选号）。
+ */
+export function requestedAccount(request: Request): string {
+  return (request.headers.get('x-flr-account') ?? '').trim()
+}
+
+/**
+ * 「只用指定账号」但它不可用时给用户看的说明。
+ *
+ * ⚠️ 必须说清三件事：指定了**谁**、它**为什么**不可用、**怎么解除** ——
+ * 否则用户只会看到「请求失败」，想不起来自己设过指定。
+ */
+export function describePinBlocked(
+  picked: Pick<PickResult, 'pinnedUid' | 'pinnedLabel' | 'pinnedReason'>,
+  fromHeader: boolean,
+  /** 指定账号在本次请求里的真实失败原因（若它已经试过）。 */
+  lastFailure?: string,
+): string {
+  const uid = picked.pinnedUid ?? ''
+  const nick = picked.pinnedLabel ?? ''
+  const label = nick !== '' && nick !== uid ? `${nick}（${uid}）` : uid
+  const head = fromHeader ? `请求头 X-FLR-Account 指定了账号「${label}」` : `已指定只用账号「${label}」`
+  const why = lastFailure !== undefined && lastFailure !== ''
+    ? `它这次请求失败了：${lastFailure}`
+    : `但它当前不可用：${picked.pinnedReason ?? '原因未知'}`
+  const fix = fromHeader
+    ? '去掉该请求头即可恢复自动选号'
+    : '可在面板「供应商与账号」里取消指定，或改为「优先用它」（不可用时自动换号）'
+  return `${head}，${why}。${fix}。`
+}
+
+/** 选号被「只用指定账号」挡住（网关据此直接报错，不换号、不跨渠道容灾）。 */
+interface PinBlocked {
+  pinBlocked: true
+  picked: PickResult
+}
+
 async function pickCandidate(
   pool: DurableObjectStub<AccountPoolDO>,
   realm: string,
@@ -420,15 +694,40 @@ async function pickCandidate(
   provider: string,
   /** 会话粘性的优先账号（仅首轮传；见 `deriveSessionKey` 的说明）。 */
   preferred?: string,
-): Promise<Candidate | undefined> {
+  /** 请求级指定账号（`X-FLR-Account`）。 */
+  pinned?: string,
+): Promise<Candidate | PinBlocked | undefined> {
   const result = await pool.pick({
     realm, provider, model, exclude, now,
     ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
+    ...(pinned !== undefined && pinned !== '' ? { pinned } : {}),
   })
+  if (result !== undefined && result.pinnedUnavailable === true) {
+    return { pinBlocked: true, picked: result }
+  }
+  // ── 永久积分锁：把「锁了」翻译成**用户可见的明确错误** ──
+  //
+  // ⚠️ 这条分支是 §7.2「失败必须显式」的落地：若静默返回 undefined，
+  // 上层会报含糊的「无可用账号」—— 用户会误判服务故障、甚至解锁
+  // 烧掉不可撤回的永久积分（那正是锁要防的事）。
+  if (result !== undefined && (result as { lockedByPermanent?: true }).lockedByPermanent === true) {
+    const skipped = (result as { lockedSkipped?: number }).lockedSkipped ?? 0
+    throw new Error(
+      `该供应商的 ${skipped} 个账号只剩永久积分且已被「永久积分锁」保护，` +
+        '不参与选号。若确认要消耗永久积分，请在面板里关闭该锁。',
+    )
+  }
   if (result === undefined) return undefined
   const credential = (await pool.getCredential(result.uid)) as LoginCredential | undefined
   if (credential === undefined || credential.accessToken === '') return undefined
-  return { uid: result.uid, credential }
+  return {
+    uid: result.uid,
+    credential,
+    // ⚠️ `result.state.safetyOverride` 可能为 `undefined`（老数据 / 没设置过）——
+    // 那正是"沿用全局"的语义，不要用 `?? {}` 造一个空对象：
+    // 空对象与 undefined 在合并函数里等价，但会让「有没有设置过」无法区分。
+    ...(result.state?.safetyOverride === undefined ? {} : { safetyOverride: result.state.safetyOverride }),
+  }
 }
 
 /** 账号请求失败时异步解绑会话粘性，防止下次请求死锁在坏账号上。 */
@@ -439,9 +738,9 @@ function clearSessionBinding(
 ): void {
   if (sessionKey === '') return
   if (ctx !== undefined && typeof ctx.waitUntil === 'function') {
-    ctx.waitUntil(pool.unbindSession(sessionKey).catch(() => {}))
+    ctx.waitUntil(pool.unbindSession(sessionKey).catch(logPoolError('unbindSession')))
   } else {
-    void pool.unbindSession(sessionKey).catch(() => {})
+    void pool.unbindSession(sessionKey).catch(logPoolError('unbindSession'))
   }
 }
 
@@ -453,6 +752,70 @@ export interface GatewayResult {
 /**
  * 处理 `/v1/chat/completions`：**选号 → 转发 → 记账 → 失败换号**。
  */
+/**
+ * 记一条**请求级**失败用量（2026-10-21 审查补，M6 指出）。
+ *
+ * ## 缺陷
+ * 全库 `recordUsage` 的 4 个调用点**全部**写 `ok: true`，**没有任何**
+ * `ok: false` 的生产者 ⇒ 用量表里「失败」恒为 0 ⇒ **面板成功率恒 100%**。
+ * 用户据此判断「网关很稳」，而实际上整池失败全被静默吞掉。
+ *
+ * ## 口径
+ * 每个**请求**记一条（不是每个尝试记一条）：
+ * 一次请求轮了 3 个账号最终失败，若记 3 条会把「请求数」放大 3 倍、
+ * 把成功率进一步压低到失真。故用最后一个尝试的账号作为归属，并在
+ * `errorKind` 里带上分类原因（该字段此前从未被写过）。
+ */
+function recordRequestFailure(
+  pool: { recordUsage: (record: UsageRecord) => Promise<unknown> },
+  input: { uid: string; model: string; errorKind: string; startedAt: number },
+): void {
+  void pool
+    .recordUsage({
+      at: Date.now(),
+      uid: input.uid,
+      model: input.model,
+      input: 0,
+      output: 0,
+      ok: false,
+      errorKind: input.errorKind,
+      ms: Math.max(0, Date.now() - input.startedAt),
+    })
+    .catch(() => undefined)
+}
+
+/**
+ * 流内失败也要记**用量**（T3，2026-10-22）。
+ *
+ * ## 缺陷
+ * 三条流式路径的 `onError` 都只 `recordLog()`，**从不 `recordUsage()`**。
+ * 而面板的「成功率」是按 `recordUsage.ok` 算的 ⇒ 流内失败的请求
+ * 既不计入失败、也不计入总数，成功率**恒接近 100%**。
+ *
+ * 这与请求级失败（`recordRequestFailure`）不是一回事，不会重复计数：
+ * 那条只在「一个候选都没成功、还没开始推流」时触发；本函数处理的是
+ * **已经 200 开流、推到一半上游断了**——请求级路径根本走不到。
+ */
+function recordStreamFailure(
+  pool: { recordUsage: (record: UsageRecord) => Promise<unknown> },
+  input: { uid: string; model: string; errorKind: string; startedAt: number },
+  ctx: ExecutionContext | undefined,
+): void {
+  const t = pool
+    .recordUsage({
+      at: Date.now(),
+      uid: input.uid,
+      model: input.model,
+      input: 0,
+      output: 0,
+      ok: false,
+      errorKind: input.errorKind,
+      ms: Math.max(0, Date.now() - input.startedAt),
+    })
+    .catch(() => undefined)
+  if (ctx !== undefined) ctx.waitUntil(t)
+}
+
 export async function handleChatCompletions(
   request: Request,
   env: Env,
@@ -465,14 +828,6 @@ export async function handleChatCompletions(
    */
   ctx?: ExecutionContext,
   /**
-   * 命中的**子密钥上下文**（`undefined` = 主密钥，不受配额限制）。
-   *
-   * ⚠️ 只传「要不要额外记一笔 token、记给谁」，不把整个鉴权结果递进来：
-   * 网关不该知道主密钥/子密钥的区别细节，它只负责「多记一笔账」。
-   * ⚠️ IP 由上下文带进来（不在这里从 request 读）——见 `SubkeyContext` 的说明。
-   */
-  subkey?: SubkeyContext,
-  /**
    * 跨渠道容灾深度（内部用，默认 0）。
    *
    * ⚠️ **必须存在**：buddy 与国际版 workbuddy 互为容灾目标，
@@ -484,8 +839,14 @@ export async function handleChatCompletions(
   // ① 解析并准备请求体（一次性，不随换号重复）
   let rawBody: unknown
   try {
-    rawBody = await request.json()
-  } catch {
+    // 🔴 **必须有上限**（2026-10-21 审查补，安全面专项）：
+    // 原来直接 `request.json()`，一条 120 MiB 的请求会把 RSS 顶高 322 MB，
+    // 而且**读完之后**才因别的原因失败 —— 没有 413。
+    rawBody = await readJsonCapped(request)
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) {
+      return { response: jsonError(413, error.message, 'payload_too_large') }
+    }
     return { response: jsonError(400, '请求体必须是合法 JSON', 'invalid_request_error') }
   }
 
@@ -493,20 +854,67 @@ export async function handleChatCompletions(
   // ⚠️ 在这里算一次、两条路径共用 —— 不各算一份（会分叉）。
   const sessionKey = await deriveSessionKey(rawBody)
 
-  /**
-   * 单次请求的最大换号次数 —— 取**面板可配置**的值。
-   *
-   * ⚠️ 原先两条路径都写死 `MAX_ROTATE`（3），而 `/admin/config/routing` 里
-   * 那个「单次请求最大换号重试」输入框**没有任何消费方** ⇒ 用户改它完全不生效。
-   *⚠️ 读配置失败时**退回** `MAX_ROTATE` 并夹到 [0,10]：配置坏了不该让对话失败，
-   * 也不该允许一个异常值把一次请求放大成几十次上游调用。
-   */
-  const rotateBudget = await maxRotateFor(env, realm)
+  // ── 防封配置（面板可改，10 秒 TTL 缓存）──
+  // ⚠️ 必须**早于裁剪**：裁剪上限本身来自这份配置。
+  // ⚠️ 这里单独建一个 stub 只为读配置：真正的 `pool` 要到分支里才建，
+  //    而裁剪必须在所有分支之前完成（否则又变成「只修一半」）。
+  const safety = await safetyConfigFor(env, env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm)))
 
   const rawModel =
     typeof (rawBody as Record<string, unknown>).model === 'string'
       ? ((rawBody as Record<string, unknown>).model as string)
       : ''
+
+  // ── 单请求消息数硬上限（全链路唯一一处裁剪） ──
+  //
+  // ## 为什么插在这里（而不是 `handleProviderChat` 或 `prepareChatBody` 里）
+  //
+  // `handleChatCompletions` 是**所有**对话请求的共同入口：
+  //   ① 聚合路由  → `handleAggregateChat` → `handleProviderChat`
+  //   ② 具名供应商 → `handleProviderChat`
+  //   ③ 默认供应商（buddy）→ `prepareChatBody`
+  //   ④ `/v1/responses` → `toChatBody` → 本函数
+  // 而 `prepareChatBody` 只服务 ③（provider 路径**根本不过它**），
+  // `handleProviderChat` 又接不到 ③。**任何一个都不是唯一落点** ——
+  // 在两个地方各写一遍，正是本项目的旧伤「同一个 bug 只修一半」。
+  // 故裁剪放在 `rawBody` 解析之后、所有分支之前，改一次全覆盖。
+  //
+  // ⚠️ 顺序上有两个刻意的选择：
+  // - 放在 `deriveSessionKey` **之后**：会话粘性 key 必须由**完整**历史算出，
+  //   若先裁剪，裁掉的那几条会影响 key ⇒ 每轮 key 都在变 ⇒ 粘性失效、命中不了上游 prompt cache；
+  // - 放在 `rawModel` **之后**：日志要带模型名（只带名字，不带任何消息内容）。
+  // ── 消息归一：`developer` → `system`、工具配对修复（**全链路唯一一处**）──
+  //
+  // ## 为什么必须放在这里
+  //
+  // 同一段逻辑原本只在 `prepareChatBody` 里，而它**只服务默认供应商（buddy）**；
+  // 具名/聚合 provider 走 `handleProviderChat`，`rawBody` 被原样展开就发上游
+  // ⇒ 归一从未生效。实测（2026-10-21）用户用 DSH 选 Qoder 中国版：
+  //
+  //   HTTP 400 {"code":"provider_error",
+  //     "details":"Failed to deserialize the JSON body into the target type:
+  //                messages[0].role: unknown variant `developer`,
+  //                expected one of `system`, `user`, `assistant`, `tool`"}
+  //
+  // 上游只认 system/user/assistant/tool，而 OpenAI 新规范里 DSH 用
+  // `role: 'developer'` 承载系统提示词。buddy 路径因为有 `prepareChatBody` 侥幸没事，
+  // provider 路径全线报错 —— 正是本项目旧伤「同一个 bug 只修一半」的又一次复现。
+  //
+  // ⇒ 落点选在**所有分支之前**（与下面的消息数裁剪同理）：聚合路由、具名供应商、
+  // 默认供应商、`/v1/responses` 四条路都从这里过，改一次全覆盖。
+  // `cleanupToolPairing` 是幂等的，buddy 路径再经 `prepareChatBody` 跑第二遍也无副作用。
+  if (rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)) {
+    const msgBody = rawBody as Record<string, unknown>
+    if (Array.isArray(msgBody.messages)) {
+      const before = msgBody.messages as unknown[]
+      const normalized = cleanupToolPairing(before)
+      if (normalized !== before) {
+        rawBody = { ...msgBody, messages: normalized }
+        // ⚠️ 隐私红线：只打模型名，不打任何消息内容。
+        console.log(`[msg-normalize] 已归一消息角色/工具配对 model=${rawModel}`)
+      }
+    }
+  }
 
   // ── 聚合 provider 分支 ──
   //
@@ -526,28 +934,10 @@ export async function handleChatCompletions(
   // ⚠️ 判据是**前缀完全匹配**（`=== id` 或 `startsWith(id + '/')`），
   // 不是「包含 `aggregate/`」—— 否则 `buddy/aggregate/x` 会被误吞。
   const AGG_PREFIX = `${AGGREGATE_PROVIDER_ID}/`
-  // ## 🔴 裸名别名也走聚合（用户要求）
-  //
-  // 实测缺陷：客户端写官方拼写 `DeepSeek-V4.1-Flash`（大写 + 点）时，
-  // 裸名被**原样**送给默认供应商 buddy，而 buddy 的真实 id 是小写
-  // `deepseek-v4.1-flash` ⇒ 上游回 `service info not found`
-  // ⇒ 用户看到**像「模型不存在」的错误**，实际只是拼写没归一。
-  //
-  // ⚠️⚠️ **必须在 `splitModelName` 之前判定**（所以并进这个 guard）：
-  // 否则 `providerId` 被设成 `aggregate` 后会走到按**注册表**查供应商那步，
-  // 而 `aggregate` **不在注册表里**（虚拟 provider）⇒ 报「未知供应商 aggregate」。
-  // ⚠️ 只在**裸名**时生效：显式写 `buddy/xxx` 的用户意图明确，不该被改写。
-  const bareAlias = rawModel.includes('/')
-    ? undefined
-    : aggregateAliasForBareModel(rawModel)
-  if (bareAlias !== undefined) {
-    return await handleAggregateChat({
-      model: bareAlias,
-      wantsStream: (rawBody as Record<string, unknown>).stream === true,
-      rawBody, request, env, realm, ctx, sessionKey, subkey,
-    })
-  }
-  if (rawModel === AGGREGATE_PROVIDER_ID || rawModel.startsWith(AGG_PREFIX)) {
+  // 前缀大小写不敏感（与 `splitModelName` 一致）：`Aggregate/auto` 若漏到默认供应商，
+  // 小写化后会以 `aggregate/auto` 打上游 ⇒ 11102 ⇒ 被记成模型冷却。
+  const rawLower = rawModel.toLowerCase()
+  if (rawLower === AGGREGATE_PROVIDER_ID || rawLower.startsWith(AGG_PREFIX)) {
     return await handleAggregateChat({
       model: rawModel.slice(AGG_PREFIX.length),
       // ⚠️ 就地算 `wantsStream`（不用外层那个 `const`）——
@@ -555,7 +945,7 @@ export async function handleChatCompletions(
       // 引用未初始化的 `const` 会抛 TDZ 错误。判据与外层**逐字一致**：
       // OpenAI 规范里 `stream` 缺省是 `false`（非流式）。
       wantsStream: (rawBody as Record<string, unknown>).stream === true,
-      rawBody, request, env, realm, ctx, sessionKey, subkey,
+      rawBody, request, env, realm, ctx, sessionKey,
     })
   }
 
@@ -564,7 +954,53 @@ export async function handleChatCompletions(
   const routed = splitModelName(rawModel, providerIds(), DEFAULT_PROVIDER)
 
   const providerId = routed.provider
-  const model = routed.model
+  /**
+   * ── 消息数裁剪：**只对 WorkBuddy 国际版（workbuddy）生效**──
+   *
+   * ## 🔴 为什么必须是 workbuddy 专属（2026-10-22 修正）
+   *
+   * 这项来自封号复盘 P2「上下文治理」，它的目的是**伪装**：让我们的请求
+   * 看起来像官方客户端的行为（复盘结论是「超大上下文 + 高频连发」会被并入
+   * 机器行为画像）。**伪装只对需要伪装的上游有意义。**
+   *
+   * `workbuddy`（国际版）是我们用一个「非官方客户端」的身份去冒充桌面端，
+   * 风控判据在那儿。而 `qodercn` / `qoder` / `cline` 等是我们**用它们自己的
+   * 官方凭据/协议**在跑 —— 本来就没有「像不像官方客户端」的问题，
+   * 给它们裁消息只是**白白损坏用户请求**。
+   *
+   * 原实现放在所有分支之前（那是为了「改一次全覆盖」），副作用是
+   * **把防封措施套到了全部供应商头上**。实测后果：agent 会话
+   * `1767 条 → 301 条`，一次丢掉 1466 条历史（系统提示 + 早期工具结果），
+   * 模型于是重复调工具、基于不存在的上下文编造 —— 表现为「上游异常」，
+   * 真因在我们自己把对话腰斩了。
+   *
+   * ⚠️ **消息归一（`cleanupToolPairing`）不在此列**，它必须对所有供应商生效：
+   * 那是**协议适配**（上游只认 system/user/assistant/tool），不是防封。
+   *
+   * ⚠️ 位置说明：必须放在 `splitModelName` **之后**（否则拿不到 `providerId`），
+   * 且仍在所有真正的转发分支**之前**（buddy 主路径、provider 路径、聚合路径）。
+   */
+  /**
+   * 上下文裁剪上限（全局默认值）。
+   *
+   * ## 🔴 为什么裁剪挪到了「选号之后」（2026-10-22，按账号配置）
+   *
+   * 用户要求「每个账号不同设置」⇒ 上限是**按账号**的（`safetyOverride.maxContextMessages`），
+   * 而账号要选号之后才知道。原来在选号**之前**裁一次，就永远只能用全局值。
+   *
+   * 现在：选号后由 `rebuildPreparedForLimit` 按该账号的实际上限重新裁剪。
+   * `maxContextMessages` 仍保留在这里作为**全局默认**（未覆盖的账号直接用它）。
+   *
+   * ⚠️ 裁剪仍然**只对 workbuddy 生效**（下面 `trimAllowed` 判定）：
+   * 它来自封号复盘的「伪装成官方客户端」，而 qodercn 等用自家凭据无需伪装 ——
+   * 给它们裁只会白白损坏请求（实测 agent 会话 1767 → 301 条）。
+   */
+  const maxContextMessages = safety.maxContextMessages
+
+  // WorkBuddy 两个渠道的上游模型 id 全是小写（`deepseek-v4.1-flash`、`glm-5.3` …），
+  // 客户端手填的 `Workbuddy/DeepSeek-v4.1-Flash` 若原样上送会 11102 ⇒ 被记 6 小时模型冷却。
+  // 其他供应商的 id 可能区分大小写，不动。
+  const model = providerId === 'buddy' || providerId === 'workbuddy' ? routed.model.toLowerCase() : routed.model
 
   // ⚠️ **读客户端要的是流式还是非流式**（实测踩到的严重缺陷）。
   //
@@ -607,8 +1043,50 @@ export async function handleChatCompletions(
 
   // 非 WorkBuddy 的供应商走独立的 Provider 接口（协议差异极大，
   // 不能把分支塞进下面这段 WorkBuddy 专用逻辑里）。
+  /**
+   * 🔴 **逐模型「停用」必须在直连路径也生效**（2026-10-21 审查补，重复实现专项）。
+   *
+   * 「供应商级」关闭上面已经两路都拦了；但**模型级**此前只在 `/v1/models`
+   * 目录与 `aggregate` 聚合路径过滤（`filterDisabledCandidates`）。
+   * 于是：面板里关掉的烧钱模型，目录里消失、`aggregate/auto` 也剔除它，
+   * 但客户端直接写 `qodercn/dfmodel`（或裸名）**照样打通、照样扣额度**。
+   *
+   * 就是上面那段注释的原话 ——「只在 `/v1/models` 里过滤是不够的 …… 那会让
+   * 『我明明关了它』变成一句空话」—— 只是这句当时没对模型级执行。
+   */
+  /**
+   * ⚠️ `auto` 是**网关自己的别名**（"不指定模型，用默认的"），不是供应商的真实模型 id。
+   *
+   * 停用列表里可能存在一条陈旧的 `auto`（历史目录里曾有过同名模型），
+   * 若一并拦掉，会把 `buddy/auto` 这个**默认入口**打成 403 ——
+   * 实测就踩到了：上线后 `buddy/auto` 立刻从 200 变成
+   * `模型「auto」已被停用`，而 `/v1/models` 里根本不存在 `buddy/auto`。
+   *
+   * 与 `aggregate/auto` 的处理保持一致：别名不受「停用」约束。
+   */
+  const isAutoAlias = model.toLowerCase() === 'auto'
+  try {
+    const poolForModelGate = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const disabledModels = isAutoAlias ? [] : await poolForModelGate.getDisabledModels(providerId)
+    if (disabledModels.length > 0) {
+      const lowered = model.toLowerCase()
+      if (disabledModels.some((m) => m.toLowerCase() === lowered)) {
+        return {
+          response: jsonError(
+            403,
+            `模型「${model}」已被你在面板中停用。如需使用，请在「模型」页重新启用。`,
+            'model_disabled',
+          ),
+        }
+      }
+    }
+  } catch (error) {
+    // 读不到停用列表就按「没停用」处理：这是展示/省钱用的闸门，不该把请求卡死。
+    console.warn(`[model-disabled] 读 ${providerId} 的停用模型失败，按「未停用」放行：`, error)
+  }
+
   if (providerId !== DEFAULT_PROVIDER) {
-    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey, subkey, rotateBudget })
+    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey })
   }
 
   // ⚠️ **必须把请求体里的 model 改写成去前缀的裸名**（实测踩到的真实缺陷，
@@ -637,12 +1115,72 @@ export async function handleChatCompletions(
     }
   }
 
+  /**
+   * 按某个「上下文上限」重建请求体（用于**按账号**的裁剪上限）。
+   *
+   * ## 🔴 为什么需要它（2026-10-22，按账号配置）
+   *
+   * 裁剪上限现在是**按账号**的，而账号要**选号之后**才知道 ⇒
+   * 同一个请求换号重试时，可能需要用**不同的**裁剪上限重新序列化。
+   *
+   * ⚠️ 只在「该账号的上限**严于**已用的上限」时才重建 —— 否则等于把
+   * 已经裁好的再裁一遍（幂等但白费 CPU），或在放宽时**无法还原**已丢的消息
+   *（裁剪是有损的，放宽只能从原始 `upstreamBody` 重来）。
+   * 故重建时**始终从 `upstreamBody` 出发**，不在上一次结果上叠加。
+   *
+   * @param limit `0` = 不裁剪。
+   * @returns 序列化后的 body；序列化失败返回 `undefined`（调用方按原样继续）。
+   */
+  const rebuildPreparedForLimit = (limit: number, provider: string): string | undefined => {
+    // ⚠️ 裁剪**只对 workbuddy 生效**（与下方 `trimAllowed` 判据同源，勿分叉）。
+    // 其它供应商直接用原始体：它们用自家官方凭据，无需伪装，
+    // 裁剪只会白白损坏请求（实测 agent 会话 1767 → 301 条）。
+    const trimAllowed = provider === 'workbuddy'
+    if (!trimAllowed || limit <= 0) {
+      // 不裁剪：直接用未裁剪的原始体重新序列化（比 `prepared` 更完整）。
+      try {
+        return sanitizeChatBody(prepareChatBody(upstreamBody).body)
+      } catch {
+        return undefined
+      }
+    }
+    if (upstreamBody === null || typeof upstreamBody !== 'object' || Array.isArray(upstreamBody)) {
+      return prepared
+    }
+    const withMessages = upstreamBody as Record<string, unknown>
+    if (!Array.isArray(withMessages.messages)) return prepared
+    const beforeTrim = withMessages.messages as unknown[]
+    const trimmed = trimMessagesByLimit(beforeTrim, limit)
+    if (trimmed.messages === beforeTrim) return prepared
+    try {
+      // ⚠️ 隐私红线：**不打任何消息内容**，只打条数与模型名。
+      console.log(
+        `[context-trim] 按账号上限重新压缩：${beforeTrim.length} 条 → ${trimmed.messages.length} 条`
+          + `（省略更早 ${trimmed.dropped} 条）limit=${limit} model=${rawModel}`,
+      )
+      return sanitizeChatBody(
+        prepareChatBody({ ...withMessages, messages: trimmed.messages }).body,
+      )
+    } catch {
+      return prepared
+    }
+  }
+
   const bases = resolveUpstream(env)
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
 
   // ⚠️ `tried` 必须**跨重试保留**，否则会在两个账号之间无限来回
   // （Go 侧 account-pool.ts:905-914 记录过这个缺陷）。
   const tried: string[] = []
+  /**
+   * 已经应用到当前 `prepared` / `effectivePrepared` 上的上下文上限（0 = 未裁剪）。
+   *
+   * ⚠️ 跨重试保留：换号后新账号上限若**不小于**它，就不必重算 ——
+   * 裁剪是单调的（更宽的上限对同一批消息不裁或少裁），重算只会白花 CPU。
+   */
+  let appliedLimit = 0
+  // 请求级开始时刻（用于失败用量的 `ms`，见 `recordRequestFailure`）。
+  const requestStartedAt = Date.now()
   let lastError: { status: number; message: string; kind: string } | undefined
 
   // ⚠️ IP 级 WAF 拦截的**前置检查**：激活期内直接失败，**连一个号都不试**。
@@ -658,6 +1196,29 @@ export async function handleChatCompletions(
     }
   }
 
+  // ⚠️ **账号级限制波次**的前置检查（与上面 IP 级并列、判据不同）。
+  // 依据 workbuddy2api-hub #425：短时间内多个账号被 11140 标记 ⇒ 上游正在对这批号
+  // 做风控，继续送号只会让更多号进标记（社区红线「看到 11140 立即停手」）。
+  // 期间**一个上游请求都不发**，直接返回可读原因。
+  // ⚠️ **先判方法存在**再调用：波次暂停是保护措施，不是请求前置条件。
+  // 读不到状态（测试替身缺该方法 / 老 DO 未升级）时应放行请求，
+  // 而不是让整条 chat 路径崩掉 —— 保护措施本身不能成为新的故障点。
+  // 注意不能只靠 `.catch()`：方法**不存在**时是同步 TypeError，promise 链接不住。
+  const gateProbe = (pool as { restrictionGateActive?: (now: number) => Promise<boolean> })
+  const restrictionPaused =
+    typeof gateProbe.restrictionGateActive === 'function'
+      ? await gateProbe.restrictionGateActive(Date.now()).catch(() => false)
+      : false
+  if (restrictionPaused) {
+    return {
+      response: jsonError(
+        429,
+        '多个账号近期被上游风控限制（11140 账号存在异常行为），已暂停该区域派发以避免更多账号被牵连。稍后自动恢复；如确认是误判可在面板解冻。',
+        'restriction_wave',
+      ),
+    }
+  }
+
   // ⚠️ **会话/轮级 id 在重试循环外算一次**（实测语义）。
   //
   // 官方客户端：`X-Conversation-ID` 在同一对话里恒定，`X-Conversation-Request-ID`
@@ -665,9 +1226,88 @@ export async function handleChatCompletions(
   // 放在循环内会让每次重试都变成「另一个会话 / 另一轮」，正是上游画像里最显眼的
   // 非人类特征。
   const turnRequestId = newTurnRequestId()
-  let conversationId = sessionKey === '' ? crypto.randomUUID() : ''
+  /**
+   * `X-Conversation-ID` 的**当前值**与**它属于哪个账号**（2026-10-21 审查补，M3 指出高危）。
+   *
+   * ## 原缺陷：注释与实现相反
+   * 下面（`:1167`）的注释明写「`X-Conversation-ID` 按「账号 + 会话」派生：
+   * 换号**必须**换 id（同一段会话 id 发给两个账号就是跨账号关联键）」，
+   * 但实现是 `if (conversationId === '') { … }` —— 只在**第一次**算，
+   * 之后换号**永远复用**同一个 id。**注释描述了意图，代码做了相反的事。**
+   *
+   * 更糟的是 `sessionKey === ''` 时原来直接 `crypto.randomUUID()` 一次，
+   * 于是「无会话」的请求在整个重试链路上共用**一个随机 id**，同样构成关联键。
+   *
+   * ## 为什么要记 owner
+   * 只判 `=== ''` 无法区分「没算过」与「算过但属于别的账号」。
+   * 用 `conversationIdOwner` 显式记住归属，账号一变就重算 ——
+   * 同一账号的多次重试仍复用同一 id（客户端在同一次发送里重试是正常的）。
+   */
+  let conversationId = ''
+  let conversationIdOwner = ''
+  const pinnedHeader = requestedAccount(request)
+  const maxRotate = await maxRotateFor(pool)
 
-  for (let attempt = 0; attempt <= rotateBudget; attempt += 1) {
+  /**
+   * 本 provider 在当前 realm 有多少个**可参与轮换**的账号（循环外探一次）。
+   *
+   * 用途见下方 `deferSoft`：池里只有 1 个号时，软冷却 = 掐断唯一路径。
+   *
+   * ⚠️ 探测失败按「多账号」处理（`0` ⇒ 不禁用延迟，即保持原有立即记账行为）：
+   * 读不到池大小时**不应该**放宽记账纪律 —— 那会让真正的限流被漏记。
+   * 宁可偶发误冷却，也不要让限流失去约束。
+   */
+  let poolSize = 0
+  try {
+    const all = await pool.listAccounts(realm, Date.now())
+    poolSize = all.filter(
+      (a) => (a.provider ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER && a.disabled !== true,
+    ).length
+  } catch {
+    poolSize = 0
+  }
+
+  // ⚠️ **延迟记账收件箱**（借鉴 qoder2api-hub #65 的 blame 机制）。
+  //
+  // 只有「**换号后成功了**」才能证明问题出在之前那个账号上；若所有号都以同样方式
+  // 失败，更可能是上游整体故障 / 本机断网，此时给每个号都记一次失败会造成
+  // **连锁熔断**：每个请求遍历 N 个号 ⇒ 各记 1 次 ⇒ 3 个请求后全池 breaker 30 分钟，
+  // 而熔断期内没有成功请求来复位计数，网络恢复后号池仍然不可用。
+  //
+  // 因此只对「会累加失败计数」的维度（breaker / degrade）延迟记账；
+  // restricted（上游明确标记）、model（模型级）、soft（限流）等**仍然立即记** ——
+  // 它们都有明确的上游证据，不是「靠换号成功才反推」的推测。
+  const blame: BlameEntry[] = []
+
+  /**
+   * ⚠️ **单账号池的 soft 冷却必须延迟**（2026-10-21 实测踩到）。
+   *
+   * ## 症状（用户报）
+   * 「审查的时候会被误判打断」—— 一次瞬时抖动就让 qodercn（**只有 1 个账号**）
+   * 进 60 秒软冷却，期间所有请求回 503「1 个账号都在冷却中，约 1 分钟后恢复」。
+   * 而账号本身完全健康（实测 successCount 1556、errTotal 仅 9，
+   * 并发 5 连发 + 长上下文并发全部 200）。
+   *
+   * ## 为什么上面的注释「soft 有明确上游证据，立即记」在这情况下站不住
+   * 那个理由对**多账号池**成立：罚了 A 还能用 B，代价可控。
+   * 但池里只有 1 个账号时，「立即记」= **立即把唯一可用路径掐断 60 秒**。
+   * 而此时根本没有别的号可换，冷却换不来任何好处，只有中断。
+   *
+   * ## 判据：**真实的池大小**，不是 `tried.length`
+   *
+   * ⚠️ 第一版我写成 `tried.length <= 1`，那是错的：`tried.push` 发生在错误处理
+   * **之前**，所以「多账号池的第一个号失败」时 `tried.length` 也是 1 ——
+   * 会把它误判成单账号池，从而漏记真正的限流。
+   * 故改成循环外探一次 `poolSize`（只数未停用的同 provider 账号）。
+   *
+   * 只有 `poolSize === 1` 才延迟：**只有后续真的换号成功才记账**，
+   * 全失败则丢弃（与 breaker/degrade 同一套纪律）。
+   * `poolSize === 0`（探测失败或有 0 个可用）**不启用**延迟 ——
+   * 读不到就按原纪律走，宁可偶发误冷却，也不让限流失去约束。
+   */
+  const deferSoft = (): boolean => poolSize === 1
+
+  for (let attempt = 0; attempt <= maxRotate; attempt += 1) {
     const now = Date.now()
     // ⚠️ 限定默认供应商：池里可能同时有 cline 等家的账号，
     // 拿它们的凭据去打 WorkBuddy 端点必然 401（看起来像「凭据坏了」）。
@@ -677,9 +1317,79 @@ export async function handleChatCompletions(
     const candidate = await pickCandidate(
       pool, realm, model, tried, now, DEFAULT_PROVIDER,
       buddyPreferred === undefined ? '' : buddyPreferred,
+      pinnedHeader,
     )
+    // ── 只用指定账号但它不可用：直接报它的原因（不换号、不跨渠道容灾）──
+    if (candidate !== undefined && 'pinBlocked' in candidate) {
+      // ⚠️ **早退出口也要丢弃 blame**（S11）：指定账号在本次请求里已经失败过
+      //（`lastError` 有值即证明），那些失败挂在这里既不结算也不打日志。
+      discardBlame(blame, '只用指定账号且它已不可用（早退，不换号）')
+      return {
+        response: jsonError(
+          lastError?.status ?? 503,
+          describePinBlocked(candidate.picked, pinnedHeader !== '', lastError?.message),
+          lastError?.kind ?? 'pinned_account_unavailable',
+        ),
+      }
+    }
     if (candidate === undefined) {
-      // ⚠️ 严格隔离：不自动跨渠道容灾，各渠道配额完全独立，严禁将国内版流量切到国际版
+      // ⚠️ 国内版（buddy）所有可用账号已尝试或全部处于限流/冷却中。
+      // 跨渠道智能容灾：如果用户配置了国际版（workbuddy）账号且**真的可选**，
+      // 自动无缝降级派发至国际版同名模型，避免直接向客户端返回 502/503。
+      //
+      // ⚠️ **只在 `failoverDepth === 0` 时触发**：否则会与 workbuddy 路径的
+      // 反向容灾形成无限相互递归（`buddy→workbuddy→buddy→…`）。
+      if (failoverDepth === 0 && model !== '') {
+        try {
+          const intlPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+          const hasIntlUsable = (await intlPool.listAccounts('global', now)).some(
+            (a) => (a.provider ?? DEFAULT_PROVIDER) === 'workbuddy' && healthyForModel(a, now, model),
+          )
+          if (hasIntlUsable) {
+            console.log(`[failover] 国内版 ${DEFAULT_PROVIDER} 全部不可用或已限流，自动无缝跨渠道容灾至国际版 workbuddy (模型: ${model})`)
+            // ⚠️ 容灾是**早退出口**（S11）：`handleProviderChat` 有它**自己的**空
+            // `blame` 收件箱，本路径挂起的失败不会跟着过去 ⇒ 必须在这里显式丢弃，
+            // 否则它们静默消失（既不结算也不打日志）。
+            discardBlame(blame, '已跨渠道容灾至国际版（blame 不移交）')
+            return await handleProviderChat({
+              providerId: 'workbuddy',
+              model,
+              wantsStream,
+              rawBody,
+              request,
+              env,
+              realm: 'global',
+              ...(ctx !== undefined ? { ctx } : {}),
+              tried: [],
+              sessionKey,
+              failoverDepth: 1,
+            })
+          }
+        } catch (failoverError) {
+          console.warn('[failover] 跨渠道容灾检查失败：', failoverError)
+        }
+      }
+
+      // 🔴 记一条**请求级失败**（否则面板成功率恒 100%，见 `recordRequestFailure`）。
+      // ⚠️ 必须在 `if` **之外**：`lastError === undefined` 的那条「池里根本没账号」
+      // 同样是失败请求，漏记会让「零账号」场景完全不出现在用量里。
+      recordRequestFailure(pool, {
+        uid: tried[tried.length - 1] ?? '',
+        model,
+        errorKind: lastError?.kind ?? 'no_available_account',
+        startedAt: requestStartedAt,
+      })
+      // ⚠️ **下面两条 return 都是早退出口**（S11），一起在这里丢弃 blame。
+      //
+      // 放在 `if` **之前**而不是各分支里：只有一条会执行（if/else），
+      // 两处各调一次会重复打日志。而第一条（`lastError !== undefined`）
+      // 正是「有 blame 却静默丢弃」的典型场景 —— 全池都失败、账号全在冷却时
+      // 走的就是它，此前一条日志都没有。
+      //
+      // ⚠️ 第二条（`lastError === undefined`）此时 blame **必然为空**
+      //（没有失败就没有 `lastError`，而 `blame.push` 与 `lastError` 赋值同块发生），
+      // 故它不会产生日志；保留同一次调用只是为了不让「出口 → 丢弃」这条规则出现例外。
+      discardBlame(blame, '没有可用账号（所有候选都已尝试或全在冷却/禁用）')
       // 没有可用账号了：若之前有过失败，报最后一次的真实原因（更有信息量）
       if (lastError !== undefined) {
         return {
@@ -689,7 +1399,13 @@ export async function handleChatCompletions(
       return {
         response: jsonError(
           503,
-          '没有可用账号（请先登录/导入凭据；若已导入，检查是否全部处于冷却或禁用状态）',
+          // ⚠️ **必须与 provider 路径同源**（2026-10-22 实测）。
+          // 原来这里是一句写死的「请先登录/导入凭据；检查是否全部处于冷却或禁用状态」，
+          // 与 `describeNoAccount` 构成**两份判据**，且这一份把
+          // 「只是某个模型在冷却」也说成「没账号」，比 provider 路径那句更误导
+          // （用户会去重新导入一份完全有效的凭据）。
+          // ⇒ 同一个语义只能有一份实现。
+          await describeNoAccount(env, realm, DEFAULT_PROVIDER, model),
           'no_available_account',
         ),
       }
@@ -697,19 +1413,101 @@ export async function handleChatCompletions(
     tried.push(candidate.uid)
     console.log(`[pick:buddy] 选中账号 uid=${candidate.uid} nickname=${candidate.credential.nickname || ''} tried=${tried.length}`)
 
-    // ⚠️ `X-Conversation-ID` 按「账号 + 会话」派生：换号**必须**换 id
-    //（同一段会话 id 发给两个账号就是跨账号关联键）。
-    if (conversationId === '') {
-      conversationId = await deriveIntlConversationId(candidate.uid, sessionKey)
+    /**
+     * ── 该账号实际生效的防封配置 ──
+     *
+     * 用户 2026-10-22 要求「每个账号不同设置」。全局值来自面板的「防封」分区，
+     * 账号级覆盖存在 `AccountState.safetyOverride` 里，由 `resolveSafetyFor` 合并。
+     *
+     * ⚠️ 合并**只能有这一个实现** —— 各处自己写 `override.x ?? global.x`
+     * 就变成「同一语义多份判据」，那正是本项目最反复的缺陷类型。
+     */
+    const acctSafety = resolveSafetyFor(safety, candidate.safetyOverride)
+
+    /**
+     * 上下文裁剪：若该账号的上限**严于**全局（或全局为 0 而它有限制），
+     * 就从原始体重新裁剪序列化。
+     *
+     * ⚠️ 裁剪是**有损**的，故重算永远从 `upstreamBody` 出发
+     * （见 `rebuildPreparedForLimit` 的说明），不在已裁过的结果上叠加。
+     * ⚠️ 放宽（账号上限 > 全局）**不重算**：已丢的消息找不回来，
+     * 白跑一遍 prepareChatBody 只是浪费 CPU。
+     */
+    // `prepared` 是**未裁剪**的原始序列化结果（裁剪已挪到这里，选号之后）。
+    // 故只要该账号的上限 > 0 且是 workbuddy，就需要裁一次。
+    // ⚠️ 换号重试时 `appliedLimit` 会记录已用过的上限：若新账号的上限**不小于**
+    // 已用过的，就不必重算（裁剪是单调的，更宽的上限结果与未裁剪等价）。
+    let effectivePrepared = prepared
+    if (acctSafety.maxContextMessages > 0
+      && (appliedLimit === 0 || acctSafety.maxContextMessages < appliedLimit)) {
+      const rebuilt = rebuildPreparedForLimit(acctSafety.maxContextMessages, providerId)
+      if (rebuilt !== undefined) {
+        effectivePrepared = rebuilt
+        appliedLimit = acctSafety.maxContextMessages
+      }
     }
 
-    // ② 构造出站请求
+    // ⚠️ `X-Conversation-ID` 按「账号 + 会话」派生：换号**必须**换 id
+    //（同一段会话 id 发给两个账号就是跨账号关联键）。
+    //
+    // 🔴 判据是「**归属账号变了**」，不是「还没算过」（2026-10-21 审查补，M3 指出）。
+    // 原来写成 `if (conversationId === '')`，于是：
+    //   - 有会话：只在第一个账号身上算一次，之后换号全程复用 ⇒ 跨账号关联键；
+    //   - 无会话：整个重试链路共用一个 `randomUUID()` ⇒ 同样是关联键。
+    if (conversationIdOwner !== candidate.uid) {
+      conversationId = sessionKey === ''
+        ? crypto.randomUUID()
+        : await deriveIntlConversationId(candidate.uid, sessionKey)
+      conversationIdOwner = candidate.uid
+    }
+
+    /**
+     * ② 构造出站请求
+     *
+     * 🔴 **设备标识必须真的发出去**（2026-10-22 审查，A7）。
+     *
+     * 原来这两行算了 `machineId` / `sessionId` 之后**再也没用过** ——
+     * 纯死变量：值算出来就扔，`referenceChatHeaders` 根本没收到它们。
+     *
+     * 后果是同一账号在两个端点上呈现成**两台不同设备**：
+     * - `listModels()`（`/v3/config`）走 `cliChatHeaders`，发的是
+     *   `deriveDeviceId()` 派生的 **36 位 hex**；
+     * - `chat`（`/v2/chat/completions`）走 `referenceChatHeaders`，
+     *   国内版**一个都不发**，国际版发的是 `deriveUuidLike()` 的 **UUID 形态**。
+     *
+     * 对上游风控来说这是「一个账号、两台机器、三种身份」——
+     * 而 `intlDeviceHeaders` 的注释早就写明「缺 `X-Machine-ID` 会回 14003 Model busy」，
+     * 等于我们自己把那条已验证的结论只用在一条路径上（又一次「只修一半」）。
+     *
+     * ⚠️ 形态统一为 **36 位 hex**（`/v3/config` 已在用、且是 `desktop.go:51-53` 的原口径）。
+     * `deriveUuidLike` 的 UUID 形态是「国际服抓包长这样」的推断，没有版本锚点；
+     * 而 36-hex 有明确的参考实现出处，故以它为准。
+     */
     const machineId = await deriveDeviceId(candidate.uid, 'machine')
     const sessionId = await deriveDeviceId(candidate.uid, 'session')
     const conversationRequestId = crypto.randomUUID().replaceAll('-', '')
 
     let upstream: Response
     try {
+      /**
+       * 🔴 **防封节奏也必须在这里做**（2026-10-21 审查补，M3 指出高危）。
+       *
+       * `throttleUpstream` 此前**只**接在 provider 分支（`2198` / `2220`），
+       * buddy 主分支完全没接 ⇒ 面板「防封」分区里的**节奏/抖动开关对 buddy 静默无效**。
+       *
+       * 而 buddy 恰恰是默认 provider（`DEFAULT_PROVIDER`），也就是**主要流量路径**。
+       * ⇒ 用户打开「防封节奏」以为在保护账号，实际只有带前缀模型生效。
+       * 这是本项目「配置只在一处生效」模式的又一次复现。
+       */
+      // ⚠️ 只对 workbuddy（国际版）加节奏 —— 那是需要伪装的上游，见 throttle.ts 的说明。
+      await throttleUpstream(
+        candidate.uid,
+        undefined,
+        undefined,
+        DEFAULT_PROVIDER === 'workbuddy' ? 'workbuddy' : 'buddy',
+        // ⚠️ 按账号的限速/抖动参数（用户要求每个账号不同设置）。
+        { qps: acctSafety.rateLimitQps, jitterMs: acctSafety.rateJitterMs },
+      )
       upstream = await fetch(`${bases.chat}/v2/chat/completions`, {
         method: 'POST',
         // ⚠️ 与 provider 路径用**同一套**参考实现口径的头（见 referenceChatHeaders）。
@@ -723,8 +1521,13 @@ export async function handleChatCompletions(
           // 两者都在重试循环**第 0 轮**算一次（见函数开头的说明）。
           conversationId,
           turnRequestId,
+          // ⚠️ 与 `/v3/config` 同源（同一账号 ⇒ 同一台设备），见上面的说明。
+          machineId,
+          sessionId,
+          // ⚠️ 按账号的会话链（b3 三件套）开关（用户要求每个账号不同设置）。
+          sessionTrace: acctSafety.sessionTrace,
         }),
-        body: prepared,
+        body: effectivePrepared,
         signal: request.signal,
       })
     } catch (error) {
@@ -740,6 +1543,35 @@ export async function handleChatCompletions(
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '')
       const { kind, msg } = classify(upstream.status, text)
+      /**
+       * 上游原文诊断开关（`QODER_DEBUG_UPSTREAM=1`）。
+       *
+       * ⚠️ 保留而不是用完就删：这次排查「11140 到底是不是真封号」全靠它 ——
+       * 只有拿到 `http=403 code=11140 displayMsg:"account has been restricted"`
+       * 的**原始字节**，才能区分「真·账号限制」与「WAF 403 / 模型下线」这两种
+       * 完全不同的处置。之前正是因为看不到原文，把模型下线误判成封号。
+       * 默认关闭（正文可能含用户内容），排障时打开。
+       */
+      /**
+       * ⚠️ **`waf_blocked` 无条件留证**（2026-10-21 加，这是排查误判的关键）。
+       *
+       * 数据库里存到的真实 reason 是：
+       *   `waf_blocked: WAF blocked (403 without business envelope)`
+       * 而 `waf_blocked` 的处置是 `punish: true, dimension: 'soft'` ⇒ **账号级软冷却**。
+       * 也就是说：只要上游回一个「403 且解析不出业务信封」，该账号就会被冷却 60 秒，
+       * 单账号池下等于整条链路中断 —— 而**我们从来没记录过那个 403 的原文**，
+       * 导致反复误判却无从定位。
+       *
+       * 该分支默认开启（不依赖环境变量）：它是**误判的唯一证据来源**，
+       * 而 WAF 403 本身应是低频事件，不会刷屏。
+       */
+      if (kind === 'waf_blocked') {
+        console.warn(
+          `[waf-403] model=${model} http=${upstream.status} len=${text.length} body=${text.slice(0, 500)}`,
+        )
+      } else if ((globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.UPSTREAM_DEBUG === '1') {
+        console.warn(`[upstream] http=${upstream.status} kind=${kind} body=${text.slice(0, 300)}`)
+      }
       const mapped = mapErrorToPunishment(kind)
       const { dimension, resetAt } = refineModelScoped(kind, text)
 
@@ -747,6 +1579,15 @@ export async function handleChatCompletions(
       // ① 账号级软冷却（下方 applyFailure）—— 让这个号暂时别用；
       // ② **IP 级判定**（noteWaf）—— 若短窗内多个不同号都命中，说明是出口 IP 被拦，
       //    此时继续轮转毫无意义（撞的是同一堵墙），必须 fail-fast。
+      // ②-b **账号级限制波次判定**（noteRestriction）—— 与上面的 IP 级并列。
+      //     短窗内多个不同号被 11140 标记 ⇒ 上游正在对这一批号做风控，
+      //     继续送号会让更多号被牵连（workbuddy2api-hub #425）。
+      //     ⚠️ 与 `waf_blocked` 分开判：11128 是渠道指纹（不罚号），
+      //     11140 是账号级限制（罚号），两者混判会让处置互相串味。
+      if (kind === 'request_illegal') {
+        await pool.noteRestriction(candidate.uid, Date.now()).catch(() => false)
+      }
+
       if (kind === 'waf_blocked') {
         const ipBlocked = await pool.noteWaf(candidate.uid, Date.now()).catch(() => false)
         if (ipBlocked) {
@@ -761,10 +1602,27 @@ export async function handleChatCompletions(
 
       // 记账（按类别落到正确维度）
       if (mapped.punish) {
+        const cause = modelCauseFor(kind)
+        const punishKind =
+          kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension
+        // 累加失败的维度延迟到「换号成功」时再记（见 blame 的注释）。
+        // ⚠️ `soft` 在**单账号池**下也要延迟：池里只有一个号时，立即冷却
+        // 等于立即掐断唯一路径 60 秒，而冷却换不来任何好处（见 deferSoft）。
+        //
+        // ⚠️ 延迟记账**也必须带上 `resetAt`**：下面「立即结算」那条分支传了它，
+        // 若这里不传，同一个 429 只因走了延迟就丢掉上游墙钟（见 `BlameEntry`）。
+        if (punishKind === 'breaker' || punishKind === 'degrade' || (punishKind === 'soft' && deferSoft())) {
+          blame.push({
+            uid: candidate.uid,
+            kind: punishKind,
+            reason: `${kind}: ${msg}`.slice(0, 200),
+            ...(resetAt !== undefined ? { resetAt } : {}),
+          })
+        } else {
         await pool
           .applyFailure({
             uid: candidate.uid,
-            kind: kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension,
+            kind: punishKind,
             now: Date.now(),
             ...(model !== '' ? { model } : {}),
             // ⚠️ 带上上游给的重置时刻（文案里的 `reset at … UTC+8`）。
@@ -772,16 +1630,25 @@ export async function handleChatCompletions(
             // 猜早了会继续撞限流，猜晚了白白少用几小时。
             ...(resetAt !== undefined ? { resetAt } : {}),
             ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
+            // 结构化成因：不靠文案反推（见 modelCauseFor 的注释）
+            ...(cause !== undefined ? { modelCause: cause } : {}),
           })
-          .catch(() => {
-            // 记账失败不该让回复失败：这是可观测性问题，不是正确性问题
+          .catch((error: unknown) => {
+            // 记账失败不该让回复失败：这是可观测性问题，不是正确性问题。
+            // ⚠️ 但**不能完全静默** —— 此前这里是空 catch，导致「restricted 维度
+            // 没被 DO 接受」这类问题只表现为「罚了却看不出罚」，线上排查极难。
+            console.warn(
+              `[punish] applyFailure 失败 uid=${candidate.uid} kind=${punishKind}: ` +
+                (error instanceof Error ? error.message : String(error)),
+            )
           })
+        }
       }
 
       lastError = {
         // ⚠️ 不原样透传上游状态码：400 会让客户端误以为「是我请求写错了」。
         status: clientStatusFor(upstream.status, kind),
-        message: `${kind}: ${msg || text.slice(0, 160)}`,
+        message: `${kind}: ${msg || text.slice(0, 160)}${kind === 'channel_blocked' ? CHANNEL_BLOCKED_HINT : ''}`,
         kind,
       }
 
@@ -812,25 +1679,57 @@ export async function handleChatCompletions(
       const { kind, msg } = classify(200, errText)
       const mapped = mapErrorToPunishment(kind)
       const { dimension, resetAt } = refineModelScoped(kind, errText)
+      /**
+       * 🔴 **流内错误诊断**（`UPSTREAM_DEBUG=1` 开启）。
+       *
+       * ⚠️ 此前诊断开关只覆盖 `!upstream.ok`（非 2xx）分支，而**这条路径是
+       * HTTP 200 但流里藏错误帧** —— qoder / codearts 等上游都用这种形态。
+       * 结果：用户报「误判进冷却」时，日志里**一条记录都没有**，只能猜。
+       *
+       * 这条日志记录「真实的分类结果」——它是判断「我们是否误判」的**唯一依据**：
+       * 若 kind 是 rate_limited 但上游原文其实是别的，就是误判。
+       */
+      if ((globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.UPSTREAM_DEBUG === '1') {
+        console.warn(
+          `[stream-error] model=${model} kind=${kind} dim=${dimension} punish=${mapped.punish} ` +
+            `resetAt=${resetAt ?? '-'} text=${errText.slice(0, 300)}`,
+        )
+      }
 
       if (mapped.punish) {
-        await pool
-          .applyFailure({
+        const cause = modelCauseFor(kind)
+        const punishKind =
+          kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension
+        // ⚠️ 与 buddy 路径同一套纪律：累加型维度 + 单账号池的 soft 都延迟记账，
+        // 只有「换号后成功」才落账；全失败则丢弃（见上方 blame 的说明）。
+        // ⚠️ `resetAt` 同样要带进收件箱（见 `BlameEntry`）：下面立即结算那条传了它。
+        if (punishKind === 'breaker' || punishKind === 'degrade' || (punishKind === 'soft' && deferSoft())) {
+          blame.push({
             uid: candidate.uid,
-            kind: kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension,
-            now: Date.now(),
-            ...(model !== '' ? { model } : {}),
+            kind: punishKind,
+            reason: `${kind}: ${msg}`.slice(0, 200),
             ...(resetAt !== undefined ? { resetAt } : {}),
-            ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
           })
-          .catch(() => {})
+        } else {
+          await pool
+            .applyFailure({
+              uid: candidate.uid,
+              kind: punishKind,
+              now: Date.now(),
+              ...(model !== '' ? { model } : {}),
+              ...(resetAt !== undefined ? { resetAt } : {}),
+              ...(msg !== '' ? { reason: `${kind}: ${msg}`.slice(0, 200) } : {}),
+              ...(cause !== undefined ? { modelCause: cause } : {}),
+            })
+            .catch(logPoolError('applyFailure'))
+        }
       }
 
       clearSessionBinding(pool, sessionKey, ctx)
 
       lastError = {
         status: clientStatusFor(200, kind),
-        message: `${kind}: ${msg || errText.slice(0, 160)}`,
+        message: `${kind}: ${msg || errText.slice(0, 160)}${kind === 'channel_blocked' ? CHANNEL_BLOCKED_HINT : ''}`,
         kind,
       }
 
@@ -849,21 +1748,94 @@ export async function handleChatCompletions(
     }
 
     const startedAt = Date.now()
+
+    // **零输出越墙熔断**（buddy 路径，与 provider 路径同一份判据 ——
+    // 见 `zero-output.ts` 文件头：同一语义不得两套实现）。
+    //
+    // ⚠️ buddy/workbuddy 是**默认供应商**，绝大多数流量走这里；若只在
+    // provider 路径接守卫，越墙熔断对主力渠道等于不存在。
+    const screenedBuddy = await screenZeroOutputStream(peeked.stream, {
+      // 客户端主动取消 ⇒ 一律不改道（本项目的既有纪律）
+      isCancelled: () => request.signal.aborted,
+    })
+    if (screenedBuddy.hit) {
+      // ⚠️ 罚**模型维度**（`kind:'model'`）：越墙是「这个目标此刻的输入被拒」，
+      // 不是账号坏了。绝不能升成 `breaker`（3 次熔断账号 30 分钟，误杀健康号）。
+      await pool
+        .applyFailure({
+          uid: candidate.uid,
+          kind: 'model',
+          now: Date.now(),
+          ...(model !== '' ? { model } : {}),
+          // 显式给 `resetAt`：不走「11102 无此模型」那条 6h 指数退避
+          resetAt: Date.now() + ZERO_OUTPUT_COOLDOWN_MS,
+          reason: `buddy/${model} zero-output (finish_reason=length, ${screenedBuddy.probe.frames}f)`,
+        })
+        .catch(logPoolError('applyFailure'))
+
+      // ⚠️ §7.2「失败必须显式」：改道必须留痕（日志 + 面板日志双写）
+      console.warn(`[zero-output] ${describeZeroOutputHit(DEFAULT_PROVIDER, model, screenedBuddy.probe)} uid=${candidate.uid}`)
+      recordLog(
+        pool,
+        {
+          type: 'error',
+          model: `buddy/${model}`,
+          provider: 'buddy',
+          uid: candidate.uid,
+          status: 502,
+          durationMs: Date.now() - startedAt,
+          error: `零输出越墙，已冷却该目标并改道（finish_reason=length，0 输出，${screenedBuddy.probe.frames} 帧）`,
+          stream: wantsStream,
+        },
+        ctx,
+      )
+
+      clearSessionBinding(pool, sessionKey, ctx)
+      lastError = {
+        status: 502,
+        message: describeZeroOutputHit(DEFAULT_PROVIDER, model, screenedBuddy.probe),
+        kind: 'upstream_error',
+      }
+      continue // 改道下一个候选重发（什么都没产出，没有内容可丢）
+    }
+
     return {
-      response: await streamResponse(peeked.stream, {
+      response: await streamResponse(screenedBuddy.stream, {
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
           // 首帧到达即算成功（清熔断/降权）
-          const okTask = pool.noteSuccess(candidate.uid, Date.now()).catch(() => {})
+          const okTask = pool.noteSuccess(candidate.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
           if (ctx !== undefined) ctx.waitUntil(okTask)
           else void okTask
+          // ✅ **结算 blame**：这个号成功了 ⇒ 之前那些失败确实是那几个号的问题，
+          // 现在才记账（见 blame 的注释：全池同样失败时不记账，避免连锁熔断）。
+          const settle = settleBlame(pool, blame, Date.now())
+          if (ctx !== undefined) ctx.waitUntil(settle)
+          else void settle
+          /**
+           * 🔴 **会话粘性必须在主成功路径也绑定**（2026-10-21 审查补，M3 指出高危）。
+           *
+           * `bindSession` 此前只在**续期重试分支**调用（`2242` / `2500`）。
+           * 而续期重试是**罕见路径** ⇒ 绝大多数请求从未建立会话粘性
+           * ⇒ 同一会话的后续轮次会落到**不同账号**。
+           *
+           * 后果有两层（都不是「功能坏了」而是「优化静默失效」）：
+           * 1. 上游 prompt cache **命中率为 0**（缓存是按账号隔离的）⇒ 更慢更贵；
+           * 2. 同一段对话在不同账号间跳，对上游是**指纹异常**
+           *   （本项目防封的核心顾虑之一）。
+           *
+           * ⇒ 首帧到达即绑定（与 provider 分支的续期分支同一时机）。
+           */
+          if (sessionKey !== '' && ctx !== undefined) {
+            ctx.waitUntil(pool.bindSession(sessionKey, candidate.uid, Date.now()).catch(logPoolError('bindSession')))
+          }
         },
         onFinish: (usage) => {
           // 记账用量（面板的「用量」视图靠它）
           //
-          // ⚠️ 这里**不能**静默吞错误：第一版写成 `.catch(() => {})`，
+          // ⚠️ 这里**不能**静默吞错误：第一版写成 `.catch(logPoolError('noteSuccess'))`，
           // 结果线上「对话成功但用量恒为 0」，且没有任何日志可查
           // （正是本项目一直在警告的「静默失败」形态）。
           const record = {
@@ -875,6 +1847,8 @@ export async function handleChatCompletions(
             ok: true,
             ms: Date.now() - startedAt,
           }
+          // 🔴 子密钥的 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
+          settleSubkeyUsage(ctx, env, record.input, record.output, record.model)
           const task = pool.recordUsage(record).catch((error: unknown) => {
             console.error(
               '[usage] 记录用量失败：',
@@ -884,13 +1858,6 @@ export async function handleChatCompletions(
           // ⚠️ 必须 waitUntil：否则响应流结束的瞬间这个 promise 会被取消
           if (ctx !== undefined) ctx.waitUntil(task)
           else void task
-
-          // 子密钥：补录真实 token（请求数已在放行时占过名额，这里**不再加**）
-          if (subkey !== undefined) {
-            const t = settleUsage(env, subkey.record, record.input, record.output, model, subkey.ip)
-            if (ctx !== undefined) ctx.waitUntil(t)
-            else void t
-          }
 
           recordLog(
             pool,
@@ -922,8 +1889,14 @@ export async function handleChatCompletions(
               now: Date.now(),
               reason: message.slice(0, 200),
             })
-            .catch(() => {})
+            .catch(logPoolError('applyFailure'))
 
+          // ⚠️ 流内失败也要记**用量**（否则面板成功率虚高，见 recordStreamFailure）
+          recordStreamFailure(
+            pool,
+            { uid: candidate.uid, model: `buddy/${model}`, errorKind: punishmentForStreamError(message), startedAt },
+            ctx,
+          )
           recordLog(
             pool,
             {
@@ -944,6 +1917,14 @@ export async function handleChatCompletions(
   }
 
   // 所有轮转都失败
+  // ⚠️ **丢弃 blame**：所有候选都以同样方式失败，没有「换号后成功」这个证据，
+  // 就不能断定是那几个号坏了（更可能是上游整体故障 / 本机断网）。
+  // 记账会累加 `fails`，3 次后全池熔断 30 分钟且期间无成功请求复位 ——
+  // 那会把一次上游抖动放大成半小时不可用。留日志便于事后判断。
+  //
+  // ⚠️ 丢弃逻辑统一走 `discardBlame`（S11）：函数里还有 4 个早退出口也要丢弃，
+  // 若各写一份，日志格式与「是否留痕」就会再次分叉。
+  discardBlame(blame, '全池同样失败')
   return {
     response: jsonError(
       lastError?.status ?? 502,
@@ -1002,6 +1983,8 @@ function streamResponse(
       // 上游要拒绝请求必然在开头，不可能先正常输出几万字再报错。
       // 而每帧全串扫描要 9.6ms/2 万帧 —— 直接超 10ms 配额。
       let frameSeq = 0
+      // 是否已在流内检出错误帧（检出后立刻终止整条流，见下方 break）。
+      let errorDetected = false
       // ⚠️ **有状态**转换器：首帧判断一次，之后全程沿用该决定。
       //
       // 逐帧扫描整帧字符串**必然超预算**（实测 8000 帧的单次 `includes`
@@ -1041,8 +2024,12 @@ function streamResponse(
                 if (errMsg !== undefined) {
                   hooks.onError(errMsg)
                   controller.enqueue(encoder.encode(errorFrame(errMsg)))
-                  nl = buffer.indexOf('\n', start)
-                  continue
+                  // ⚠️ 必须是 break（终止整条流），不能是 continue：
+                  // continue 只回到 while 判断，上游在 HTTP 200 下「先发错误帧、
+                  // 后续正常帧照发」时，客户端会**同时**收到 error 帧与 choices 帧，
+                  // 违反 OpenAI SSE 语义（客户端行为未定义：可能既报错又渲染内容）。
+                  errorDetected = true
+                  break
                 }
               }
               sawChunk = true
@@ -1065,11 +2052,14 @@ function streamResponse(
             }
             nl = buffer.indexOf('\n', start)
           }
+          // 检出错误帧：终止整条流，不再继续读取上游（避免 error 帧与内容帧混发）。
+          if (errorDetected) break
           buffer = start > 0 ? buffer.slice(start) : buffer
         }
 
         // 流结束但从未产生内容 → 明确报「疑似截断」，而不是假装模型没话说
-        if (!sawChunk && !sawDone) {
+        // ⚠️ 已检出错误帧时不重复报：错误已发过，再补一条会污染客户端判断。
+        if (!errorDetected && !sawChunk && !sawDone) {
           const msg = '上游流在产生任何内容前结束（疑似被截断）'
           if (!hooks.clientGone?.()) {
             hooks.onError(msg)
@@ -1078,7 +2068,7 @@ function streamResponse(
             } catch {}
           }
         }
-        if (!sawDone && !hooks.clientGone?.()) {
+        if (!errorDetected && !sawDone && !hooks.clientGone?.()) {
           try {
             controller.enqueue(encoder.encode(doneFrame()))
           } catch {}
@@ -1258,7 +2248,14 @@ async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
         const detected = detectJsonError(text)
         if (detected !== undefined) return await errorResult(detected.error, detected.cleanJson)
       } else if (candidate === 'sse' && lineStart < text.length) {
-        const detected = await detectSseLine(text.slice(lineStart))
+        // ⚠️ 只喂**第一行**给 detectSseLine：`text.slice(lineStart)` 可能含多个
+        // `data:` 帧（预读缓冲跨过帧边界就 EOF）。整段喂进去时，parseSseLine 会
+        // `slice(5)` 得到 `{...}\ndata: {...}` —— 不以 `{` 开头 ⇒ 被判成
+        // 「非预期的 SSE 数据帧」错误 ⇒ 一条**完全正常**的流在结束边界被误拦成 502。
+        const rest = text.slice(lineStart)
+        const nlIdx = rest.indexOf('\n')
+        const firstLine = nlIdx >= 0 ? rest.slice(0, nlIdx) : rest
+        const detected = await detectSseLine(firstLine)
         if (detected.error !== undefined) return await errorResult(detected.error, detected.cleanJson)
       }
       return { stream: replay() }
@@ -1329,7 +2326,7 @@ async function peekStreamForError(body: ReadableStream<Uint8Array>): Promise<{
  * ⇒ 供应商差异**全部**收敛到 `Provider` 接口（见 `src/providers/types.ts`），
  * 这里只做「选号 → 调接口 → 记账 → 换号」这件与供应商无关的事。
  */
-async function handleProviderChat(input: {
+export async function handleProviderChat(input: {
   providerId: string
   model: string
   /** 客户端是否要流式（false ⇒ 聚合成非流式 JSON）。 */
@@ -1348,14 +2345,8 @@ async function handleProviderChat(input: {
    * ⚠️ ≥1 时**不再触发**反向容灾，避免与 buddy 路径形成无限相互递归。
    */
   failoverDepth?: number
-  /** 子密钥上下文（透传下来记账用；主密钥时为 `undefined`）。 */
-  subkey?: SubkeyContext
-  /** 换号预算（由 `handleChatCompletions` 从策略配置读好后传入，避免每条候选路径各读一次）。 */
-  rotateBudget?: number
-}): Promise<GatewayResult> {
-  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey, subkey } = input
+}): Promise<GatewayResult> {  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey } = input
   const failoverDepth = input.failoverDepth ?? 0
-  const rotateBudget = input.rotateBudget ?? MAX_ROTATE
 
   const provider = findProvider(providerId)
   if (provider === undefined) {
@@ -1396,6 +2387,17 @@ async function handleProviderChat(input: {
     }
   }
 
+  // 请求头指定的账号若在另一个分片，跟着它走（否则只会报「指定账号不存在」）
+  const headerPin = requestedAccount(request)
+  if (headerPin !== '' && providerId !== 'workbuddy') {
+    const here = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(activeRealm))
+    if ((await here.getAccount(headerPin)) === undefined) {
+      const other = activeRealm === 'cn' ? 'global' : 'cn'
+      const there = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(other))
+      if ((await there.getAccount(headerPin)) !== undefined) activeRealm = other
+    }
+  }
+
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(activeRealm))
   // ⚠️ 与 WorkBuddy 路径同理：请求体里的 `model` 必须换成**去前缀**的裸名。
   // 各 provider 的 `chat()` 会把它直接放进上游请求，带前缀会被上游判为
@@ -1405,15 +2407,128 @@ async function handleProviderChat(input: {
       ? { ...(rawBody as Record<string, unknown>), model }
       : (rawBody as Record<string, unknown>)
   const tried = input.tried
-  let lastError: { status: number; message: string } | undefined
+  const requestStartedAt = Date.now()
+  let lastError: { status: number; message: string; kind?: string } | undefined
 
   // ⚠️ 会话 / 轮级 id 在重试循环**外**算一次（实测语义）：
   // `X-Conversation-Request-ID` 在一轮用户发送里恒定（重试复用），
   // 放在循环内会让每次重试都变成「另一轮」。
   const providerTurnRequestId = newTurnRequestId()
-  let providerConversationId = sessionKey === '' ? crypto.randomUUID() : ''
+  /**
+   * 与 buddy 路径的 `conversationId` **同一缺陷、同一修法**
+   *（2026-10-21 审查补，M3 指出高危）。
+   *
+   * 原来 `let providerConversationId = sessionKey === '' ? crypto.randomUUID() : ''`
+   * 配合循环内 `if (providerConversationId === '') { … }`，
+   * ⇒ 只在**第一个账号**身上算一次，之后换号全程复用
+   * ⇒ **同一段会话 id 发给多个账号 = 跨账号关联键**（防封最忌的形态之一）。
+   *
+   * 判据改为「**归属账号变了**」：用 `providerConversationIdOwner` 显式记归属。
+   */
+  let providerConversationId = ''
+  let providerConversationIdOwner = ''
+  const pinnedHeader = requestedAccount(request)
+  /** 是否被「只用指定账号」挡住（挡住时不做跨渠道容灾 —— 用户要的就是这个号）。 */
+  let pinBlocked = false
+  const maxRotate = await maxRotateFor(env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')))
 
-  for (let attempt = 0; attempt <= rotateBudget; attempt += 1) {
+  /**
+   * ⚠️ **provider 路径也要延迟记账**（2026-10-21 修，我自己上一次只修了一半）。
+   *
+   * 0.9.1 给 buddy 主循环加了 `blame` + `deferSoft`，但**漏了这条路径** ——
+   * 而 `qodercn` / `qoder` / `trae` 等**所有带前缀的模型都走这里**
+   *（`server.ts:913` 的 `if (providerId !== DEFAULT_PROVIDER)` 分流）。
+   *
+   * 后果与 buddy 路径完全相同：池里只有 1 个号时，一次瞬时抖动就让该号进 60 秒
+   * 软冷却，期间全部请求回 503「1 个账号都在冷却中」—— 用户报「审查时被打断」
+   * 的症状在修完 0.9.1 后**依然复现**，就是因为这条路径没修。
+   *
+   * ⚠️ 这是本项目第三次「同一个 bug 只修一半」
+   *（前两次：`developer→system` 归一化、SSE `data:` 前缀解析）。
+   * ⇒ 以后修任何记账/归一化逻辑，**必须 grep 出所有 `applyFailure` 调用点**再动手。
+   *
+   * ⚠️ 本函数的出口共 4 类，**每一类都必须对 blame 表态**（S11）：
+   * - 循环内的成功返回（3 处）⇒ `settleBlame`（见各自的 `onFirstChunk`）；
+   * - 循环尾（全失败）⇒ `discardBlame`；
+   * - 跨渠道容灾（`return await handleChatCompletions(...)`）⇒ `discardBlame`；
+   * - 进循环**之前**的两道闸门（`wafGateActive` / `restrictionGateActive`）⇒
+   *   此时 `blame` **必然为空**（本行以下到循环之间没有任何 `blame.push`），无需调用。
+   */
+  const blame: BlameEntry[] = []
+  let poolSize = 0
+  try {
+    /**
+     * 🔴 **必须用 `activeRealm`，不是 `realm`**（2026-10-21 审查发现，M2 指出）。
+     *
+     * `activeRealm` 在 `1997` 处按 provider 修正过
+     *（`workbuddy` ⇒ `'global'`，或按 `X-FLR-Account` 钉号落到另一分片），
+     * 而 `realm` 是**请求参数的原始值**（默认 `'cn'`）。
+     *
+     * ## 后果（静默失效）
+     * `workbuddy` 的号全在 `global` 分片，却去 `cn` 分片数：
+     * `listAccounts('cn')` 里没有 provider 为 `workbuddy` 的号
+     * ⇒ `poolSize` 恒为 **0** ⇒ `deferSoft()` 恒 **false**
+     * ⇒ workbuddy 的单账号池**永远走立即记账**，
+     *   而 `deferSoft` 的设计目的（单账号池不要立刻掐断唯一路径）对它完全没生效。
+     *
+     * ⚠️ 这类「用了名字相近但语义不同的变量」的缺陷不会报错，
+     * 只会让某个 provider 的保护静默失效 —— 正是本项目最难查的一类。
+     * 直接用已经修正过的 `pool`（`2024` 处按 `activeRealm` 构造）最稳妥。
+     */
+    const all = await pool.listAccounts(activeRealm, Date.now())
+    poolSize = all.filter((a) => (a.provider ?? '') === providerId && a.disabled !== true).length
+  } catch {
+    poolSize = 0
+  }
+  /** 单账号池时 soft 也延迟（理由见 buddy 路径的同名函数）。 */
+  const deferSoft = (): boolean => poolSize === 1
+
+  /**
+   * 🔴 **两道全局防封闸门必须在**这里也接线**（2026-10-21 审查补，M1 指出高危）**。
+   *
+   * ## 缺陷
+   * `wafGateActive` 的查询与 `noteWaf` 的投喂**只存在于 buddy 分支**（`987` / `1252`），
+   * provider 分支**既不查询也不投喂**。后果是双向的：
+   * 1. **不查询** ⇒ 出口 IP 已被 WAF 拦住时，buddy 会停手，provider 路径却继续
+   *    轮转送号，把一次客户端请求放大成 N 次撞同一堵墙（正是防封最忌的）；
+   * 2. **不投喂** ⇒ provider 路径上真实的 403 不计入 IP 级窗口，
+   *    导致闸门**永远攒不够证据**、形同虚设。
+   *
+   * ⇒ 带前缀模型（`qodercn/dfmodel`、`workbuddy/*` 等）的请求此前**完全不受防封保护**。
+   * 这是本项目「只在一处生效」模式的又一次复现，故此处**逐字对齐** buddy 的判据，
+   * 连错误码与文案都保持一致，避免两条路径的语义再漂。
+   *
+   * ## 为什么放在循环外
+   * 闸门激活期内应当**一个上游请求都不发**（见 buddy 分支的注释：
+   * 轮转只会加重风控）。放进循环内就失去意义了。
+   */
+  if (await pool.wafGateActive(Date.now()).catch(() => false)) {
+    return {
+      response: jsonError(
+        503,
+        '出口 IP 疑似被上游 WAF 拦截（短时间内多个账号接连 403），已暂停轮转以避免加重风控。稍后自动恢复。',
+        'waf_ip_blocked',
+      ),
+    }
+  }
+  // ⚠️ 先判方法存在再调用：波次暂停是保护措施，保护措施本身不能成为新的故障点
+  //（测试替身缺该方法 / 老 DO 未升级时应放行请求，而不是崩掉整条路径）。
+  const waveProbe = (pool as { restrictionGateActive?: (now: number) => Promise<boolean> })
+  const wavePaused =
+    typeof waveProbe.restrictionGateActive === 'function'
+      ? await waveProbe.restrictionGateActive(Date.now()).catch(() => false)
+      : false
+  if (wavePaused) {
+    return {
+      response: jsonError(
+        429,
+        '多个账号近期被上游风控限制（11140 账号存在异常行为），已暂停该区域派发以避免更多账号被牵连。稍后自动恢复；如确认是误判可在面板解冻。',
+        'restriction_wave',
+      ),
+    }
+  }
+
+  for (let attempt = 0; attempt <= maxRotate; attempt += 1) {
     const now = Date.now()
     // ⚠️ 供应商过滤交给 `pick()` 做（`provider` 字段），
     // **不要**在这里「先选中再筛掉」—— 那会让「池里有账号但当前供应商没账号」
@@ -1422,13 +2537,40 @@ async function handleProviderChat(input: {
     // `preferred` 只是「排到最前」，不可用时自然回落 —— 不会因为它挂了就报「无可用账号」。
     // ⚠️ 只在**首轮**（`tried` 为空）用粘性：已经在换号了还粘回去会死循环。
     const preferred = tried.length === 0 ? (sessionKey === '' ? '' : await pool.getSession(sessionKey, now)) : ''
-    const picked = await pool.pick({ realm: activeRealm, provider: providerId, model, exclude: tried, now, ...(preferred !== undefined && preferred !== '' ? { preferred } : {}) })
+    const picked = await pool.pick({
+      realm: activeRealm, provider: providerId, model, exclude: tried, now,
+      ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
+      ...(pinnedHeader !== '' ? { pinned: pinnedHeader } : {}),
+    })
+    // ── 只用指定账号但它不可用：显式报原因，**不换号、不跨渠道容灾** ──
+    if (picked !== undefined && picked.pinnedUnavailable === true) {
+      pinBlocked = true
+      lastError = {
+        status: lastError?.status ?? 503,
+        message: describePinBlocked(picked, pinnedHeader !== '', lastError?.message),
+        kind: lastError?.kind ?? 'pinned_account_unavailable',
+      }
+      break
+    }
+    // ── 永久积分锁：同第一消费点，锁定必须显式报错（不许静默 break）──
+    if (picked !== undefined && (picked as { lockedByPermanent?: true }).lockedByPermanent === true) {
+      const skipped = (picked as { lockedSkipped?: number }).lockedSkipped ?? 0
+      lastError = {
+        status: 429,
+        message: `该供应商的 ${skipped} 个账号只剩永久积分且已被「永久积分锁」保护，不参与选号。若确认要消耗永久积分，请在面板里关闭该锁。`,
+      }
+      break
+    }
     if (picked === undefined) break
     tried.push(picked.uid)
     console.log(`[pick:${providerId}] 选中账号 uid=${picked.uid} realm=${activeRealm} tried=${tried.length}`)
     // ⚠️ 换号必须换会话 id（同一段会话发给两个账号就是跨账号关联键）
-    if (providerConversationId === '') {
-      providerConversationId = await deriveIntlConversationId(picked.uid, sessionKey)
+    // 🔴 换号必须换 id（见声明处的说明）：判「归属账号变了」，不是「还没算过」。
+    if (providerConversationIdOwner !== picked.uid) {
+      providerConversationId = sessionKey === ''
+        ? crypto.randomUUID()
+        : await deriveIntlConversationId(picked.uid, sessionKey)
+      providerConversationIdOwner = picked.uid
     }
 
     const credential = (await pool.getCredential(picked.uid)) as ProviderCredential | undefined
@@ -1436,6 +2578,17 @@ async function handleProviderChat(input: {
       lastError = { status: 500, message: '账号缺少凭据' }
       continue
     }
+
+    /**
+     * 该账号实际生效的防封配置（全局 + 账号级覆盖）。
+     *
+     * ⚠️ 合并走 `resolveSafetyFor` 这**唯一**实现，不在这里手写
+     * `override.x ?? global.x` —— 那会变成同一语义多份判据。
+     */
+    const acctSafety = resolveSafetyFor(
+      await safetyConfigFor(env, pool),
+      picked.state?.safetyOverride,
+    )
 
     const startedAt = Date.now()
     // ⚠️ 续期只试一次（见下方 401 分支的说明）。
@@ -1449,9 +2602,50 @@ async function handleProviderChat(input: {
      */
     let refreshFailure = ''
     let upstream: Response
+    /**
+     * 🔴 **分支 B 的上下文裁剪**（2026-10-22 补，修我自己引入的回归）。
+     *
+     * ## 缺陷：裁剪曾经在分支 A，但 workbuddy **不走分支 A**
+     *
+     * `DEFAULT_PROVIDER === 'buddy'`，而 `providerId === 'workbuddy'`
+     * 在分流点（`if (providerId !== DEFAULT_PROVIDER)`）就被送进**本函数**。
+     * 我把裁剪从「分流之前」挪到「选号之后」（为了支持按账号上限），
+     * 于是它落进了分支 A 的循环里 —— **workbuddy 永远走不到那里**。
+     *
+     * 后果：裁剪对唯一需要它的供应商**完全失效**
+     *（实测：改动后日志里 `context-trim` 出现 0 次，改动前正常）。
+     *
+     * ## 为什么放在这里而不是循环外
+     *
+     * 上限是**按账号**的，换号后可能不同 ⇒ 必须在循环内、拿到 `acctSafety` 之后裁。
+     * 与分支 A 用**同一个** `trimMessagesByLimit`（不另写一份，否则两处判据会漂）。
+     *
+     * ⚠️ 只对 workbuddy 生效：它来自封号复盘的「伪装成官方客户端」，
+     * 而 qodercn/cline 等用自家官方凭据、无需伪装 —— 给它们裁只会损坏请求。
+     */
+    let sendBody: Record<string, unknown> = body
+    if (providerId === 'workbuddy' && acctSafety.maxContextMessages > 0) {
+      const withMessages = body as Record<string, unknown>
+      if (Array.isArray(withMessages.messages)) {
+        const before = withMessages.messages as unknown[]
+        const trimmed = trimMessagesByLimit(before, acctSafety.maxContextMessages)
+        if (trimmed.messages !== before) {
+          sendBody = { ...withMessages, messages: trimmed.messages }
+          // ⚠️ 隐私红线：**不打任何消息内容**，只打条数与模型名。
+          console.log(
+            `[context-trim] 消息数超限已压缩：${before.length} 条 → ${trimmed.messages.length} 条`
+              + `（省略更早 ${trimmed.dropped} 条）limit=${acctSafety.maxContextMessages} model=${providerId}/${model}`,
+          )
+        }
+      }
+    }
+
     try {
+      // 防封：按账号排队 + 抖动 —— **只对 workbuddy 生效**（见 throttle.ts）。
+      await throttleUpstream(picked.uid, undefined, undefined, providerId,
+        { qps: acctSafety.rateLimitQps, jitterMs: acctSafety.rateJitterMs })
       upstream = await provider.chat(credential, {
-        model, body, signal: request.signal,
+        model, body: sendBody, signal: request.signal,
         conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
       })
     } catch (error) {
@@ -1471,6 +2665,8 @@ async function handleProviderChat(input: {
           const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
           await pool.putCredential(picked.uid, fresh, Date.now())
           console.warn(`[refresh] ${providerId} 续期成功（catch 分支），已回写凭据`)
+          await throttleUpstream(picked.uid, undefined, undefined, providerId,
+        { qps: acctSafety.rateLimitQps, jitterMs: acctSafety.rateJitterMs })
           const retry = await provider.chat(fresh, {
             model, body, signal: request.signal,
             conversation: { conversationId: providerConversationId, turnRequestId: providerTurnRequestId },
@@ -1483,19 +2679,24 @@ async function handleProviderChat(input: {
                 //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
                 clientGone: () => request.signal.aborted,
                 onFirstChunk: () => {
-                  const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
+                  const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  // ✅ **结算 blame**：这个号成功了 ⇒ 之前那些失败确实是那几个号的问题。
+                  const settle = settleBlame(pool, blame, Date.now())
+                  if (ctx !== undefined) ctx.waitUntil(settle)
+                  else void settle
                   // ⚠️ 首帧到达即绑定会话 —— 此后同一会话优先落这个账号，
                   // 从第二轮起命中上游 prompt cache（更快、更省）。
                   if (sessionKey !== '' && ctx !== undefined) {
-                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(() => {}))
+                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(logPoolError('bindSession')))
                   }
                 },
                 onError: (m) => {
                   const t = pool
                     .applyFailure({ uid: picked.uid, kind: 'breaker', now: Date.now(), reason: m.slice(0, 200) })
-                    .catch(() => {})
+                    .catch(logPoolError('applyFailure'))
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  recordStreamFailure(pool, { uid: picked.uid, model: `${providerId}/${model}`, errorKind: 'breaker', startedAt: startedAt2 }, ctx)
                   recordLog(
                     pool,
                     {
@@ -1512,13 +2713,15 @@ async function handleProviderChat(input: {
                   )
                 },
                 onFinish: (usage) => {
+                  // 🔴 子密钥 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
+                  settleSubkeyUsage(ctx, env, usage?.input ?? 0, usage?.output ?? 0, `${providerId}/${model}`)
                   const t = pool
                     .recordUsage({
                       at: Date.now(), uid: picked.uid, model: `${providerId}/${model}`,
                       input: usage?.input ?? 0, output: usage?.output ?? 0, ok: true,
                       ms: Date.now() - startedAt2,
                     })
-                    .catch(() => {})
+                    .catch(logPoolError('recordUsage'))
                   if (ctx !== undefined) ctx.waitUntil(t)
                   recordLog(
                     pool,
@@ -1544,6 +2747,202 @@ async function handleProviderChat(input: {
             refreshError instanceof Error ? refreshError.message : String(refreshError),
           )
         }
+      }
+
+      // ══════════════════════════════════════════════════════════════════
+      // 🔴 `ProviderError` 必须**先过一遍业务码分类**，不能一律当网络错误
+      // ══════════════════════════════════════════════════════════════════
+      //
+      // ## 实测缺陷（2026-10-20，与 11158 / 11102 误锁直接相关）
+      //
+      // 8 家 provider 的 `chat()` 在非 2xx 时**抛 `ProviderError`**，
+      // 于是网关的 `!upstream.ok` 分支（那里才有 `classify()`）永远走不到。
+      // 结果：**所有**上游业务错误都被压成一句 `lastError = {502, message}`、
+      // 记成传输层失败 —— 业务码语义整条丢失。
+      //
+      // 具体后果（本次事故现场）：
+      //   - `11158 model not allowed for user type` ⇒ 记成网络错误 ⇒ 不写模型负缓存；
+      //   - `11102 service info not found`          ⇒ 同上；
+      //   - 而**另一些**路径（如 SSE 分支）却会写模型冷却 —— 同一份错误两套结果，
+      //     出现 `cause=absent` 与 `cause=denied` 混杂、且冷却时长对不上账的现象。
+      //
+      // 修法：把 `ProviderError` 的原始 message 交给 `classify()`（它本来就是
+      // 按文本解析业务码的），只有**确实解析不出业务码**时才退回传输层语义。
+      const pe = error as { name?: string; httpStatus?: number; code?: unknown; retryable?: unknown }
+      const peStatus = typeof pe?.httpStatus === 'number' ? pe.httpStatus : 0
+      const isProviderErr = pe?.name === 'ProviderError'
+      if (isProviderErr) {
+        const c = classify(peStatus, message)
+        // ⚠️ **解析不出业务码时保留 provider 的原文**（实测缺陷）。
+        // `classify()` 在没有信封时只会给出 `upstream 403` / `unexpected status 0`
+        // 这种合成文案 —— 直接用它会把 ProviderError 里真正的原因（例如
+        // 「WASM 实例化失败：Import #0 …」）整句吞掉，用户只看到
+        // `unknown: unexpected status 0`，完全无从排查。
+        const detail = c.code === undefined && c.kind !== 'waf_blocked' ? message : (c.msg || message)
+
+        /**
+         * 🔴 **`waf_blocked` 无条件留证**（2026-10-21，第三次修同一个盲区）。
+         *
+         * ⚠️ 我此前把这条日志加在了 `!upstream.ok` 分支（`handleChatCompletions`
+         * 里），但**8 家 provider 的 `chat()` 在非 2xx 时抛 `ProviderError`**，
+         * 于是那条分支**永远走不到** —— 日志加了等于没加，`[waf-403]` 一条都没有，
+         * 而 `[punish]` 却持续输出 `reason=waf_blocked: ...`。
+         *
+         * 这就是「记录点在 A 路径、故障发生在 B 路径」的第 4 次复发。
+         * ⇒ 判据应该是「**这个 kind 值得留证**」，而不是「我在哪个分支顺手」。
+         */
+        if (c.kind === 'waf_blocked' || c.kind === 'channel_blocked') {
+          console.warn(
+            `[waf-403] model=${model} http=${peStatus} kind=${c.kind} len=${message.length} ` +
+              `body=${message.slice(0, 500)}`,
+          )
+        }
+
+        /**
+         * 🔴 **WAF / 11140 的「双记账」也必须在这里做**
+         *（2026-10-21 审查补，M1 指出高危）。
+         *
+         * ## 缺陷
+         * buddy 分支在 `!upstream.ok` 里做了双记账（`1260` 附近的 `noteWaf` /
+         * `noteRestriction`），而 provider 分支**只打日志、不记账**。
+         *
+         * ⇒ 效果是**闸门永远攒不够证据**：
+         * 顶部的 `wafGateActive` / `restrictionGateActive` 靠「短窗内多个不同号命中」
+         * 才激活，而 provider 路径（8 家 provider 抛 `ProviderError` 都走这里）
+         * 的真实 403 一条都没投喂 ⇒ 闸门对带前缀模型**形同虚设**。
+         *
+         * ## 为什么还要 `break`
+         * IP 被拦时继续轮转，就是把一次客户端请求放大成 N 次撞同一堵墙
+         *（buddy 分支的注释记过 Go 侧实测：3 个账号 1 秒内全部 403）。
+         * 故与 buddy 分支同样**立即停手**，返回可读原因。
+         */
+        if (c.kind === 'request_illegal') {
+          await pool.noteRestriction(picked.uid, Date.now()).catch(() => false)
+        }
+        if (c.kind === 'waf_blocked') {
+          const ipBlocked = await pool.noteWaf(picked.uid, Date.now()).catch(() => false)
+          if (ipBlocked) {
+            lastError = {
+              status: 503,
+              message: '出口 IP 疑似被 WAF 拦截（短窗内多个账号接连 403）',
+              kind: 'waf_ip_blocked',
+            }
+            break
+          }
+        }
+
+        const pm = mapErrorToPunishment(c.kind)
+        const pcause = modelCauseFor(c.kind)
+        if (pm.punish) {
+          /**
+           * ⚠️ **与另两条路径同一套纪律**：累加型维度 + 单账号池的 soft 都延迟记账。
+           *
+           * 这是「延迟记账」的第 3 条路径（前两条：buddy 主循环、provider 的
+           * `peekStreamForError` 分支）。三处必须一致，否则又是「只修一半」。
+           */
+          /**
+           * 🔴 **必须在这里也做 `refineModelScoped`**（2026-10-21 审查发现，M1 指出）。
+           *
+           * ## 缺陷
+           * 本分支原来只写 `const pPunishKind = pm.dimension` ——
+           * 而 `mapErrorToPunishment('rate_limited')` 恒为 `'soft'`（**账号级**）。
+           * `refineModelScoped` 的模型级细分（6004 / 14003 / 11134 / **110**）
+           * 在这里**根本没被调用**。
+           *
+           * ## 为什么这条路径最关键
+           * qoder 的 `110`（日次数上限）**恰恰只从这条路径产生**：
+           * `providers/qoder.ts` 把非 2xx 包成 `ProviderError` 抛出 ⇒ 落到本分支。
+           * ⇒ 我上一版把 `110` 加进 `refineModelScoped` 的模型级判据，
+           * 但**唯一真正产生 110 的路径不调用它** ⇒ 修复等于没生效。
+           * 后果：单账号 provider（`qodercn`）遇 110 时**整个账号被锁 60 秒起**，
+           * 而正确处置是「只冷却该模型，换个模型立刻可用」。
+           *
+           * ## 与另两条路径对齐
+           * - 分支A（`server.ts:1269`）：`kind === 'rate_limited' ? dimension : …`
+           * - 分支B 首帧预检（`server.ts:2534`）：`kind === 'rate_limited' ? refined.dimension : …`
+           * 本处照抄同一口径，并**补上 `resetAt`**（另两条都传了）：
+           * 上游在文案里给了重置墙钟时，冷却应对齐它而不是走我们自己猜的指数退避
+           *（猜早了继续撞限流，猜晚了白白少用几小时）。
+           */
+          /**
+           * ⚠️ **必须传原始 message，不能传 `detail`**（2026-10-22，G3）。
+           *
+           * `detail` 在「已解析出业务码」时被换成了 `c.msg`（人话文案），
+           * 而 `refineModelScoped()` 内部是拿 `parseBusinessCode(bodyText)` 找码的 ——
+           * 传人话过去必然解析不出码，于是 `110/6004/14003/11134` 全部退化成
+           * **账号级 soft**：一个模型限流就把整个号锁掉，换个模型明明能用。
+           *
+           * 这与注释里声称的「与另两条路径对齐」并不一致：那两条传的都是原始文本。
+           */
+          const pRefined = refineModelScoped(c.kind, message)
+          const pPunishKind =
+            c.kind === 'rate_limited'
+              ? pRefined.dimension
+              : pm.dimension === 'model'
+                ? 'model'
+                : pm.dimension
+          const pResetAt = pRefined.resetAt
+          if (pPunishKind === 'breaker' || pPunishKind === 'degrade' || (pPunishKind === 'soft' && deferSoft())) {
+            // ⚠️ `resetAt` 也必须带进收件箱（S4）：下面立即结算那条分支传了
+            // `pResetAt`，若这里不传，同一个错误只因走了延迟就丢掉上游墙钟。
+            // ⚠️ 本路径拿不到 `Retry-After` 头（上游是**抛异常**，没有 `Response`），
+            // 故只有文案里解析出的 `pResetAt` —— 与立即结算分支的可用信息同源。
+            blame.push({
+              uid: picked.uid,
+              kind: pPunishKind,
+              reason: `${c.kind}: ${detail}`.slice(0, 200),
+              ...(pResetAt !== undefined ? { resetAt: pResetAt } : {}),
+            })
+          } else {
+            await pool
+              .applyFailure({
+                uid: picked.uid,
+                kind: pPunishKind,
+                now: Date.now(),
+                ...(model !== '' ? { model } : {}),
+                ...(pcause !== undefined ? { modelCause: pcause } : {}),
+                ...(pResetAt !== undefined ? { resetAt: pResetAt } : {}),
+                reason: `${c.kind}: ${detail.slice(0, 180)}`,
+              })
+              .catch(logPoolError('applyFailure'))
+          }
+        }
+        lastError = {
+          status: clientStatusFor(peStatus || 502, c.kind),
+          message: `${c.kind}: ${detail}`,
+          kind: c.kind,
+        }
+        /**
+         * 🔴 **换不换号：先问 provider，再退到 `retryable`，最后才是通用判据**
+         *（2026-10-21 审查补，M4 指出高危）。
+         *
+         * ## 缺陷
+         * 这条路径原来**只用** `pm.rotate`（由业务码推出来的通用判据），于是：
+         * 1. `provider.shouldRotate?.(status, text)` **从未被调用** ——
+         *    cline / minimax 里写好的「403 地域封锁不换号」「5xx 不换号」
+         *    整套判据**一次都没生效**（M4 实测：这两家都抛 `ProviderError`，
+         *    而唯一消费 `shouldRotate` 的地方在「返回 Response」的分支）；
+         * 2. `ProviderError.retryable` 在对话路径**无人消费**
+         *    （只有登录流程读它）⇒ 各家精心标的 `retryable` 全是死字段。
+         *
+         * ## 后果是**反向**的
+         * cline 想「403 别换号」（换号会连坐其它号），实际却按通用判据
+         * `auth_error.rotate = true` **整池轮转** —— 与作者意图完全相反。
+         *
+         * ## 优先级
+         * `shouldRotate`（provider 最了解自己的错误语义）
+         * → `retryable`（provider 的较粗粒度标注）
+         * → `pm.rotate`（通用兜底）。
+         * 三者都缺省时保持原行为，不改变未定义这两项的 provider。
+         */
+        const providerRotate = provider.shouldRotate?.(peStatus, message)
+        const rotate =
+          providerRotate
+          ?? (typeof pe.retryable === 'boolean' ? pe.retryable : pm.rotate)
+        // 判出来的「不可换号」类（如渠道拦截 / 参数错 / 地域封锁）立刻停，
+        // 否则会白换号并放大风控。
+        if (!rotate) break
+        continue
       }
 
       lastError = { status: 502, message }
@@ -1584,11 +2983,19 @@ async function handleProviderChat(input: {
             return {
               response: await streamResponse(retry.body, {
                 onFirstChunk: () => {
-                  const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
+                  const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  // ✅ **结算 blame**（2026-10-21 审查补，M1 指出）：
+                  // 这个号成功了 ⇒ 之前那些失败确实是那几个号的问题，现在才记账。
+                  // 缺了它，本路径塞进 blame 的 breaker/degrade 失败**永不落账**
+                  //（成功时直接 return，连「丢弃」日志都不打）——
+                  // 表现是「持续 5xx 的账号永远不进熔断、面板 fails 恒 0」。
+                  const settle = settleBlame(pool, blame, Date.now())
+                  if (ctx !== undefined) ctx.waitUntil(settle)
+                  else void settle
                   // 会话粘性：首帧到达即绑定，后续轮次优先落同一账号
                   if (sessionKey !== '' && ctx !== undefined) {
-                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(() => {}))
+                    ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(logPoolError('bindSession')))
                   }
                 },
                 // ⚠️ 诊断用：区分「客户端断开」与「上游中断」
@@ -1601,8 +3008,9 @@ async function handleProviderChat(input: {
                       now: Date.now(),
                       reason: message.slice(0, 200),
                     })
-                    .catch(() => {})
+                    .catch(logPoolError('applyFailure'))
                   if (ctx !== undefined) ctx.waitUntil(t)
+                  recordStreamFailure(pool, { uid: picked.uid, model: `${providerId}/${model}`, errorKind: punishmentForStreamError(message), startedAt: startedAt2 }, ctx)
                   recordLog(
                     pool,
                     {
@@ -1619,13 +3027,15 @@ async function handleProviderChat(input: {
                   )
                 },
                 onFinish: (usage) => {
+                  // 🔴 子密钥 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
+                  settleSubkeyUsage(ctx, env, usage?.input ?? 0, usage?.output ?? 0, `${providerId}/${model}`)
                   const t = pool
                     .recordUsage({
                       at: Date.now(), uid: picked.uid, model: `${providerId}/${model}`,
                       input: usage?.input ?? 0, output: usage?.output ?? 0, ok: true,
                       ms: Date.now() - startedAt2,
                     })
-                    .catch(() => {})
+                    .catch(logPoolError('recordUsage'))
                   if (ctx !== undefined) ctx.waitUntil(t)
                   recordLog(
                     pool,
@@ -1672,6 +3082,36 @@ async function handleProviderChat(input: {
       // 改用共享的 `classify()` 后，11-128 会被认成 `channel_blocked`，
       // 走「不罚号 + 不换号 + 直出真实原因」的分支，与 buddy 路径口径一致。
       const classified = classify(upstream.status, text)
+      /**
+       * 🔴 **WAF / 11140 的「双记账」在这条出口也要做**（2026-10-22，G5）。
+       *
+       * ProviderError 出口（`2451`/`2454`）早就补了双记账，但**这条出口没有** ——
+       * 而 `trae` / `opencode` 恰恰是把非 2xx **原样 return**（不抛异常）的两家：
+       * ```
+       * trae.ts:1083   if (!upstream.ok || upstream.body === null) return upstream
+       * opencode.ts:815  return res
+       * ```
+       * ⇒ 这两家的真实 403-WAF / 11140 从来不给闸门投喂证据，
+       * 而顶部的 `wafGateActive` / `restrictionGateActive` 靠「短窗内多个不同号命中」
+       * 才激活 ⇒ 闸门对它们形同虚设。
+       *
+       * 这与本项目反复出现的「记录点在 A 路径、故障发生在 B 路径」是同一个毛病：
+       * 判据应该挂在**语义**上（这个 kind 该不该记账），而不是「我在哪个分支顺手」。
+       */
+      if (classified.kind === 'request_illegal') {
+        await pool.noteRestriction(picked.uid, Date.now()).catch(() => false)
+      }
+      if (classified.kind === 'waf_blocked') {
+        const ipBlocked = await pool.noteWaf(picked.uid, Date.now()).catch(() => false)
+        if (ipBlocked) {
+          lastError = {
+            status: 503,
+            message: '出口 IP 疑似被 WAF 拦截（短窗内多个账号接连 403）',
+            kind: 'waf_ip_blocked',
+          }
+          break
+        }
+      }
       const isChannelBlocked = classified.kind === 'channel_blocked'
       const rotate = isChannelBlocked
         ? false
@@ -1680,7 +3120,7 @@ async function handleProviderChat(input: {
       if (isChannelBlocked) {
         lastError = {
           status: clientStatusFor(upstream.status, 'channel_blocked'),
-          message: `渠道校验失败（11-128）：${text.slice(0, 200)}`,
+          message: `渠道校验失败：${text.slice(0, 200)}${CHANNEL_BLOCKED_HINT}`,
         }
         clearSessionBinding(pool, sessionKey, ctx)
         break
@@ -1695,7 +3135,38 @@ async function handleProviderChat(input: {
       //
       // 复用与 buddy 路径相同的细分判据，避免两条路径口径分叉
       //（此前 buddy 路径已细分、这里没有 —— 同一个 bug 修了一半）。
-      const refined = refineModelScoped(upstream.status === 429 ? 'rate_limited' : 'unknown', text)
+      /**
+       * 🔴 **必须用 `classify()` 的结论决定「罚不罚、罚哪个维度」**
+       *（2026-10-21 审查补，M4 指出的**严重**项）。
+       *
+       * ## 缺陷
+       * 本分支原来把 `classified.kind` **只**用于判 `channel_blocked`，
+       * 其余非 2xx 一律硬编码：
+       * ```
+       * const failureKind = 402 ? 'hard' : 429 ? refined.dimension : 'breaker'
+       * ```
+       * ⇒ opencode / trae 这两家（**返回非 2xx Response** 而非抛异常）的
+       * `400 / 401 / 403 / 404` 全部落 `breaker` ⇒ 3 次熔断健康号 30 分钟起，
+       * 且 `AccountPoolDO` 还按 `2^retryCount` 递增到 6 小时。
+       *
+       * ## 为什么这是「只修一半」的第 N 次
+       * **同一个文件里**的 SSE 预读分支（`2681` 起）**已经**用
+       * `mapErrorToPunishment(kind)` 正确判定了 —— 只有这条 HTTP 非 2xx 分支没改。
+       * 于是「上游用 SSE 帧报错」和「上游用 HTTP 状态码报错」表现完全不同，
+       * 而这两条路径**服务的是同一批 provider**。
+       *
+       * ## 修法
+       * 与 SSE 分支同口径：`mapErrorToPunishment` 决定 `punish` 与 `dimension`，
+       * `refineModelScoped` 在 `rate_limited` 时细分到模型级，
+       * `modelCauseFor` 把「无此模型/档位拒绝」的结构化成因一并带给池。
+       */
+      const pm = mapErrorToPunishment(classified.kind)
+      const refined = refineModelScoped(
+        // 429 一律按「限流」细分（`classify` 对无信封的 429 也返回 rate_limited，
+        // 这里显式兜一层，避免上游回 429 但文案没码时被判成 unknown 而失去模型级细分）
+        upstream.status === 429 ? 'rate_limited' : classified.kind,
+        text,
+      )
       // ⚠️ **文案解析不到时，退回标准的 `Retry-After` 头**。
       //
       // 上游文案格式**随时可能改**（`reset at … UTC+8` 是我们逆向出来的），
@@ -1710,25 +3181,39 @@ async function handleProviderChat(input: {
         : undefined
       const resolvedResetAt = refined.resetAt
         ?? (retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs)
-      const failureKind: 'soft' | 'hard' | 'model' | 'breaker' =
+      /**
+       * `punish === false` 的一律**不写冷却**（如 `bad_request` / `auth_error` /
+       * `model_unavailable` 之类参数或凭据问题）—— 罚健康账号是本项目最贵的错误。
+       * 402 例外保留：它语义上就是「余额耗尽」，必须硬冷却。
+       */
+      // ⚠️ 直接透传 `pm.dimension`，**不做有损映射**：
+      // 一度写成 `model/soft/else breaker`，结果把 hard / session_dead / restricted
+      // 三个维度全并成了 breaker —— 那正是本项目反复出现的「映射时丢语义」。
+      const failureKind: typeof pm.dimension | undefined =
         upstream.status === 402
           ? 'hard'
-          : upstream.status === 429
-            ? refined.dimension
-            : 'breaker'
-      await pool
-        .applyFailure({
-          uid: picked.uid,
-          kind: failureKind,
-          now: Date.now(),
-          ...(model !== '' ? { model } : {}),
-          // ⚠️ 带上上游给的重置时刻（文案里的 `reset at … UTC+8`，
-          // 或标准 `Retry-After` 头）：模型级冷却据此对齐上游墙钟，
-          // 而不是我们自己猜 6 小时。
-          ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
-          reason: `${providerId} http=${upstream.status}: ${text.slice(0, 160)}`,
-        })
-        .catch(() => {})
+          : pm.punish
+            ? (upstream.status === 429 || classified.kind === 'rate_limited'
+              ? refined.dimension
+              : pm.dimension)
+            : undefined
+      if (failureKind !== undefined) {
+        const cause = modelCauseFor(classified.kind)
+        await pool
+          .applyFailure({
+            uid: picked.uid,
+            kind: failureKind,
+            now: Date.now(),
+            ...(model !== '' ? { model } : {}),
+            // ⚠️ 带上上游给的重置时刻（文案里的 `reset at … UTC+8`，
+            // 或标准 `Retry-After` 头）：模型级冷却据此对齐上游墙钟，
+            // 而不是我们自己猜 6 小时。
+            ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
+            reason: `${providerId} http=${upstream.status}: ${text.slice(0, 160)}`,
+            ...(cause !== undefined ? { modelCause: cause } : {}),
+          })
+          .catch(logPoolError('applyFailure'))
+      }
       // ⚠️ 同上：不原样透传上游状态码（避免把网关故障伪装成客户端的 400）
       lastError = {
         status: clientStatusFor(upstream.status, 'unknown'),
@@ -1766,6 +3251,7 @@ async function handleProviderChat(input: {
       const resolvedResetAt = refined.resetAt ?? (retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs)
 
       if (mapped.punish) {
+        const cause = modelCauseFor(kind)
         await pool
           .applyFailure({
             uid: picked.uid,
@@ -1774,8 +3260,9 @@ async function handleProviderChat(input: {
             ...(model !== '' ? { model } : {}),
             ...(resolvedResetAt !== undefined ? { resetAt: resolvedResetAt } : {}),
             reason: `${providerId} sse: ${(msg || errText).slice(0, 160)}`,
+            ...(cause !== undefined ? { modelCause: cause } : {}),
           })
-          .catch(() => {})
+          .catch(logPoolError('applyFailure'))
       }
 
       clearSessionBinding(pool, sessionKey, ctx)
@@ -1785,20 +3272,105 @@ async function handleProviderChat(input: {
         message: `${providerId} sse: ${msg || errText.slice(0, 160)}`,
       }
 
-      // ⚠️ 与 HTTP 非 2xx 分支同口径：渠道校验失败不换号（判的是我方指纹）
+      // ⚠️ 渠道校验失败必须立刻停止轮换，**不能**落到下面的 `mapped.rotate` 再换号。
+      //
+      // 11-128 判的是**我方请求指纹**（头部身份 + 会话头族），与账号无关：
+      // 实测 5 个国际版账号用同一套头发出去，全部回 11-128。
+      // 换号只是把同一份指纹再打 N 次 —— 既拖长客户端等待（每次都等首帧超时），
+      // 又白白给上游刷失败次数、抬高风控权重。
+      //
+      // 与 HTTP 非 2xx 分支同口径：那一路已经显式 break，两条路径必须一致，
+      // 否则「上游用 400 报」和「上游用 SSE 帧报」会表现不同（同一个 bug 只修一半）。
       if (kind === 'channel_blocked') break
       if (mapped.rotate) continue // 换号重试！
       break
     }
 
+    // ②b **零输出越墙熔断**（见 `zero-output.ts` 文件头）。
+    //
+    // ⚠️ 必须在**把响应交给客户端之前**判定：一旦 `finish_reason=length` 的
+    // 终止帧被转发出去，客户端就把这一轮当结束了，改道也晚了。
+    // 故这里预读「首帧可见内容之前」的字节（正常只有 1~3 帧），判定完再原样放行。
+    const screened = await screenZeroOutputStream(peeked.stream, {
+      // 客户端主动取消 ⇒ 一律不改道（本项目的既有纪律）
+      isCancelled: () => request.signal.aborted,
+    })
+    if (screened.hit) {
+      // ⚠️ 罚**模型维度**（`kind:'model'`），不罚账号：
+      // 越墙是「这个目标（账号+模型）此刻的输入被拒」，与账号好坏无关，
+      // 换账号可能有用（不同号挂不同后端），故仍需改道；但绝不能升成
+      // `breaker`（3 次就熔断账号 30 分钟，会误杀健康账号）。
+      const reason = `${providerId}/${model} zero-output (finish_reason=length, ${screened.probe.frames}f)`
+      await pool
+        .applyFailure({
+          uid: picked.uid,
+          kind: 'model',
+          now: Date.now(),
+          ...(model !== '' ? { model } : {}),
+          // ⚠️ 显式给 `resetAt`：不走「11102 无此模型」那条 6h 指数退避
+          //（越墙不是「上游没有这个模型」，6h 惩罚过重）。
+          resetAt: Date.now() + ZERO_OUTPUT_COOLDOWN_MS,
+          reason,
+        })
+        .catch(logPoolError('applyFailure'))
+
+      // ⚠️ §7.2「失败必须显式」：改道**必须留痕**，不能静默。
+      // 日志 + 面板日志双写，否则用户/排查者无法把这次改道与网络故障区分开
+      //（两者在 chunk 层完全同形，见 `zero-output.ts` 文件头）。
+      console.warn(`[zero-output] ${describeZeroOutputHit(providerId, model, screened.probe)} uid=${picked.uid}`)
+      recordLog(
+        pool,
+        {
+          type: 'error',
+          model: `${providerId}/${model}`,
+          provider: providerId,
+          uid: picked.uid,
+          status: 502,
+          durationMs: Date.now() - startedAt,
+          error: `零输出越墙，已冷却该目标并改道（finish_reason=length，0 输出，${screened.probe.frames} 帧）`,
+          stream: wantsStream,
+        },
+        ctx,
+      )
+
+      clearSessionBinding(pool, sessionKey, ctx)
+      lastError = {
+        status: 502,
+        message: describeZeroOutputHit(providerId, model, screened.probe),
+      }
+      continue // 改道下一个候选重发（什么都没产出，没有内容可丢）
+    }
+
     return {
-      response: await streamResponse(peeked.stream, {
+      response: await streamResponse(screened.stream, {
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
         onFirstChunk: () => {
-          const t = pool.noteSuccess(picked.uid, Date.now()).catch(() => {})
+          const t = pool.noteSuccess(picked.uid, Date.now(), undefined, model).catch(logPoolError('noteSuccess'))
           if (ctx !== undefined) ctx.waitUntil(t)
+          /**
+           * ✅ **结算 blame**（2026-10-21 审查补，M1 指出）。
+           *
+           * 这是**分支B 的主成功路径** —— 它原来只有 `noteSuccess`，没有 `settleBlame`。
+           * 而 `blame.push` 在 ProviderError 分支（`2325`）会塞入 breaker/degrade 失败。
+           *
+           * ⇒ 缺 `settleBlame` 的后果：这些失败**永不落账**，
+           *   而且因为成功时直接 return，连「全失败则丢弃」的那条日志都不会打。
+           *   表现：持续 5xx 的账号永远不进熔断，面板 `fails` 恒 0 —— **保护机制静默失效**。
+           *
+           * ⚠️ 之所以长期没被发现：`tests/state.test.ts` 用的是
+           * `settleCalls.length >= 2` 的**全局计数**断言，
+           * 而它恰好被「分支A + 分支B 续期重试」两处满足 ⇒ 主路径缺失被掩盖。
+           */
+          const settle = settleBlame(pool, blame, Date.now())
+          if (ctx !== undefined) ctx.waitUntil(settle)
+          else void settle
+          // 🔴 **会话粘性**（2026-10-21 审查补，M3 指出）：主成功路径此前从不绑定
+          // ⇒ 同一会话的后续轮次落到不同账号 ⇒ prompt cache 命中率 0 + 指纹跳变。
+          if (sessionKey !== '' && ctx !== undefined) {
+            ctx.waitUntil(pool.bindSession(sessionKey, picked.uid, Date.now()).catch(logPoolError('bindSession')))
+          }
         },
         onError: (message) => {
           const t = pool
@@ -1808,8 +3380,9 @@ async function handleProviderChat(input: {
               now: Date.now(),
               reason: message.slice(0, 200),
             })
-            .catch(() => {})
+            .catch(logPoolError('applyFailure'))
           if (ctx !== undefined) ctx.waitUntil(t)
+          recordStreamFailure(pool, { uid: picked.uid, model: `${providerId}/${model}`, errorKind: punishmentForStreamError(message), startedAt }, ctx)
           recordLog(
             pool,
             {
@@ -1836,18 +3409,13 @@ async function handleProviderChat(input: {
             ok: true,
             ms: Date.now() - startedAt,
           }
+          // 🔴 子密钥的 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
+          settleSubkeyUsage(ctx, env, record.input, record.output, record.model)
           const t = pool.recordUsage(record).catch((error: unknown) => {
             console.error('[usage] 记录用量失败：', error instanceof Error ? error.message : String(error))
           })
           if (ctx !== undefined) ctx.waitUntil(t)
           else void t
-
-          // 子密钥：把真实 token 补录进它的用量（请求数已在放行时占过名额）
-          if (subkey !== undefined) {
-            const st = settleUsage(env, subkey.record, record.input, record.output, `${providerId}/${model}`, subkey.ip)
-            if (ctx !== undefined) ctx.waitUntil(st)
-            else void st
-          }
 
           recordLog(
             pool,
@@ -1868,17 +3436,83 @@ async function handleProviderChat(input: {
     }
   }
 
-  // ⚠️ 严格隔离：不自动跨渠道容灾，各渠道配额完全独立，严禁将国际版流量切到国内版
+  // ⚠️ 国际版（workbuddy）容灾回退：若国际版所有账号均失败或限流，
+  // 检查国内版（buddy）是否有**真可选**账号，自动无缝跨渠道容灾至国内版同名模型。
   //
-  // ⚠️ **有 `lastError` 时必须回放真实原因**（实测踩到的误导）：
-  // 5 个国际版账号因上游 11-128 被逐个记了软冷却后，下一次请求 `pick()` 直接返回空，
-  // 用户看到的竟是「没有可用账号（请先登录/导入凭据）」—— 而账号一个都没坏。
-  // 真实原因（渠道校验失败）只存在于 `lastError` 里，必须优先露出来。
+  // ⚠️ **只在 `failoverDepth === 0` 时触发**（否则与 buddy 路径互相递归成死循环）。
+  // ⚠️ **绝不能复用 `request`**：它的 body 在 `handleChatCompletions` 开头
+  //    已被 `request.json()` 消费，再读会抛错 → 恒返回 400「请求体必须是合法 JSON」。
+  //    必须用 `rawBody` 重建一个**全新** Request。
+  // ⚠️ 重建时把 `model` 换成**裸名**（去掉 `workbuddy/` 前缀）：否则
+  //    `splitModelName` 会再次路由回 workbuddy，形成自我循环。
+  if (providerId === 'workbuddy' && failoverDepth === 0 && model !== '' && !pinBlocked) {
+    try {
+      const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+      const now = Date.now()
+      const hasCnUsable = (await cnPool.listAccounts('cn', now)).some(
+        (a) => (a.provider ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER && healthyForModel(a, now, model),
+      )
+      if (hasCnUsable) {
+        console.log(`[failover] 国际版 workbuddy 全部不可用或已限流，自动无缝跨渠道容灾至国内版 ${DEFAULT_PROVIDER} (模型: ${model})`)
+        const fallbackBody =
+          rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)
+            ? { ...(rawBody as Record<string, unknown>), model }
+            : rawBody
+        const fallbackRequest = new Request(request.url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          /**
+           * 🔴 **必须带 `signal`**（2026-10-21 审查发现，M1 指出）。
+           *
+           * 重建 Request 时漏掉 `signal` ⇒ 内层 `handleChatCompletions` 的
+           * `clientGone()`（`request.signal.aborted`）**恒为 false**
+           * ⇒ 用户点「停止」造成的 AbortError 会被当成**上游/账号失败**记账
+           * ⇒ 健康号被记 breaker，3 次即熔断 30 分钟。
+           *
+           * 这正是本项目反复踩的「客户端取消被记成账号失败」在**合成 Request 入口的回归**：
+           * 两条主路径已经用 `clientGone` 修好了，但这里重建 Request 把判据废掉了。
+           */
+          signal: request.signal,
+          body: JSON.stringify(fallbackBody),
+        })
+        // ⚠️ 容灾是**早退出口**（S11）：`handleChatCompletions` 有它**自己的**空
+        // `blame` 收件箱，本路径挂起的失败不会跟着过去 ⇒ 必须在这里显式丢弃。
+        // 否则它们静默消失：既不在国际版结算、也不打日志、更不会走到下面那段
+        // 循环尾的「丢弃」日志（那段在 `return` 之后，永远执行不到）。
+        discardBlame(blame, '已跨渠道容灾至国内版（blame 不移交）')
+        return await handleChatCompletions(fallbackRequest, env, 'cn', ctx, 1)
+      }
+    } catch (failoverError) {
+      console.warn('[failover] 国际版->国内版容灾检查失败：', failoverError)
+    }
+  }
+
+  // ⚠️ **丢弃 blame**（与 buddy 路径同一纪律）：所有候选都以同样方式失败，
+  // 没有「换号后成功」这个证据，就不能断定是那几个号坏了。
+  // 不丢弃的话这些记录会留在数组里既不算也不清 —— 虽然随函数返回被回收，
+  // 但**日志缺失**会让排障时误以为「没有失败过」。
+  //
+  // ⚠️ 与 buddy 路径同一份实现（`discardBlame`，S11）：那边的 4 个早退出口
+  // 也要丢弃，各写一份会让「是否留痕」再次分叉。
+  discardBlame(blame, 'provider 路径全池同样失败')
+  // 🔴 请求级失败用量（emit 一次，不按尝试次数重复记）。
+  recordRequestFailure(pool, {
+    uid: tried[tried.length - 1] ?? '',
+    model: `${providerId}/${model}`,
+    errorKind: lastError?.kind ?? 'provider_error',
+    startedAt: requestStartedAt,
+  })
   return {
     response: jsonError(
       lastError?.status ?? 503,
       lastError === undefined
-        ? (await describeNoAccount(env, activeRealm, providerId))
+        // ⚠️ 区分「真的没账号」与「有账号但全在冷却/熔断」。
+        // 实测踩到：账号因连续失败进了熔断，报的却是「请先导入凭据」——
+        // 用户会去重新导入一份好凭据，而真实原因是**等几分钟就好**。
+        // ⚠️ 必须把 `model` 一起传进去（2026-10-22）：不传就只能报笼统的
+        // 「暂时没有可用账号」，而真实原因常常是**这一个模型**在冷却
+        // —— 用户看到那句话会去翻面板，却只看到一个健康的号。
+        ? (await describeNoAccount(env, activeRealm, providerId, model))
         : `供应商「${provider.name}」请求失败：${lastError.message}`,
       'provider_error',
     ),
@@ -1915,32 +3549,106 @@ async function handleProviderChat(input: {
  * ⚠️ 不能一律说「请先导入凭据」（实测踩到的误导）：
  * 账号可能只是**在冷却/熔断**里（`until` / `breakerUntil` / `degradeUntil`），
  * 等几分钟自己就好了。让用户去重新导入凭据是纯粹的浪费时间。
+ *
+ * ## 🔴 判据必须直接复用 `healthyForModel()`，绝不自己再列一遍维度
+ *（2026-10-22 实测事故，用户截图）
+ *
+ * 现场：5 个并行子代理请求 `qodercn/dfmodel`，全部得到
+ * `503 供应商「qodercn」暂时没有可用账号（请稍后重试或查看面板状态）`。
+ * 而面板上那个账号 `disabled=false`、`credits=4562`、四个账号级冷却**全为 0**，
+ * 唯一的异常是 `modelCooldowns['dfmodel']`（上游排队 10605 打上的模型级冷却）。
+ *
+ * 根因：本函数手抄了一份「这号为什么不可用」的判据，且**抄漏了两个维度**：
+ *
+ * | 维度 | `pick()`（`healthyForModel`） | 本函数（旧） |
+ * |---|---|---|
+ * | `disabled` | ✅ | ✅ |
+ * | `until` / `breakerUntil` / `degradeUntil` | ✅ | ✅ |
+ * | **`restrictedUntil`**（11140 上游限制） | ✅ | ❌ 漏 |
+ * | **`modelCooldowns[model]`**（模型级冷却） | ✅ | ❌ 漏 |
+ *
+ * ⇒ 只因模型级冷却（或上游限制）不可用时，全部落进最后的兜底文案。
+ * 那句「暂时没有可用账号」对用户是**误导**：账号根本没坏，等冷却过去
+ * 或**换个模型**就行；而「查看面板状态」只会看到一个健康的号，无从下手。
+ *
+ * ⚠️ 这与 `modelExempt` 漏 `restrictedUntil`、`shouldPunish` 与
+ * `mapErrorToPunishment` 漂移是**同一类缺陷**（本项目最反复的一类）：
+ * 同一个判据写了两份，改一份漏一份。
+ * ⇒ 故这里**直接调用共享判据**，物理上不可能再漂。
+ *
+ * @param model 请求的模型名。只有传了它才能说清「是这个模型被冷却」——
+ *              不传则退化为只判账号级维度（仍比手抄准确）。
  */
 export async function describeNoAccount(
   env: Env,
   realm: string,
   provider: string,
+  model = '',
 ): Promise<string> {
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-  const accounts = (await pool.listAccounts(realm, Date.now())).filter(
+  const now = Date.now()
+  // ⚠️ 用 `listAccounts(realm, now)`：它在内部会 `pruneExpired`，
+  // 否则已自然到期的模型冷却会让下面误报「还在冷却」。
+  const accounts = (await pool.listAccounts(realm, now)).filter(
     (a) => (a.provider ?? 'workbuddy') === provider,
   )
   if (accounts.length === 0) {
     return `供应商「${provider}」没有账号（请先在面板导入该供应商的凭据）`
   }
-  const now = Date.now()
-  const cooling = accounts.filter((a) => a.until > now || a.breakerUntil > now || a.degradeUntil > now)
-  if (cooling.length > 0) {
-    // 取最长的剩余时间（用户关心的是「还要等多久」）
-    const waits = cooling.map((a) => Math.max(a.until, a.breakerUntil, a.degradeUntil) - now)
-    const maxWait = Math.max(...waits)
-    const mins = Math.max(1, Math.round(maxWait / 60_000))
-    return `供应商「${provider}」的 ${accounts.length} 个账号都在冷却中（因连续失败触发退避），约 ${mins} 分钟后自动恢复`
-  }
+
+  // ⚠️ 顺序很重要：先说「最具体」的原因，再说笼统的。
+  // 用户看到「被上游限制」能立刻明白重试无用、要换号；
+  // 看到「模型冷却」能立刻换模型；看到「没有可用账号」则完全无从下手
+  // —— 故它必须是**最后**才可能出现的一句话。
+
   const disabled = accounts.filter((a) => a.disabled)
   if (disabled.length === accounts.length) {
     return `供应商「${provider}」的账号都被手动禁用了（请在面板启用）`
   }
+
+  // 上游明确标记的账号级限制（11140）：与「我们自己怀疑它不行」的冷却分开说，
+  // 因为处置不同（这个只能等或换号，重试无用）。
+  const restricted = accounts.filter((a) => a.restrictedUntil > now)
+  if (restricted.length === accounts.length) {
+    const waits = restricted.map((a) => a.restrictedUntil - now)
+    const mins = Math.max(1, Math.round(Math.max(...waits) / 60_000))
+    return `供应商「${provider}」的账号被上游判定为异常行为并限制使用（11140），约 ${mins} 分钟后到期。`
+      + '这不是本地配置问题，重试不会恢复；如需立即使用请换供应商或换号。'
+  }
+
+  // 账号级冷却（soft / hard / breaker / degrade）。
+  const cooling = accounts.filter(
+    (a) => a.until > now || a.breakerUntil > now || a.degradeUntil > now,
+  )
+  if (cooling.length === accounts.length) {
+    const waits = cooling.map((a) => Math.max(a.until, a.breakerUntil, a.degradeUntil) - now)
+    const mins = Math.max(1, Math.round(Math.max(...waits) / 60_000))
+    return `供应商「${provider}」的 ${accounts.length} 个账号都在冷却中（因连续失败触发退避），约 ${mins} 分钟后自动恢复`
+  }
+
+  // ── 模型级冷却：最常见、也最容易被误报成「没账号」的一维 ──
+  //
+  // ⚠️ 判据复用 `healthyForModel`（与 `pick()` **同一份**），不再手写维度。
+  if (model !== '') {
+    const healthyForIt = accounts.filter((a) => healthyForModel(a, now, model))
+    if (healthyForIt.length === 0) {
+      // 全部账号对该模型都在冷却。取**最短**的剩余时间：
+      // 用户关心的是「最快什么时候能用」，不是「最坏要等多久」。
+      const waits = accounts
+        .map((a) => {
+          const mc = a.modelCooldowns[model]
+          return mc === undefined ? 0 : mc.until - now
+        })
+        .filter((w) => w > 0)
+      if (waits.length > 0) {
+        const mins = Math.max(1, Math.round(Math.min(...waits) / 60_000))
+        return `供应商「${provider}」的 ${accounts.length} 个账号对模型「${model}」都在冷却中`
+          + `（上游限流/排队或该后端无此模型），最快约 ${mins} 分钟后恢复。`
+          + '换一个模型通常立刻可用 —— 账号本身是好的。'
+      }
+    }
+  }
+
   return `供应商「${provider}」暂时没有可用账号（请稍后重试或查看面板状态）`
 }
 
@@ -2101,14 +3809,19 @@ async function nonStreamingResponse(
   // `finish_reason` 为 `'tool_calls'`）。不排除就会把一次**成功**的工具调用
   // 误报成「上游返回空响应」—— 那是比原缺陷更糟的假阳性
   //（工具调用是 agent 场景的主路径）。
-  const toolCalls = (choice?.message as { tool_calls?: unknown[] } | undefined)?.tool_calls
-  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0
-  if (
-    choice !== undefined
-    && !hasToolCalls
-    && choice.message.content === ''
-    && (choice.message.reasoning_content ?? '') === ''
-  ) {
+  /**
+   * ⚠️ 判据已抽到 `stream.ts` 的 `isEmptyAssistantTurn`（2026-10-21 审查后）。
+   *
+   * 原来这里手写一遍 `content==='' && reasoning_content===''` + 排除 `tool_calls`，
+   * 而 `responses.ts` 的非流式路径**没有这段** —— 同一概念两套口径，
+   * 结果是 `/v1/chat/completions` 报 502、`/v1/responses` 回 **200 空答案**。
+   *
+   * 换用共用函数后：
+   * - 两条路径**结构上不可能再漂移**；
+   * - 顺带补上原来漏判的 `refusal`（合法拒答）与旧式 `function_call` ——
+   *   漏掉它们会把**有产出的响应**反向误报成「上游空响应」502。
+   */
+  if (isEmptyAssistantTurn(choice)) {
     // ⚠️ **先处理「整个响应体就是一个 JSON（不是 SSE）」的情况**。
     //
     // 实测踩到：某些上游（如 CodeArts 经华为 APIG）在 HTTP **200** 下直接
@@ -2251,12 +3964,10 @@ async function handleAggregateChat(input: {
   realm: string
   ctx?: ExecutionContext
   sessionKey: string
-  /** 子密钥上下文（透传下来记账用；主密钥时为 `undefined`）。 */
-  subkey?: SubkeyContext
 }): Promise<GatewayResult> {
-  const { model, rawBody, request, env, realm, ctx, sessionKey, subkey } = input
+  const { model, rawBody, request, env, realm, ctx, sessionKey } = input
 
-  const virtuals = await loadAggregateCatalog(env, realm)
+  const virtuals = await loadAggregateCatalog(env, realm, { signal: request.signal })
   if (virtuals.length === 0) {
     return {
       response: jsonError(
@@ -2346,7 +4057,7 @@ async function handleAggregateChat(input: {
   }
 
   // 逐个候选试。**只在「还没输出内容就失败」时换下一个**。
-  let lastError: { status: number; message: string } | undefined
+  let lastError: { status: number; message: string; kind?: string } | undefined
   const tried: string[] = []
   for (const c of ranked) {
     // ⚠️ 把请求体里的 `model` 换成**该渠道的真实 id**再派发。
@@ -2366,7 +4077,6 @@ async function handleAggregateChat(input: {
         env,
         realm,
         ...(ctx !== undefined ? { ctx } : {}),
-        ...(subkey !== undefined ? { subkey } : {}),
         tried: [],
         sessionKey,
         // ⚠️ 聚合层**自己**有候选轮转循环，故禁止它内部的跨渠道容灾
@@ -2419,14 +4129,47 @@ async function handleAggregateChat(input: {
  * ⚠️ 单家失败**只跳过它**（记日志），不让整个聚合不可用 ——
  * 一家凭据过期不该让「用哪家更划算」这件事整个失效。
  */
-async function loadAggregateCatalog(env: Env, realm: string): Promise<ReturnType<typeof buildVirtualModels>> {
+/**
+ * 聚合目录的**总预算**。
+ *
+ * 🔴 为什么必须有（2026-10-21 审查补，并发专项）：
+ * 这里原本**逐家串行**、每家 `AbortSignal.timeout(20_000)`，
+ * 而 `providerIds()` 有 14 家 ⇒ 最坏 **280 秒**才吐出第一个 token，
+ * 期间既不接客户端取消、也没有总超时 —— 客户端早就断了，
+ * 我们还在替它排队打上游（既烧配额也烧 CPU）。
+ *
+ * 给 12 秒总预算：正常情况（每家 1~3 秒、且多数家没账号直接返回空）
+ * 远小于它；真有一家卡住时，宁可让聚合目录**少几家**，
+ * 也不能让用户等 4 分钟。缺席的家在下次请求会自动补上（无缓存副作用）。
+ */
+const AGGREGATE_CATALOG_BUDGET_MS = 12_000
+
+async function loadAggregateCatalog(
+  env: Env,
+  realm: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<ReturnType<typeof buildVirtualModels>> {
   const catalogs: ProviderCatalog[] = []
+  const startedAt = Date.now()
+  const skipped: string[] = []
+
   for (const providerId of providerIds()) {
     if (providerId === AGGREGATE_PROVIDER_ID) continue
     const provider = findProvider(providerId)
     if (provider === undefined || !provider.capabilities.listModels) continue
+
+    // ⚠️ 客户端已经断开就别再打上游了 —— 继续排队只会白烧配额
+    if (options.signal?.aborted === true) {
+      skipped.push(`${providerId}(客户端已取消)`)
+      break
+    }
+    if (Date.now() - startedAt > AGGREGATE_CATALOG_BUDGET_MS) {
+      skipped.push(providerId)
+      continue
+    }
+
     try {
-      const models = await listModelsForProvider(env, realm, providerId)
+      const models = await listModelsForProvider(env, realm, providerId, options.signal)
       if (models.length > 0) catalogs.push({ provider: providerId, models })
     } catch (error) {
       console.warn(
@@ -2434,6 +4177,12 @@ async function loadAggregateCatalog(env: Env, realm: string): Promise<ReturnType
         error instanceof Error ? error.message : String(error),
       )
     }
+  }
+
+  if (skipped.length > 0) {
+    console.warn(
+      `[aggregate] 目录预算 ${AGGREGATE_CATALOG_BUDGET_MS}ms 用尽或请求已取消，本次跳过：${skipped.join(', ')}`,
+    )
   }
   return buildVirtualModels(catalogs)
 }
@@ -2449,6 +4198,7 @@ async function listModelsForProvider(
   env: Env,
   realm: string,
   providerId: string,
+  outerSignal?: AbortSignal,
 ): Promise<import('../providers/types.js').ProviderModel[]> {
   // ⚠️ 分片消歧：国际版在 global 分片，优先走其规范分片
   const targetRealm = providerId === 'workbuddy' ? 'global' : realm
@@ -2481,8 +4231,15 @@ async function listModelsForProvider(
   if (credential === undefined) return []
 
   const bound = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : provider
+  // ⚠️ 单家 20s 上限 + **外层取消**：两者任一触发都要停（否则客户端走了我们还在等）
+  const timeoutSignal = AbortSignal.timeout(20_000)
+  const signal = outerSignal === undefined
+    ? timeoutSignal
+    : (typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([timeoutSignal, outerSignal])
+        : timeoutSignal)
   try {
-    return await bound.listModels(credential, AbortSignal.timeout(20_000))
+    return await bound.listModels(credential, signal)
   } catch (error) {
     // ⚠️ 目录拉取失败时**不在这里续期**：续期需要 `putCredential` 回写，
     // 而那套逻辑在 `index.ts` 的 `withRefreshRetry` 里（私有的）。

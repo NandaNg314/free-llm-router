@@ -93,6 +93,19 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
   `)
 
   let activeTimer: NodeJS.Timeout | undefined
+  /**
+   * alarm 处理器**正在执行中**的标志。
+   *
+   * ⚠️ 为什么需要它：`triggerAlarm` 一进来就 `clearTimer()`，于是**整个 handler
+   * 执行期间** `activeTimer === undefined` —— 若此时有 GC（`pruneIdle`）跑过来，
+   * 会把「正在算」的实例误判成 idle 并回收，下次 `get()` 新建第二个实例读写
+   * **同一份 SQLite、同一个 uid** ⇒ 重复执行 / 进度互相覆盖。
+   *
+   * 而 TaskRunner 的**单个 alarm 内**确实会长时间阻塞（`chat5` / `blackCat`
+   * 等在一步里循环 + `await setTimeout`，可轻易超过 5 分钟的 GC 空窗），
+   * 故这个标志是必需的。
+   */
+  let running = false
 
   const clearTimer = () => {
     if (activeTimer !== undefined) {
@@ -114,12 +127,14 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
 
   const triggerAlarm = async () => {
     clearTimer()
-    // 执行前从数据库清理记录
-    db.prepare('DELETE FROM system_alarms WHERE id = ?').run(instanceId)
-
     if (!onAlarm) return
 
+    running = true
     try {
+      // 🔴 **执行前清理记录**必须在 try 内（2026-10-21 审查补，并发专项）：
+      // 原来写在 try **之外**，`SQLITE_FULL`/只读库时这条语句一抛，
+      // 错误连 `console.error` 都进不去，且直接冒成 unhandledRejection ⇒ 杀进程。
+      db.prepare('DELETE FROM system_alarms WHERE id = ?').run(instanceId)
       await onAlarm()
     } catch (err) {
       console.error(`[Node Alarm Error for ${instanceId}]`, err)
@@ -131,9 +146,15 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
          ON CONFLICT(id) DO UPDATE SET scheduled_time = excluded.scheduled_time`,
       ).run(instanceId, retryAt)
       activeTimer = setTimeout(() => {
-        void triggerAlarm()
+        // ⚠️ 必须 catch：`void` 一个会 reject 的 promise = unhandledRejection
+        // ⇒ Node 默认**直接杀进程**（整个网关，不只是这个任务）。
+        void triggerAlarm().catch((e) => console.error('[alarm] 重试调度失败：', e))
       }, ALARM_RETRY_DELAY_MS)
       activeTimer.unref?.()
+    } finally {
+      // 执行结束（正常或异常）：无论 handler 内部是否已 setAlarm 续期，
+      // 都不能再标记为「执行中」——否则 GC 永远收不了这个实例。
+      running = false
     }
   }
 
@@ -144,7 +165,7 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
   if (pendingAlarmRow.length > 0) {
     const delay = Math.max(0, pendingAlarmRow[0].scheduled_time - Date.now())
     activeTimer = setTimeout(() => {
-      void triggerAlarm()
+      void triggerAlarm().catch((e) => console.error('[alarm] 恢复调度失败：', e))
     }, delay)
     activeTimer.unref?.()
   }
@@ -208,7 +229,7 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
       clearTimer()
       const delay = Math.max(0, timeMs - Date.now())
       activeTimer = setTimeout(() => {
-        void triggerAlarm()
+        void triggerAlarm().catch((e) => console.error('[alarm] 执行失败：', e))
       }, delay)
       // 不阻止 Node.js 进程退出（但在常驻服务中由 HTTP 服务器保持运行）
       activeTimer.unref?.()
@@ -229,6 +250,22 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
 
   return {
     storage,
+    /**
+     * 与 Cloudflare 真实语义一致：`ctx.id.name` 是 `idFromName()` 传入的名字。
+     *
+     * ## 为什么必须补上（2026-10-22）
+     *
+     * `AccountPoolDO` 需要知道自己服务的是哪个 realm（cn / global），
+     * 才能把账号读写限定在本分片内 —— 因为**所有 realm 共用一张 `accounts` 表**，
+     * 只按 uid 查会跨 realm 串味（探针实测：cn 的账号被 global 的同 uid 覆盖）。
+     *
+     * 真实 Cloudflare 环境本来就有 `ctx.id.name`，只有本 Node 适配层漏了 ——
+     * 补上它，业务代码就能用**平台原生语义**而不是自己维护一份我是谁的映射。
+     */
+    id: {
+      name: instanceId.includes(':') ? instanceId.slice(instanceId.indexOf(':') + 1) : instanceId,
+      toString: () => instanceId,
+    },
     async blockConcurrencyWhile<T>(fn: () => Promise<T>): Promise<T> {
       return await fn()
     },
@@ -240,12 +277,15 @@ export function createNodeDurableObjectState(options: NodeDurableObjectStateOpti
     /**
      * 本适配层的**内部**方法（非 Cloudflare DurableObjectState 标准接口）。
      *
-     * 供 `NodeDurableObjectNamespace` 判断该实例是否还有未决 alarm：
-     * 有则**不可回收**（回收会连同定时器一起丢弃，任务永久卡死），
-     * 无则说明实例处于 idle，可安全从内存 Map 中移除（下次用时重建）。
+     * 供 `NodeDurableObjectNamespace` 判断该实例是否**忙**（不可回收）：
+     * - `activeTimer !== undefined`：已排了未触发的 alarm；
+     * - `running === true`：alarm 处理器**正在执行**（此时定时器已清空，
+     *   但绝不能回收 —— 否则会新建第二个实例操作同一份数据）。
+     *
+     * 两者皆为假时才说明实例真正 idle，可安全从内存 Map 移除（下次用时重建）。
      */
     __hasPendingAlarm(): boolean {
-      return activeTimer !== undefined
+      return activeTimer !== undefined || running
     },
   }
 }

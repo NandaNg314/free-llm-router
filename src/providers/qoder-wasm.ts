@@ -77,11 +77,8 @@ const WASM_MODULE = wasmModule as unknown as WebAssembly.Module
 async function compileWasm(raw: unknown): Promise<WebAssembly.Module> {
   if (raw instanceof WebAssembly.Module) return raw
 
-  // ⚠️ 用 `WebAssembly.instantiate(bytes, {})` 而不是 `WebAssembly.compile`：
-  // 本项目的 tsconfig 是 `lib: ["ES2022"]`（无 DOM），
-  // `WebAssembly.compile` 的声明来自 DOM lib，故在此不可见。
-  // `instantiate` 有 ES2022 的声明，且**顺带**得到 instance ——
-  // 但我们只取 `.module`（真正的实例化在下面按真实 import 表做）。
+  // ⚠️ `WebAssembly.compile` 的声明来自 DOM lib（本项目 `lib: ["ES2022"]` 不可见），
+  // 故下面对它做一次签名断言；运行时 Node / Workers 都有该函数。
   /**
    * ⚠️ 统一归一成 `Uint8Array` 而**不是** `ArrayBuffer`：`ArrayBufferView.buffer`
    * 的类型是 `ArrayBufferLike`（含 `SharedArrayBuffer`），而 `BufferSource`
@@ -97,25 +94,20 @@ async function compileWasm(raw: unknown): Promise<WebAssembly.Module> {
 
   if (bytes !== undefined) {
     /**
-     * ⚠️ **`WebAssembly.instantiate` 在两种 tsconfig 下解析到不同的重载**。
+     * 🔴 **只编译、不实例化**（真实缺陷：Node/VPS 部署 Qoder 恒失败）。
      *
-     * 本项目是 `lib: ["ES2022"]`（**无 DOM**），`WebAssembly` 的声明来自
-     * `@cloudflare/workers-types`；那里只暴露了
-     * `instantiate(module: Module, …) => Promise<Instance>` 这一个重载。
-     * 而这里传的是**字节**，运行时会走另一个重载并返回
-     * `{ module, instance }` —— 故 TS 报 `Property 'module' does not exist
-     * on type 'Instance'`（纯粹是声明缺失，不是行为问题）。
-     *
-     * 修法：**只对「被调用的函数」本身断言签名**，而不是对返回值做
-     * `as unknown as { module }` —— 后者会把 `Instance` 类型整个抹掉，
-     * 万一将来真传错参数（传了 Module 却取 `.module`）也检查不出来。
+     * 原写法 `instantiate(bytes, {})` 用**空 import 表**实例化 —— 这个 wasm
+     * 声明了 `./qoder_auth_wasm_bg.js` 的 import，空表必然抛
+     * `Import #0 "./qoder_auth_wasm_bg.js": module is not an object or function`。
+     * wrangler 给的是现成 Module、走不到这里，所以 Workers 上一直正常；
+     * 而 Node 构建（esbuild `binary` loader 给字节）**每次推理都在这里炸**，
+     * 网关只看到一句 `unknown: unexpected status 0`。
+     * 真正的实例化在下面按真实 import 表做，这里只要 Module。
      */
-    const instantiateFromBytes = WebAssembly.instantiate as unknown as (
-      bytes: BufferSource,
-      imports: Record<string, unknown>,
-    ) => Promise<{ module: WebAssembly.Module; instance: WebAssembly.Instance }>
-    const result = await instantiateFromBytes(bytes, {})
-    return result.module
+    const compile = (WebAssembly as unknown as {
+      compile: (bytes: BufferSource) => Promise<WebAssembly.Module>
+    }).compile
+    return await compile(bytes)
   }
 
   // ⚠️ 不静默降级：拿不到可编译的 wasm 就无法生成签名头，
@@ -133,8 +125,31 @@ async function compileWasm(raw: unknown): Promise<WebAssembly.Module> {
  */
 const IMPORT_MODULE = './qoder_auth_wasm_bg.js'
 
-/** 客户端版本（影响 `Cosy-Version` 与签名载荷）。 */
+/**
+ * 客户端版本（影响 `Cosy-Version` 头**与签名载荷**）。
+ *
+ * ⚠️ **这个值直接参与签名**（见 `prepareQoderInfer` 里写进 stack 的 `version`），
+ * 改错会让上游回 `403 Signature invalid` —— 不是"旧一点也无所谓"的装饰性头。
+ *
+ * 当前值 1.1.49 来自最初的参考实现，**没有留下可核验的依据**。
+ * 上游若升级 CLI，可用 `QODER_COSY_VERSION` 环境变量覆盖而不必改代码：
+ * shuishuipingan/qoder2api-hub 的 PR #75 对照官方 qodercli 1.1.75 与桌面端 0.4.8
+ * 指出网关应升到 1.1.75，但该版本号**在本环境无法独立核实**（npm 上查不到
+ * `qodercli`），故不盲改默认值 —— 只把覆盖入口打开，等实测确认后再动常量。
+ */
 export const QODER_COSY_VERSION = '1.1.49'
+
+/**
+ * 实际使用的客户端版本：`QODER_COSY_VERSION` 优先，便于上游升级时无需改代码。
+ *
+ * 用 `globalThis` 探测而不是直接写 `process`：本模块同时要跑在 Workers
+ *（没有 `process`）与 Node（有）上，直接引用会让 Workers 构建期的类型检查失败。
+ */
+export function cosyVersion(): string {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+  const trimmed = (env?.QODER_COSY_VERSION ?? '').trim()
+  return trimmed === '' ? QODER_COSY_VERSION : trimmed
+}
 
 /** `generate_runtime_auth_fields` 的产物。 */
 export interface QoderRuntimeAuthFields {
@@ -345,6 +360,85 @@ interface Glue {
 
 let gluePromise: Promise<Glue> | null = null
 
+/**
+ * 🔴 **WASM 访问互斥锁**（严格串行）。
+ *
+ * ## 为什么必须有（2026-10-22 线上故障）
+ *
+ * `getGlue()` 返回的是**模块级单例**，而 WASM 实例的以下资源全部共享：
+ * - 线性内存 `exports.memory`（唯一的 `Uint8Array` 视图）
+ * - 栈指针（`__wbindgen_add_to_stack_pointer` 是**全局**偏移，不是每调用一份）
+ * - wasm-bindgen 的对象堆（`pushObject` / `takeObject` 共用一个数组）
+ * - `lastLength` 这类可变状态
+ *
+ * 而 `prepareQoderInfer` 里有**多处 `await`**（`getGlue()`、鉴权字段生成），
+ * 每条 chat 请求都会调用它 ⇒ 理论上并发请求可能在**同一份堆栈上交错**。
+ *
+ * ## ⚠️ 诚实记录：这条锁是**纵深防御**，不是已证实的根因修复
+ *
+ * 线上确实见过（2026-10-22）：
+ * ```
+ * 供应商「Qoder (中国版)」请求失败：unknown: Qoder 请求失败：unreachable
+ * ```
+ * `unreachable` 是 wasm 以 `panic=abort` 编译时的 Rust panic/trap 文本。
+ *
+ * 但我**没能复现**它，且 A/B 实验推翻了我的并发假设：
+ * - 去掉本锁后，20 个并发 `generateRuntimeAuthFields` **依然全部成功**；
+ * - 15 种 payload 形态（空/超长/emoji/孤立代理/NUL/工具调用/多轮）全部正常；
+ * - 最大 4.6 MB body（1765 条消息）也正常。
+ *
+ * ⇒ 加锁的理由是**违反了一条已有约束**，而不是「已证明它能修好那个报错」：
+ * 本文件注释原本就写明「`QoderContext` 指针**不可跨并发复用**」，
+ * 而我们此前把同一个实例复用给了所有并发请求。修它是本分，但不要声称它解释了那次故障。
+ *
+ * 那条报错真正**已修好**的部分是文案（见 `qoder.ts` 的 `wasmPanic` 分支）：
+ * 原文案让用户以为账号/网关坏了，而它与账号无关 —— 官方客户端正常即可证明。
+ *
+ * ## 实现：一条 promise 链
+ *
+ * `wasmChain` **永不 reject**（用 `then(() => undefined, () => undefined)` 续链），
+ * 否则一个请求失败会让后续所有请求永久卡死 —— 那是比崩溃更难查的故障。
+ * 调用方拿到的仍是原始结果/错误（`run` 直接返回）。
+ *
+ * ⚠️ **不可重入**：锁内不能再调加锁的函数（会死锁）。
+ * 故内部统一用 `buildRuntimeAuthFields(g, user)` 这个**不加锁**的版本。
+ */
+let wasmChain: Promise<unknown> = Promise.resolve()
+
+/** 在 WASM 互斥锁内执行（严格串行，失败不会阻塞后续请求）。 */
+function withWasmLock<T>(fn: () => T | Promise<T>): Promise<T> {
+  const run = wasmChain.then(() => fn())
+  wasmChain = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
+/**
+ * 丢弃当前 WASM 实例，让**下一次调用重建一个干净的**。
+ *
+ * ## 为什么必须有（2026-10-22 线上 `unreachable` 故障的兜底）
+ *
+ * 那次 panic 我**复现不出来**（详见 `withWasmLock` 的说明）。对一个
+ * 「可能发生、但无法复现的状态损坏」正确的工程处置不是猜根因，
+ * 而是**让它自愈**：
+ *
+ * 单例是模块级缓存 `gluePromise`。若某个实例真的进入了损坏状态
+ *（堆/栈指针错乱），那么**之后每一条请求都会撞同一个坏实例** ——
+ * 用户看到的就是「一直 502，重试也没用」，直到重启进程。
+ * 而官方客户端重开一次就好，这正是他为什么觉得「官方能用」。
+ *
+ * ⇒ 检出 wasm panic 时**主动丢弃**缓存，下次调用 `createGlue()` 重新实例化。
+ * 代价是重编译一次 wasm（毫秒级），换来的是「故障不再持续」。
+ *
+ * ⚠️ 只在**确认是 wasm 层错误**时调用（见 `qoder.ts` 的 `wasmPanic` 判据）。
+ * 不能对普通网络错误也重置 —— 那会让每个抖动都白付一次实例化成本。
+ */
+export function resetQoderWasm(): void {
+  gluePromise = null
+}
+
 async function getGlue(): Promise<Glue> {
   gluePromise ??= createGlue()
   return gluePromise
@@ -536,9 +630,18 @@ async function createGlue(): Promise<Glue> {
   }
 }
 
-/** 生成运行时鉴权字段（`encrypt_user_info` / `key`）。 */
+/** 生成运行时鉴权字段（`encrypt_user_info` / `key`）。**加锁**。 */
 export async function generateRuntimeAuthFields(user: QoderWasmUserInfo): Promise<QoderRuntimeAuthFields> {
-  const g = await getGlue()
+  return withWasmLock(async () => buildRuntimeAuthFields(await getGlue(), user))
+}
+
+/**
+ * 同上的**不加锁**版本 —— 供已在锁内的 `prepareQoderInfer` 调用。
+ *
+ * ⚠️ 拆开是为了避免**死锁**：`withWasmLock` 不可重入，
+ * 锁内再调一次加锁函数会永远等自己。
+ */
+function buildRuntimeAuthFields(g: Glue, user: QoderWasmUserInfo): QoderRuntimeAuthFields {
   const payload = JSON.stringify({
     uid: user.uid,
     security_oauth_token: user.securityOauthToken,
@@ -577,9 +680,11 @@ export async function prepareQoderInfer(options: {
   clientVersion?: string
   ask: QoderInferAsk
 }): Promise<QoderInferRequest> {
-  const g = await getGlue()
-  const fields = await generateRuntimeAuthFields(options.user)
-  const version = options.clientVersion ?? QODER_COSY_VERSION
+  return withWasmLock(async () => {
+    const g = await getGlue()
+    // ⚠️ 用**不加锁**的内部版本：本函数已在锁内，再调加锁版会死锁。
+    const fields = buildRuntimeAuthFields(g, options.user)
+    const version = options.clientVersion ?? cosyVersion()
 
   const userInfoJson = JSON.stringify({
     uid: options.user.uid,
@@ -633,10 +738,11 @@ export async function prepareQoderInfer(options: {
     return out
   }
 
-  return {
-    // ⚠️ 参数顺序：(栈指针, ptr) —— 与直觉相反
-    url: readResultString((stack, ptr) => g.exports.requestresult_url!(stack, ptr)),
-    headers,
-    body: readResultString((stack, ptr) => g.exports.requestresult_body!(stack, ptr)),
-  }
+    return {
+      // ⚠️ 参数顺序：(栈指针, ptr) —— 与直觉相反
+      url: readResultString((stack, ptr) => g.exports.requestresult_url!(stack, ptr)),
+      headers,
+      body: readResultString((stack, ptr) => g.exports.requestresult_body!(stack, ptr)),
+    }
+  })
 }

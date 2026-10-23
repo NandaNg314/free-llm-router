@@ -120,16 +120,24 @@ export interface ProviderModel {
   supportsImage: boolean
   /** 是否免费额度模型。 */
   isFree: boolean
-  /** 本周期官方倍率 / 倍率（如 "x0.00", "x0.11", "x0.51"）。 */
-  credits?: string
   /**
    * **计费倍率**（可选）。
    *
-   * 上游下发的形态各异（buddy 给 `"x0.21"` 字符串、lobsterai 给数字 `0.05`、
-   * trae 藏在字符串化 JSON 里），由各 provider 自己解析成数字后填这里。
+   * ⚠️ 用 `number | undefined` 而不是 `string`：
+   * 上游下发的是 `"x0.21"` 这种**形态各异**的字符串（有的家可能给数字），
+   * 由各 provider 自己解析成数字后填这里。
    * `undefined` = **该家没提供**（不是「免费」，也不是「不可用」）。
    */
   priceFactor?: number
+  /**
+   * 可选思考档位（上游明确列出的才有，如 WorkBuddy 的 `reasoning.supportedEfforts`）。
+   * `/v1/models` 会以 `reasoning_efforts` 透出，面板据此生成 DSH 的 `reasoningEfforts`。
+   */
+  reasoningEfforts?: string[]
+  /** 默认思考档位。 */
+  defaultEffort?: string
+  /** 能否关闭思考（只认上游显式给的布尔）。 */
+  canDisableThinking?: boolean
 }
 
 /** 余额信息（统一形状）。 */
@@ -313,6 +321,11 @@ export function splitModelName(
     if (knownProviders.includes(head)) {
       return { provider: head, model: raw.slice(slash + 1) }
     }
+    // 前缀大小写不敏感：客户端里手填的 `Workbuddy/…` 也该落到 `workbuddy`，
+    // 而不是被当成默认供应商的一个（不存在的）模型名。供应商 id 全小写，不会撞车。
+    const lower = head.toLowerCase()
+    const canonical = knownProviders.find((p) => p.toLowerCase() === lower)
+    if (canonical !== undefined) return { provider: canonical, model: raw.slice(slash + 1) }
   }
   return { provider: defaultProvider, model: raw }
 }
