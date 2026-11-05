@@ -98,6 +98,7 @@ export const NEEDS_REAL_CHAT: ReadonlySet<string> = new Set([
   'expert_use_douyinyin',
   'expert_use_shangjia_xuanchuan',
   'expert_use_bowangwang',
+  'WorkBuddy_Valorant',
   'Expert_team_use_3',
   'skill_1',
   'Expert_lighthouse',
@@ -703,6 +704,10 @@ const ACTIONS: Record<string, ActionHandler> = {
   async expertUseBowangwang(ctx, _step, env): Promise<ActionResult> {
     return await runNamedExpert(ctx, env, 'expert_use_bowangwang', NAMED_EXPERTS.expert_use_bowangwang)
   },
+  /** `WorkBuddy_Valorant`：无畏契约拼豆专家（+100，活动截止 2026-11-15）。 */
+  async valorantExpert(ctx, _step, env): Promise<ActionResult> {
+    return await runNamedExpert(ctx, env, 'WorkBuddy_Valorant', NAMED_EXPERTS.WorkBuddy_Valorant)
+  },
 
   /**
    * `black_cat`：夜猫子——窗口内做若干次 glm-5.2 真实对话并上报。
@@ -1017,6 +1022,17 @@ const NAMED_EXPERTS: Record<string, { expertId: string; name: string; keyword: s
   expert_use_douyinyin: { expertId: 'ex_FbY5nlWTqDod', name: '斗音音', keyword: '抖音策略师' },
   expert_use_shangjia_xuanchuan: { expertId: 'ex_Weo3x2EZuSDm', name: '商家宣传设计师', keyword: '商家宣传页与海报设计师' },
   expert_use_bowangwang: { expertId: 'ex_WZY136wV5aMt', name: '播旺旺', keyword: '直播电商教练' },
+  /**
+   * `WorkBuddy_Valorant`（无畏契约拼豆专家，+100）。
+   *
+   * ⚠️ 它的 `jump_url` 是 `workbuddy://expert`（**没有 expertId**），
+   * 所以这里写死社区实测的 id（`ex_xQHHD1u5Jkua`，实测市场版本 v1.3.1）。
+   * 验证方式：关键词搜「无畏契约」命中 3 条，该 id 在列表里。
+   *
+   * ⚠️ 活动截止 **2026-11-15**，过期后这个任务会从列表消失 ——
+   * 届时 `runNamedExpert` 的「已完成则跳过」会先命中，不会报错。
+   */
+  WorkBuddy_Valorant: { expertId: 'ex_xQHHD1u5Jkua', name: '无畏契约拼豆专家', keyword: '无畏契约' },
 }
 
 /**

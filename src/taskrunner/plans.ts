@@ -55,6 +55,8 @@ export const REAL_CHAT_ACTIONS: ReadonlyArray<{ code: string; action: string }> 
   { code: 'expert_use_douyinyin', action: 'expertUseDouyinyin' },
   { code: 'expert_use_shangjia_xuanchuan', action: 'expertUseShangjia' },
   { code: 'expert_use_bowangwang', action: 'expertUseBowangwang' },
+  // 无畏契约拼豆专家（+100，活动截止 2026-11-15；同样要真实对话）
+  { code: 'WorkBuddy_Valorant', action: 'valorantExpert' },
   { code: 'Expert_team_use_3', action: 'expertTeamUse3' },
   { code: 'skill_1', action: 'skill1' },
   { code: 'Expert_lighthouse', action: 'expertLighthouse' },
