@@ -144,9 +144,21 @@ export function readCredential(sql: SqlStorage, uid: string): string | undefined
     ?.ciphertext
 }
 
+/**
+ * 读凭据的最后写入时刻（epoch ms；没有记录返回 `undefined`）。
+ *
+ * ⚠️ 用途只有**保活节流**：判断「这枚凭据多久没被刷新过了」。
+ * 不能拿它当凭据有效性判据 —— 它只说明「我们最后一次写它是什么时候」，
+ * 不说明上游是否仍然认它。
+ */
+export function readCredentialUpdatedAt(sql: SqlStorage, uid: string): number | undefined {
+  const row = firstRow(sql.exec<{ updated_at: number }>('SELECT updated_at FROM credentials WHERE uid = ?', uid))
+  const at = row?.updated_at
+  return typeof at === 'number' && Number.isFinite(at) && at > 0 ? at : undefined
+}
+
 /** 写凭据密文（**入参必须是已加密的密文**，本层不做加密）。 */
-export function writeCredential(sql: SqlStorage, uid: string, ciphertext: string, now: number): void {
-  sql.exec(
+export function writeCredential(sql: SqlStorage, uid: string, ciphertext: string, now: number): void {  sql.exec(
     `INSERT INTO credentials (uid, ciphertext, updated_at) VALUES (?, ?, ?)
      ON CONFLICT(uid) DO UPDATE SET ciphertext = excluded.ciphertext, updated_at = excluded.updated_at`,
     uid,

@@ -212,6 +212,24 @@ export interface AccountState {
   /** 连续 12153 计数。达阈值（3）才禁用 —— 单次多为网络抖动。 */
   sessionDeadFails: number
 
+  /**
+   * **连续鉴权失败计数**（401 / 403 / `auth_error`）。
+   *
+   * 达到阈值（3）⇒ 自动 `disabled` + `reason='需重新登录'`。
+   *
+   * ## 为什么需要（2026-11-05 线上事故）
+   *
+   * AMD VPS 上账号 `2f7e22bc` 连续 **13 天**每小时报 `upstream 401`（293 次），
+   * 而面板一直显示「正常」—— 因为它的 `expiresAt` 写着 9 天后才过期，
+   * 续期判据永远不触发，也没有任何机制把「一直 401」变成「需重新登录」。
+   *
+   * ⚠️ 与 `sessionDeadFails` 分开：那是 12153（会话失效，续期可救），
+   * 这是鉴权失败（续期也救不回来 ⇒ 只能重登）。
+   * ⚠️ 只在**续期之后仍然鉴权失败**时累加（见 `refreshAccountBalances`）——
+   * 先续期、救不回来才判死，避免把「能自动续期的过期」误杀成「需重登」。
+   */
+  authFailStreak: number
+
   // ── 观测与账本 ──
   successCount: number
   errTotal: number
@@ -320,6 +338,7 @@ export function createAccountState(input: {
     degradeUntil: 0,
     consecutiveFails: 0,
     sessionDeadFails: 0,
+    authFailStreak: 0,
     successCount: 0,
     errTotal: 0,
     lastSuccess: 0,
@@ -415,6 +434,7 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
     degradeUntil: num('degradeUntil', base.degradeUntil),
     consecutiveFails: num('consecutiveFails', base.consecutiveFails),
     sessionDeadFails: num('sessionDeadFails', base.sessionDeadFails),
+    authFailStreak: num('authFailStreak', base.authFailStreak),
     successCount: num('successCount', base.successCount),
     errTotal: num('errTotal', base.errTotal),
     lastSuccess: num('lastSuccess', base.lastSuccess),

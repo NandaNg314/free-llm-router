@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 
-export type View = 'providers' | 'usage' | 'tasks' | 'apikeys' | 'models' | 'config' | 'logs'
-export const VIEWS: View[] = ['providers', 'usage', 'tasks', 'apikeys', 'models', 'config', 'logs']
+export type View = 'providers' | 'usage' | 'tasks' | 'media' | 'apikeys' | 'models' | 'config' | 'logs'
+export const VIEWS: View[] = ['providers', 'usage', 'tasks', 'media', 'apikeys', 'models', 'config', 'logs']
 
 function parse(): View {
   const v = location.hash.replace(/^#\/?/, '') as View

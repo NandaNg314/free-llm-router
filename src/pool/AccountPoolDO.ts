@@ -53,6 +53,7 @@ import {
   pruneSessions,
   readAccount,
   readCredential,
+  readCredentialUpdatedAt,
   readLoginSession,
   readSession,
   writeAccount,
@@ -262,6 +263,15 @@ const RESTRICTION_WAVE_THRESHOLD = 2
  * - `RESTRICTION_POOL_HOLD_MS`：整个区域多久不发任何上游请求。
  */
 const RESTRICTION_POOL_HOLD_MS = 30 * 60 * 1000
+
+/**
+ * **连续鉴权失败几次就自动停用**（401/403 且续期也救不回来）。
+ *
+ * ⚠️ 与 `session_dead`（12153）的阈值**同为 3**：单次多为网络抖动，
+ * 一次就杀号会误杀健康账号（`state.go:27-40` 记录过 13 个号被误 disable 的 P0）。
+ * ⚠️ 计数只在「已尝试续期仍失败」时累加，成功一次即清零 —— 见 `noteAuthSuccess`。
+ */
+const AUTH_FAIL_LIMIT = 3
 
 /** 选号候选上限（Go 侧 top5）。 */
 const TOP_N = 5
@@ -1944,6 +1954,73 @@ export class AccountPoolDO extends DurableObject<Env> {
     const key = requireCredentialKey(this.env.CREDENTIAL_KEY)
     const ciphertext = await encryptCredential(key, credential)
     writeCredential(this.ctx.storage.sql, uid, ciphertext, now)
+  }
+
+  /**
+   * 读凭据的**最后写入时刻**（epoch ms）。
+   *
+   * ⚠️ 只用于「保活节流」：判断这枚凭据多久没刷新过了。
+   * **不是**有效性判据 —— 写入时刻新 ≠ 上游还认它。
+   *
+   * 存在的理由：国内版凭据的 `expiresAt` 经常是 **0（未知）**，
+   * 而 `refreshExpiringCredentials` 遇到 0 会直接 `continue` ⇒
+   * 「到期才续期」这条策略对它们**永远不触发**，只能等 401 兜底。
+   * 有了这个时间戳，就能实现「不管到期时间，N 天没刷过就刷一次」的保活。
+   */
+  async credentialUpdatedAt(uid: string): Promise<number | undefined> {
+    return readCredentialUpdatedAt(this.ctx.storage.sql, uid)
+  }
+
+  /**
+   * 记录一次**鉴权成功**：清零连续鉴权失败计数。
+   *
+   * ⚠️ 必须清零：否则偶发 401（网络抖动 / 上游瞬时故障）会累积到阈值，
+   * 把健康账号误判成「需重新登录」。
+   */
+  async noteAuthSuccess(uid: string): Promise<void> {
+    const state = this.readState(uid)
+    if (state === undefined) return
+    if (state.authFailStreak === 0) return
+    state.authFailStreak = 0
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), Date.now())
+  }
+
+  /**
+   * 记录一次**鉴权失败**（续期之后仍然失败的那种）。
+   *
+   * 连续 {@link AUTH_FAIL_LIMIT} 次 ⇒ 自动 `disabled` + `reason='需重新登录'`。
+   *
+   * ## 🔴 为什么必须自动禁用（2026-11-05 线上事故）
+   *
+   * 账号 `2f7e22bc` 连续 **13 天**每小时报 `upstream 401`（共 **293 次**）：
+   * 它的 `expiresAt` 写着 9 天后才过期 ⇒ 续期判据永不触发；
+   * 它当时没有流量 ⇒ 请求路径的续期重试也轮不到它。
+   * 结果它一直空转、面板一直显示「正常」，**4211 积分白白闲置两周**。
+   *
+   * ⚠️ 自动禁用是**可见的**（面板红标 + 日志），比「静默空转」好得多 ——
+   * 用户至少要能看到「这个号需要重新登录」。
+   * ⚠️ 不删凭据：重登即可恢复，不丢任何数据。
+   *
+   * @returns 计数与是否本次触发了自动禁用
+   */
+  async noteAuthFailure(uid: string, now: number, reason: string): Promise<{ streak: number; disabled: boolean }> {
+    const state = this.readState(uid)
+    if (state === undefined) return { streak: 0, disabled: false }
+    // ⚠️ 已经停用的不再累加（否则每次 cron 都会重写一遍库，纯浪费配额）
+    if (state.disabled) return { streak: state.authFailStreak, disabled: false }
+
+    state.authFailStreak += 1
+    state.lastErr = now
+    let disabled = false
+    if (state.authFailStreak >= AUTH_FAIL_LIMIT) {
+      state.disabled = true
+      // ⚠️ `reason` 是共用字段（同时承载冷却原因与停用原因），这里写明是**鉴权**失败，
+      // 让用户在面板上能直接知道「该重新登录」而不是「去查别的问题」。
+      state.reason = `需重新登录：${reason}（连续 ${state.authFailStreak} 次）`
+      disabled = true
+    }
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    return { streak: state.authFailStreak, disabled }
   }
 
   /**

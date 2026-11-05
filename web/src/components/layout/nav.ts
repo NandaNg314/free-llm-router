@@ -1,4 +1,4 @@
-import { Activity, Boxes, KeyRound, LayoutGrid, ListChecks, ScrollText, Settings2, type LucideIcon } from 'lucide-react'
+import { Activity, Boxes, ImagePlay, KeyRound, LayoutGrid, ListChecks, ScrollText, Settings2, type LucideIcon } from 'lucide-react'
 import type { View } from '@/lib/router'
 
 export interface NavItem {
@@ -34,6 +34,12 @@ export const NAV: { group: string; items: NavItem[] }[] = [
         label: '任务中心',
         icon: ListChecks,
         desc: '签到、成长任务与限时补偿积分',
+      },
+      {
+        view: 'media',
+        label: '媒体与检索',
+        icon: ImagePlay,
+        desc: '生成图片、联网搜索、抓取网页正文',
       },
     ],
   },

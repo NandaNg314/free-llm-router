@@ -107,7 +107,11 @@ test('网页端打卡：完整流程成功，JSON-RPC 顺序正确且必发 sess
   assert.equal(r.conversationId, 'conv1')
   assert.equal(r.status, 'completed')
   assert.equal(r.modelPinned, true)
-  assert.deepEqual(m.rpcs.map((x) => x.method), ['initialize', 'session/load', 'session/set_model', 'session/prompt'])
+  // ⚠️ 最后一条 `session/stop` 是**收尾**（2026-11-05 新增）：不收尾的会话会占着
+  // 该账号的活跃会话配额（上限 10 条），攒满后再也建不出会话。
+  assert.deepEqual(m.rpcs.map((x) => x.method),
+    ['initialize', 'session/load', 'session/set_model', 'session/prompt', 'session/stop'])
+  assert.equal(r.released, true, `收尾必须成功：${r.releaseNote}`)
   assert.deepEqual(m.rpcs[2]?.params, { sessionId: 's1', modelId: DEFAULT_DAILY_CHAT_MODEL })
   assert.deepEqual(m.rpcs[1]?.params, { sessionId: 's1', cwd: '/w', mcpServers: [] })
   for (const rpc of m.rpcs) {
@@ -193,8 +197,60 @@ test('parseSseMessages：只取 data 行里的 JSON 对象', () => {
   assert.deepEqual(msgs, [{ a: 1 }])
 })
 
-test('intlDaily 计划：只有一步 webDailyChat，且动作已注册', () => {
-  const steps = planByName('intlDaily')
+test('intlDaily 计划：只有一步 webDailyChat，且动作已注册', () => {  const steps = planByName('intlDaily')
   assert.deepEqual(steps.map((s) => s.action), ['webDailyChat'])
   assert.ok(registeredActions().includes('webDailyChat'))
+})
+
+test('🔴 会话必须收尾：stop 失败要退到 DELETE，两条都失败才记 released=false', async () => {
+  // ## 为什么这条必须钉住（2026-11-05）
+  //
+  // 国际版单个账号的**活跃会话上限是 10 条**。原有的实现跑完就返回，
+  // 什么都不收尾 —— 每天一条 ⇒ **第 11 天起活跃打卡必然全挂**，
+  // 而且错误长相是「沙箱未就绪」，与真实原因（配额满）毫无关系。
+  //
+  // ⚠️ 这是**静默累积型**故障：前十天一切正常，第十一天突然全坏。
+
+  // ① 正常路径：`session/stop` 成功 ⇒ released=true，不额外打 DELETE
+  {
+    const m = mockUpstream()
+    const r = await runWebDailyChat(INPUT, { fetchImpl: m.fetchImpl, ...fakeClock() })
+    assert.equal(r.released, true)
+    const deletes = m.calls.filter((c) => c.method === 'DELETE')
+    assert.equal(deletes.length, 0, '⚠️ stop 成功就不该再打 DELETE（省一次子请求）')
+  }
+
+  // ② stop 失败 ⇒ 必须退到 `DELETE /console/as/conversations/{id}`
+  {
+    const m = mockUpstream({ failMethod: 'session/stop' })
+    const r = await runWebDailyChat(INPUT, { fetchImpl: m.fetchImpl, ...fakeClock() })
+    assert.equal(r.ok, true, '收尾失败不该把成功变成失败')
+    assert.equal(r.released, true, `必须靠 DELETE 兜底释放：${r.releaseNote}`)
+    const deletes = m.calls.filter((c) => c.method === 'DELETE' && c.url === `${WEB_CONVERSATIONS_URL}conv1`)
+    assert.equal(deletes.length, 1, '⚠️ stop 失败时必须 DELETE 兜底')
+  }
+
+  // ③ 失败路径（会话跑挂）也要收尾 —— 半路失败的会话同样占配额
+  {
+    const m = mockUpstream({ statuses: ['running', 'failed'] })
+    const r = await runWebDailyChat(INPUT, { fetchImpl: m.fetchImpl, ...fakeClock() })
+    assert.equal(r.ok, false)
+    assert.equal(r.released, true, '失败会话也必须释放')
+    assert.match(r.detail, /收尾/)
+  }
+})
+
+test('🔴 ACP 会话 id 必须取 initialize 的返回值，不能拿网页会话 id 充数', async () => {
+  // 网页会话 id（`conv1`）与 ACP 会话 id（沙箱内，`s1`）**不是一回事**。
+  // 原实现把前者直接传给 `session/load` ⇒ 那条调用必然失败。
+  const m = mockUpstream()
+  await runWebDailyChat(INPUT, { fetchImpl: m.fetchImpl, ...fakeClock() })
+  for (const rpc of m.rpcs) {
+    if (rpc.method === 'initialize') continue
+    assert.equal(
+      rpc.params.sessionId,
+      's1',
+      `⚠️ ${rpc.method} 必须用沙箱会话 id（s1），不能是网页会话 id（conv1）`,
+    )
+  }
 })

@@ -324,3 +324,47 @@ export const useResetApiKey = () => useAction((k: ApiKey) => api<{ key: string }
 
 export const useResetApiKeyUsage = () =>
   useAction((k: ApiKey) => api('/admin/apikeys/reset-usage', { json: { id: k.id } }), ['apikeys'], '窗口用量已清零')
+
+// ── 媒体能力（生图 / 联网检索 / 抓网页） ──
+//
+// ⚠️ 这三个能力**只有国际版账号支持**（实测国内分片 401）。
+// 服务端已做默认 realm 解析（没给 ?realm= 时自动选 global），
+// 前端**不需要**拼参数 —— 拼了反而会在没有国际账号的部署上写死错误值。
+
+export interface GeneratedImage {
+  url: string
+  size?: string
+}
+
+export function useGenerateImage() {
+  return useMutation<{ created: number; data: GeneratedImage[]; usage?: { credit?: number } }, Error, { prompt: string; size?: string }>({
+    mutationFn: (v) =>
+      api('/v1/images/generations', {
+        json: v,
+        // ⚠️ 上游出图实测 10~15 秒，默认 30 秒够，但给到 120 秒避免慢时有假超时
+        timeoutMs: 120_000,
+      }),
+    onError: (e) => toast.error('生成失败', { description: e.message }),
+  })
+}
+
+export interface SearchHit {
+  title: string
+  url: string
+  snippet: string
+  date?: string
+}
+
+export function useWebSearch() {
+  return useMutation<{ query: string; results: SearchHit[]; total_results?: number }, Error, { query: string }>({
+    mutationFn: (v) => api('/v1/search', { json: { query: v.query, max_results: 6 }, timeoutMs: 90_000 }),
+    onError: (e) => toast.error('搜索失败', { description: e.message }),
+  })
+}
+
+export function useWebFetch() {
+  return useMutation<{ url: string; title: string; content: string }, Error, { url: string }>({
+    mutationFn: (v) => api('/v1/fetch', { json: v, timeoutMs: 90_000 }),
+    onError: (e) => toast.error('抓取失败', { description: e.message }),
+  })
+}

@@ -73,6 +73,16 @@ export interface WebDailyChatResult {
   chunks: number
   /** `session/set_model` 是否成功（false ⇒ 这一轮可能按付费模型计费）。 */
   modelPinned: boolean
+  /**
+   * **收尾是否成功**（`session/stop` 或 `DELETE` 任一成功）。
+   *
+   * ⚠️ 必须往外暴露：未收尾的会话**占着该账号的活跃会话配额**
+   *（上游上限 10 条），攒满后**再也建不出新会话** —— 明日的活跃打卡会直接失败，
+   * 而失败原因看起来像「沙箱未就绪」，与真实原因（配额满）毫无关系。
+   */
+  released: boolean
+  /** 收尾方式的说明（排障用：「为什么 released=false」）。 */
+  releaseNote: string
   elapsedMs: number
   detail: string
 }
@@ -136,7 +146,8 @@ export async function runWebDailyChat(
   const started = now()
 
   const result: WebDailyChatResult = {
-    ok: false, conversationId: '', status: '', updates: 0, chunks: 0, modelPinned: false, elapsedMs: 0, detail: '',
+    ok: false, conversationId: '', status: '', updates: 0, chunks: 0, modelPinned: false,
+    released: false, releaseNote: '未执行', elapsedMs: 0, detail: '',
   }
   const finish = (ok: boolean, detail: string): WebDailyChatResult => {
     result.ok = ok
@@ -165,6 +176,57 @@ export async function runWebDailyChat(
     } catch {
       return ''
     }
+  }
+
+  /**
+   * 🔴 **收尾：释放会话**（2026-11-05 补，社区实践确认的必要步骤）。
+   *
+   * ## 为什么必须有
+   *
+   * 国际版单个账号的**活跃会话上限是 10 条**。跑完不收尾的会话会一直挂着，
+   * 攒满后 `POST /console/as/conversations/` 直接建不出新会话 ——
+   * 而错误长相是「沙箱未就绪」，与真实原因（配额满）毫无关系，极难排查。
+   *
+   * ⇒ 每日打卡每天建一条 ⇒ **第 11 天起必然全挂**，且是静默累积的。
+   *
+   * ## 两种收尾方式（依次尝试，任一成功即可）
+   *
+   * 1. **ACP `session/stop`**：通过沙箱的 JSON-RPC 通道正式终止这一轮（最干净，
+   *    上游会立刻回收沙箱）；
+   * 2. **`DELETE /console/as/conversations/{id}`**：直删会话记录（兜底）。
+   *    沙箱可能还在跑，但会话条目消失后不再占配额。
+   *
+   * ⚠️ 两者都失败才记 `released=false` —— 那要如实报到面板上，
+   * 否则用户只会在 **10 天后**突然发现「活跃打卡全失败」。
+   */
+  const releaseConversation = async (
+    conversationId: string,
+    stop: (() => Promise<void>) | undefined,
+  ): Promise<{ released: boolean; note: string }> => {
+    const notes: string[] = []
+    if (stop !== undefined) {
+      try {
+        await stop()
+        return { released: true, note: 'session/stop 已终止' }
+      } catch (error) {
+        notes.push(`stop: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    try {
+      const res = await doFetch(WEB_CONVERSATIONS_URL + encodeURIComponent(conversationId), {
+        method: 'DELETE',
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      // ⚠️ 404 也算成功：会话已经不在了 = 配额已释放（幂等）
+      if (res.ok || res.status === 404) {
+        return { released: true, note: notes.length > 0 ? `DELETE 兜底成功（${notes.join('；')}）` : 'DELETE 已删除' }
+      }
+      notes.push(`DELETE: HTTP ${res.status}`)
+    } catch (error) {
+      notes.push(`DELETE: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    return { released: false, note: notes.join('；') || '未知原因' }
   }
 
   // 1. 建会话（只是排队）
@@ -220,6 +282,20 @@ export async function runWebDailyChat(
   let sseReader: ReadableStreamDefaultReader<Uint8Array> | undefined
   let pump: Promise<void> | undefined
   let promptDone = false
+  /**
+   * 收尾用：`session/stop` 闭包（**必须在 SSE 通道关闭前**调用）。
+   *
+   * ⚠️ 在 try 里赋值，在 finally 里消费 —— 声明放在外面是为了跨块可见。
+   * 未赋值 = 通道都没建立起来，没什么可 stop 的，直接走 DELETE 兜底。
+   */
+  let stopAcp: (() => Promise<void>) | undefined
+  /**
+   * 失败原因（在 catch 里落笔，在 finally 的收尾之后统一 `finish`）。
+   *
+   * ⚠️ 不能在 catch 里直接 return：那样会跳过 finally 之后的收尾结果回填，
+   * 失败路径就看不到 `released` —— 而「失败且没释放」正是最需要报警的组合。
+   */
+  let failure = ''
   try {
     const sse = await doFetch(link, {
       method: 'GET',
@@ -268,7 +344,7 @@ export async function runWebDailyChat(
       })()
     }
 
-    const rpc = async (id: number, method: string, params: Obj): Promise<void> => {
+    const rpcRaw = async (id: number, method: string, params: Obj): Promise<Obj> => {
       const res = await doFetch(link, {
         method: 'POST',
         headers: {
@@ -281,20 +357,59 @@ export async function runWebDailyChat(
         body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
         signal: AbortSignal.timeout(timeoutMs),
       })
-      // 读完响应体（同参考实现）；读不完（流式响应超时）不算失败
-      await res.text().catch(() => '')
+      const text = await res.text().catch(() => '')
       if (res.status !== 200 && res.status !== 202) throw new WebAgentError(`${method} 返回 HTTP ${res.status}`)
+      // ⚠️ ACP 可能用 SSE 包一层（`data: {...}`），也可能直接回 JSON —— 两种都认。
+      if (text.trim() === '') return {}
+      const direct = (() => {
+        try {
+          const parsed = JSON.parse(text) as unknown
+          return isObj(parsed) ? parsed : undefined
+        } catch {
+          return undefined
+        }
+      })()
+      if (direct !== undefined) return direct
+      const frames = parseSseMessages(text)
+      return frames.find((f) => f.id === id) ?? {}
     }
 
-    await rpc(1, 'initialize', { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: CLIENT_CAPABILITIES })
-    await rpc(2, 'session/load', { sessionId, cwd, mcpServers: [] })
+    const rpc = async (id: number, method: string, params: Obj): Promise<void> => {
+      await rpcRaw(id, method, params)
+    }
+
+    // ⚠️ `initialize` 的 result 里带 **agent 侧 sessionId** —— 后续所有 ACP 调用
+    // 必须用它，不能用网页会话 id（两者不是一回事：前者是沙箱内 ACP 会话，
+    // 后者是 `console/as/conversations` 的资源 id）。
+    //
+    // 原实现直接把网页会话 id 当成 ACP sessionId 传给 `session/load`，
+    // 那条调用必然失败（我们只做了「不致命」的容错，所以从表面看不出问题）。
+    let acpSessionId = sessionId
     try {
-      await rpc(3, 'session/set_model', { sessionId, modelId: model })
+      const initRes = await rpcRaw(1, 'initialize', {
+        protocolVersion: ACP_PROTOCOL_VERSION,
+        clientCapabilities: CLIENT_CAPABILITIES,
+      })
+      const fromInit = str(isObj(initRes.result) ? (initRes.result as Obj).sessionId : '')
+      if (fromInit !== '') acpSessionId = fromInit
+    } catch {
+      // initialize 失败会让后面全部失败 —— 由下面的 rpc 调用如实报错
+    }
+    await rpc(2, 'session/load', { sessionId: acpSessionId, cwd, mcpServers: [] })
+    try {
+      await rpc(3, 'session/set_model', { sessionId: acpSessionId, modelId: model })
       result.modelPinned = true
     } catch {
       result.modelPinned = false
     }
-    await rpc(4, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: prompt }] })
+    await rpc(4, 'session/prompt', { sessionId: acpSessionId, prompt: [{ type: 'text', text: prompt }] })
+
+    /**
+     * 收尾用的 `session/stop`（在 SSE 通道关闭**之前**才能发，故这里先备好闭包）。
+     *
+     * ⚠️ 用独立 id（99）避免与 1–4 冲突。
+     */
+    stopAcp = () => rpc(99, 'session/stop', { sessionId: acpSessionId })
 
     // 4. 轮询会话状态（completed 才算数）
     const deadline = now() + waitMs
@@ -312,16 +427,39 @@ export async function runWebDailyChat(
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
-    return finish(false, `网页端会话失败：${reason}`)
+    failure = `网页端会话失败：${reason}`
   } finally {
+    /**
+     * 🔴 **收尾必须在关闭 SSE 之前做**（2026-11-05 补）。
+     *
+     * `session/stop` 走的是同一条 ACP 通道，通道先 abort 就发不出去了。
+     * 顺序错了会静默退化成「只能 DELETE」—— 能救，但沙箱要多跑一会儿、
+     * 也更容易被上游判成「客户端异常断开」。
+     *
+     * ⚠️ 收尾本身**不许抛**：会话已经跑完了，收尾失败不该把成功变成失败
+     *（但必须如实报到 `released` / `releaseNote` 上）。
+     */
+    try {
+      const r = await releaseConversation(conversation, stopAcp)
+      result.released = r.released
+      result.releaseNote = r.note
+    } catch (error) {
+      result.released = false
+      result.releaseNote = `收尾异常：${error instanceof Error ? error.message : String(error)}`
+    }
     sseAbort.abort()
     await sseReader?.cancel().catch(() => {})
     await pump?.catch(() => {})
   }
 
+  // ⚠️ 收尾之后才判成功/失败：收尾失败**不影响** ok（见 finally 的注释），
+  // 但要在 detail 里如实说一句，面板上才看得到「明天可能建不出会话」。
+  if (failure !== '') return finish(false, `${failure}；收尾：${result.releaseNote}`)
+
   return finish(
     true,
     `网页端会话跑完：${result.chunks} 段输出`
-      + (result.modelPinned ? `（模型 ${model}）` : `（⚠️ session/set_model 失败，可能按默认模型计费）`),
+      + (result.modelPinned ? `（模型 ${model}）` : `（⚠️ session/set_model 失败，可能按默认模型计费）`)
+      + `；收尾：${result.released ? result.releaseNote : `⚠️ 未释放（${result.releaseNote}）`}`,
   )
 }

@@ -288,32 +288,71 @@ export function startServer(options: ServerOptions = {}) {
   // 3. 常驻后台计划任务（模拟 Cloudflare Cron，每小时整点分发）
   let cronInterval: NodeJS.Timeout | undefined
   if (autoCron) {
-    let lastDispatchedHour = -1
+    /**
+     * 🔴 **用 UTC+8 的小时戳做键，绝不能用本地时区**（2026-11-05 修）。
+     *
+     * ## 原实现的问题
+     *
+     * ```ts
+     * const now = new Date()
+     * if (now.getMinutes() <= 2 && now.getHours() !== lastDispatchedHour)
+     * ```
+     *
+     * 三处都踩在「本地时区」上：
+     * 1. `getHours()` 读本地小时 —— 服务器是 **UTC**（凤凰城机房、容器默认 UTC），
+     *    今天恰好对；但**任何人给容器加个 `TZ=Asia/Shanghai`**（很自然的想法），
+     *    触发时点就整体错位 8 小时，`SCHEDULE_UTC8[9]` 会在 UTC+8 的 1 点跑；
+     * 2. `getMinutes() <= 2` 是个**脆弱的容差窗**：若进程在 09:03 才起来
+     *    （重启 / 部署 / 容器拉起慢），当天的 9 点签到就**静默漏掉**，
+     *    而日志里只留一句「非任务时点」——极难发现；
+     * 3. 重启后 `lastDispatchedHour = -1`，同一小时可能**重复触发**
+     *    （`growth` 计划含 5 个真实对话任务，重复跑就是重复烧配额）。
+     *
+     * ## 现在的判据
+     *
+     * 小时戳 = `floor((now + 8h) / 1h)`。它有两个好处：
+     * - **与 `SCHEDULE_UTC8` / `utc8DayKey` / `cstDay` 同一套口径**（都是手写 +8），
+     *   服务器时区改成什么都**不影响**调度；
+     * - 天然去重（同一小时只会有一个相等的小时戳），不需要 `getMinutes()` 容差，
+     *   也不会因重启重复触发。
+     *
+     * ⚠️ 唯一代价：进程若在整点后很久才起来，那一小时就跳过了（不会补跑）。
+     * 这是**有意的**——补跑「几个小时前」的签到会与当前时点冲突；
+     * 而 `SCHEDULE_UTC8` 里 9/21 两个时点本身就是互为重试。
+     */
+    const CST_OFFSET_MS = 8 * 60 * 60 * 1000
+    const HOUR_MS = 60 * 60 * 1000
+    const hourKeyOf = (at: number): number => Math.floor((at + CST_OFFSET_MS) / HOUR_MS)
+    let lastHourKey = -1
+
     const checkCron = async () => {
-      const now = new Date()
-      // 每小时整点触发（容差前 3 分钟内）
-      if (now.getMinutes() <= 2 && now.getHours() !== lastDispatchedHour) {
-        lastDispatchedHour = now.getHours()
-        try {
-          console.log(`⏰ [Cron] 触发后台自动任务分发：UTC+8 ${now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`)
-          const ctx = {
-            waitUntil(promise: Promise<unknown>): void {
-              promise.catch((err) => console.error('[Cron waitUntil Error]', err))
-            },
-            passThroughOnException(): void {},
-          }
-          await worker.scheduled(
-            { cron: '0 * * * *', scheduledTime: Date.now() } as any,
-            env,
-            ctx as any,
-          )
-        } catch (err) {
-          console.error('❌ [Cron] 后台任务执行失败:', err)
+      const now = Date.now()
+      const hourKey = hourKeyOf(now)
+      if (hourKey === lastHourKey) return
+      // ⚠️ 先落键再执行：执行期间若再次轮询，不会重复触发（执行本身可能耗时数十秒）
+      lastHourKey = hourKey
+      try {
+        console.log(
+          `⏰ [Cron] 触发后台自动任务分发：UTC+8 ${new Date(now + CST_OFFSET_MS).toISOString().slice(0, 16).replace('T', ' ')}`
+            + `（UTC ${new Date(now).toISOString().slice(0, 16).replace('T', ' ')}）`,
+        )
+        const ctx = {
+          waitUntil(promise: Promise<unknown>): void {
+            promise.catch((err) => console.error('[Cron waitUntil Error]', err))
+          },
+          passThroughOnException(): void {},
         }
+        await worker.scheduled(
+          { cron: '0 * * * *', scheduledTime: now } as any,
+          env,
+          ctx as any,
+        )
+      } catch (err) {
+        console.error('❌ [Cron] 后台任务执行失败:', err)
       }
     }
 
-    // 每 30 秒探测一次分钟变动
+    // 每 30 秒探测一次（30 秒足够精确到「整点后不久」，又不会空转太多）
     cronInterval = setInterval(() => {
       void checkCron()
     }, 30_000)

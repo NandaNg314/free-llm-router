@@ -1140,9 +1140,23 @@ test('🔴 cron 必须做**主动续期**（否则每次凭据过期都先失败
   const fn = src.slice(src.indexOf('async function refreshExpiringCredentials'))
   assert.ok(/provider\?\.refresh === undefined\) continue/.test(fn),
     '⚠️ 没有 refresh 的家必须跳过（zcode/opencode/loomy 无可续期之物）')
-  // ④ ⚠️ `expiresAt === 0` 表示**未知**而非「已过期」，不能拿它去续期
-  assert.ok(/Number\.isFinite\(expiresAt\) \|\| expiresAt <= 0\) continue/.test(fn),
-    '⚠️ expiresAt 为 0/NaN（未知）时必须跳过，不能当成已过期')
+  // ④ 🔴 `expiresAt === 0`（未知）**不能当成「已过期」**，但也**不能永远跳过**
+  //   （2026-11-05 修正，原断言是「必须跳过」，那是错的）。
+  //
+  // 实测：国内版凭据大量 `expiresAt = 0` ⇒ 原判据**永远不成立** ⇒
+  // 这些账号只能等请求撞 401 才续期 ⇒ 几天不用就掉登录。
+  // ⇒ 现在改为两条触发条件：① 距过期 < 1 小时（精确）；② 到期未知且
+  //   距上次写入 > `KEEPALIVE_INTERVAL_MS`（保活兜底）。
+  //
+  // ⚠️ ② 的节流必须来自**持久化的凭据写入时刻**，不能用内存变量 ——
+  // cron 每次可能是新 isolate，内存变量留不住。
+  assert.ok(/const KEEPALIVE_INTERVAL_MS = 24 \* 60 \* 60 \* 1000/.test(src),
+    '⚠️ 必须有保活间隔常量（24 小时）')
+  assert.ok(/credentialUpdatedAt\(/.test(fn),
+    '⚠️ 保活节流必须读持久化的凭据写入时刻（内存变量在 cron 下留不住）')
+  // 有明确到期时间的仍然走精确判据（不能被保活逻辑抢走）
+  assert.ok(/expiryKnown/.test(fn) && /REFRESH_LEAD_MS/.test(fn),
+    '⚠️ 到期时间已知的凭据仍须走「提前 1 小时」的精确判据')
   // ⑤ ⚠️ 逐账号 try（一个坏凭据不该让全场不续期）
   assert.ok(/catch \(error\)[\s\S]{0,300}主动续期失败/.test(fn),
     '⚠️ 必须逐账号兜错，否则一个失败会让后面全部不续期')
@@ -2500,5 +2514,48 @@ test('🔴 裸名别名必须在 splitModelName 之前判定（否则报「未�
   // ⚠️ 只在裸名时生效：显式前缀是用户的明确意图
   assert.ok(/rawModel\.includes\('\/'\) \? undefined : aggregateAliasForBareModel/.test(server),
     '⚠️ 显式写 provider/xxx 时不得被改写成聚合')
+})
+
+test('🔴 余额刷新撞 401 必须尝试续期，续期救不回来才自动停用（线上事故）', () => {
+  // ## 事故（2026-11-05 在 AMD VPS 上实测发现）
+  //
+  // 账号 `2f7e22bc` 连续 **13 天**每小时报 `upstream 401`，共 **293 次**：
+  // - `expiresAt` 写着 9 天后才过期 ⇒ `refreshExpiringCredentials` 永远跳过；
+  // - 它当时没有流量 ⇒ 请求路径的 `withRefreshRetry` 也轮不到它；
+  // - 余额刷新**只打请求、不试续期** ⇒ 空转两周，面板显示「正常」，4211 积分闲置。
+  //
+  // ⇒ 根因是「**只看本地记录的时间**」这个判据本身错了：上游可以提前吊销。
+  //    正确判据是**由实际失败驱动** —— 撞鉴权错误就先续期一次再重试。
+  const src = readFileSync('src/index.ts', 'utf8')
+  const fn = src.slice(src.indexOf('async function refreshAccountBalances'))
+
+  // ① 撞鉴权错误必须尝试续期（而不是直接记为失败）
+  assert.ok(/isAuth.*provider\.refresh === undefined\) throw error/s.test(fn) ||
+    /if \(!isAuth \|\| provider\.refresh === undefined\) throw error/.test(fn),
+    '⚠️ 余额刷新必须区分鉴权错误并尝试续期')
+  assert.ok(/await provider\.refresh\(credential, AbortSignal\.timeout\(30_000\)\)/.test(fn),
+    '⚠️ 必须真的调 refresh')
+  assert.ok(/b = await provider\.balance\(fresh,/.test(fn),
+    '⚠️ 续期后必须重试一次余额查询（续期成功就该救活）')
+
+  // ② 成功必须清零计数（否则偶发 401 累积成误判）
+  assert.ok(/noteAuthSuccess\(/.test(fn), '⚠️ 成功路径必须清零鉴权失败计数')
+
+  // ③ 续期仍失败 ⇒ 连续 N 次自动停用（可恢复：只禁用不删凭据）
+  assert.ok(/noteAuthFailure\(/.test(fn), '⚠️ 续期后仍鉴权失败必须累计并可能自动停用')
+
+  const pool = readFileSync('src/pool/AccountPoolDO.ts', 'utf8')
+  assert.ok(/const AUTH_FAIL_LIMIT = 3/.test(pool), '阈值应为 3（与 session_dead 同口径）')
+  assert.ok(/state\.reason = `需重新登录/.test(pool),
+    '⚠️ 停用原因必须写明「需重新登录」（否则用户不知道该做什么）')
+  // ⚠️ 只禁用、不删凭据：重登即可恢复，积分与账号都还在
+  assert.ok(!/noteAuthFailure[\s\S]{0,800}deleteCredential/.test(pool),
+    '⚠️ 自动停用不得删除凭据')
+
+  // ④ 计数必须持久化（cron 每次可能是新 isolate，内存变量留不住）
+  const state = readFileSync('src/pool/state.ts', 'utf8')
+  assert.ok(/authFailStreak: number/.test(state), '⚠️ 状态里必须有 authFailStreak 字段')
+  assert.ok(/authFailStreak: num\('authFailStreak'/.test(state),
+    '⚠️ normalizeAccountState 必须携带它（否则老记录读出来是 undefined）')
 })
 

@@ -338,3 +338,53 @@ test('envFlag：常见的「关」写法都能关掉', async () => {
   assert.equal(envFlag(undefined, true), true)
   assert.equal(envFlag('乱写', false), false)
 })
+
+test('🔴 cron 调度必须按 UTC+8 算槽位，不能依赖服务器本地时区', async () => {
+  // ## 为什么（2026-11-05）
+  //
+  // 原实现是 `now.getMinutes() <= 2 && now.getHours() !== lastDispatchedHour`，
+  // 三处都踩在**本地时区**上：
+  // 1. 服务器是凤凰城机房的 **UTC**，今天恰好对；但谁给容器加个
+  //    `TZ=Asia/Shanghai`（很自然的想法），触发时点就整体**错位 8 小时**；
+  // 2. `getMinutes() <= 2` 是脆弱容差：09:03 才起来的进程当天 9 点**静默漏签**；
+  // 3. 重启后 `lastDispatchedHour = -1`，同一小时可能**重复触发**
+  //    （`growth` 计划含 5 个真实对话任务，重复跑＝重复烧配额）。
+  //
+  // ⇒ 现在用 `floor((now + 8h) / 1h)` 做键，与 `SCHEDULE_UTC8` / `utc8DayKey`
+  //   同一套口径，服务器时区改成什么都**不影响**调度。
+  const src = fs.readFileSync('src/server/index.ts', 'utf8')
+
+  // ① 不得再用本地时区的 getHours / getMinutes 做判据
+  // ⚠️ 起点取注释里的唯一锚点 —— `if (autoCron)` 在文件里出现多次，
+  //    用它会切到别的地方（我第一版就踩了）。
+  const start = src.indexOf('用 UTC+8 的小时戳做键')
+  assert.ok(start > 0, '应能定位 cron 调度的注释锚点')
+  const cronBlock = src.slice(start, src.indexOf('cronInterval = setInterval', start))
+  // ⚠️ **必须剔掉注释行**：新代码在注释里**引用**了旧写法（"原来是这样写的"），
+  //    直接搜会假失败 —— 这是本项目踩过的「断言命中注释」老坑。
+  const cronCode = cronBlock
+    .split('\n')
+    .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+    .join('\n')
+  assert.ok(!/\.getHours\(\)/.test(cronCode),
+    '⚠️ 不得用 getHours()（本地时区）判断槽位')
+  assert.ok(!/\.getMinutes\(\)/.test(cronCode),
+    '⚠️ 不得用 getMinutes() 容差窗（进程晚起会静默漏签）')
+
+  // ② 必须显式 +8 偏移
+  assert.ok(/CST_OFFSET_MS = 8 \* 60 \* 60 \* 1000/.test(cronCode),
+    '⚠️ 必须手写 UTC+8 偏移（不依赖容器 TZ）')
+  assert.ok(/Math\.floor\(\(at \+ CST_OFFSET_MS\) \/ HOUR_MS\)/.test(src),
+    '⚠️ 槽位键必须是 floor((now+8h)/1h)')
+
+  // ③ 去重必须用小时键（不是「几小时」），否则跨天会误判
+  assert.ok(/hourKey === lastHourKey/.test(cronCode),
+    '⚠️ 必须用小时戳去重（用 0-23 的小时会跨天误判）')
+
+  // ④ 与主逻辑的时点表口径一致：必须是 1/9/21 这三个 UTC+8 时点
+  const main = fs.readFileSync('src/index.ts', 'utf8')
+  const tbl = main.slice(main.indexOf('const SCHEDULE_UTC8'))
+  assert.ok(/1: \{ plan: 'growth'/.test(tbl), 'UTC+8 1 点应为 growth（完整成长计划）')
+  assert.ok(/9: \{ plan: 'daily'/.test(tbl), 'UTC+8 9 点应为 daily（签到）')
+  assert.ok(/21: \{ plan: 'daily'/.test(tbl), 'UTC+8 21 点应为 daily（签到第二趟）')
+})

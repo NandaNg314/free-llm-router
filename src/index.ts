@@ -73,6 +73,8 @@ import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
 import { handleChatCompletions, refineModelScoped, resetMaxRotateCache } from './gateway/server.js'
+import { handleMcp } from './gateway/mcp.js'
+import { editImage, generateImage, mediaCapable, webFetch, webSearch } from './upstream/media.js'
 import { resetSafetyConfigCache, resolveSafetyFor } from './gateway/safety.js'
 import {
   emptyApiKeyUsage,
@@ -4532,6 +4534,171 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return result.response
   }
 
+  // ── OpenAI 兼容：**图像生成**（2026-11-05 新增） ──
+  //
+  // ## 为什么只支持国际版
+  //
+  // 实测（池内真实账号）：国内版 `www.workbuddy.cn` 的 `/v2/images/generations`
+  // 返回 **401**（APISIX 网关层拒绝），国际版 `www.workbuddy.ai` 返回 **200 出图**。
+  // 故这里在 realm 不匹配时**如实报错**，不回落成对话 —— 回落会让客户端拿到
+  // 一段「模型描述图片的文字」，用户以为出图成功了。
+  //
+  // ## 客户端支持
+  // Cherry Studio / ChatBox / Open WebUI / LobeChat / NextChat 等，
+  // 它们都用 DALL·E 的 `/v1/images/generations` 形状。
+  if (path === '/v1/images/generations' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const realm = await resolveMediaRealm(env, url)
+
+    if (!mediaCapable(realm)) {
+      return jsonError(
+        400,
+        `图像生成目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`
+          + '请用 `?realm=global` 调用，或在面板添加 WorkBuddy 国际版账号。',
+        'unsupported_realm',
+      )
+    }
+
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
+    if (prompt === '') return jsonError(400, 'prompt 必填', 'invalid_request')
+
+    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
+    if (credential === undefined) {
+      return jsonError(503, '没有可用的国际版账号（请先在面板登录）', 'no_available_account')
+    }
+
+    try {
+      const r = await generateImage(
+        { uid: credential.uid, accessToken: credential.credential.accessToken },
+        env,
+        {
+          prompt,
+          ...(typeof body.model === 'string' && body.model !== '' ? { model: body.model } : {}),
+          ...(typeof body.size === 'string' && body.size !== '' ? { size: body.size } : {}),
+          ...(typeof body.n === 'number' ? { n: body.n } : {}),
+        },
+      )
+      if (r.images.length === 0) {
+        return jsonError(502, '上游返回成功但没有图片（响应里 data 为空）', 'upstream_error')
+      }
+      return json({
+        created: r.created,
+        data: r.images,
+        ...(r.credit === undefined ? {} : { usage: { credit: r.credit } }),
+      })
+    } catch (error) {
+      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
+    }
+  }
+
+  // ── OpenAI 兼容：**改图 / 图生图** ──
+  if (path === '/v1/images/edits' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const realm = await resolveMediaRealm(env, url)
+    if (!mediaCapable(realm)) {
+      return jsonError(400, `图像编辑目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
+    }
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
+    const image = typeof body.image === 'string' ? body.image.trim() : ''
+    if (prompt === '') return jsonError(400, 'prompt 必填', 'invalid_request')
+    if (image === '') {
+      return jsonError(
+        400,
+        'image 必填。**本网关不会替你下载图片** —— 请传公网可访问的 URL 或 `data:` URL，'
+          + '上游要能直接取到它。',
+        'invalid_request',
+      )
+    }
+    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
+    if (credential === undefined) {
+      return jsonError(503, '没有可用的国际版账号', 'no_available_account')
+    }
+    try {
+      const r = await editImage(
+        { uid: credential.uid, accessToken: credential.credential.accessToken },
+        env,
+        {
+          prompt,
+          image,
+          ...(typeof body.model === 'string' && body.model !== '' ? { model: body.model } : {}),
+          ...(typeof body.size === 'string' && body.size !== '' ? { size: body.size } : {}),
+        },
+      )
+      if (r.images.length === 0) return jsonError(502, '上游返回成功但没有图片', 'upstream_error')
+      return json({
+        created: r.created,
+        data: r.images,
+        ...(r.credit === undefined ? {} : { usage: { credit: r.credit } }),
+      })
+    } catch (error) {
+      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
+    }
+  }
+
+  // ── 联网检索（官方 agenttool 透传） ──
+  //
+  // ⚠️ 这是**非 OpenAI 标准**的扩展端点（OpenAI 没有搜索 API）。
+  // MCP 客户端（Claude Code / Cursor / Cline）走 `/mcp` 的同名工具。
+  if (path === '/v1/search' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const realm = await resolveMediaRealm(env, url)
+    if (!mediaCapable(realm)) {
+      return jsonError(400, `联网检索目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
+    }
+    const query = typeof body.query === 'string' ? body.query.trim() : ''
+    if (query === '') return jsonError(400, 'query 必填', 'invalid_request')
+    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
+    if (credential === undefined) return jsonError(503, '没有可用的国际版账号', 'no_available_account')
+    try {
+      const r = await webSearch(
+        { uid: credential.uid, accessToken: credential.credential.accessToken },
+        env,
+        { query, ...(typeof body.max_results === 'number' ? { maxResults: body.max_results } : {}) },
+      )
+      return json({ query: r.query, results: r.results, ...(r.total === undefined ? {} : { total_results: r.total }) })
+    } catch (error) {
+      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
+    }
+  }
+
+  // ── 抓网页正文（官方 agenttool 透传，返回 markdown） ──
+  if (path === '/v1/fetch' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const realm = await resolveMediaRealm(env, url)
+    if (!mediaCapable(realm)) {
+      return jsonError(400, `网页抓取目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
+    }
+    const target = typeof body.url === 'string' ? body.url.trim() : ''
+    if (!/^https?:\/\//i.test(target)) return jsonError(400, 'url 必须是 http(s) 地址', 'invalid_request')
+    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
+    if (credential === undefined) return jsonError(503, '没有可用的国际版账号', 'no_available_account')
+    try {
+      const r = await webFetch(
+        { uid: credential.uid, accessToken: credential.credential.accessToken },
+        env,
+        { url: target },
+      )
+      return json(r)
+    } catch (error) {
+      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
+    }
+  }
+
+  // ── MCP（Model Context Protocol）端点 ──
+  //
+  // 让 OpenCode / Claude Code / Cursor / Cline 这类 AI 客户端**自动发现并调用**
+  // 我们的联网检索、网页抓取、文生图能力 —— 用户不用为每个工具写集成。
+  //
+  // ⚠️ 位置必须在**鉴权之后**（与其它端点一致）：MCP 能花积分（生图），
+  //    匿名可调用等于把额度公开。
+  // ⚠️ 用 `GET /mcp` 探测的客户端会收到 405 + Allow: POST —— 这是规范允许的
+  //    降级信号，客户端据此退回纯 POST，不要改成 404。
+  if (path === '/mcp') {
+    const r = await handleMcp(request, env)
+    // ⚠️ 通知类请求（无 id）按规范不回响应 ⇒ 回 202 空体
+    return r ?? new Response(null, { status: 202 })
+  }
+
   return json({ error: { message: 'not found', path } }, 404)
 }
 
@@ -4556,6 +4723,44 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
  *
  * ⚠️ 只判 `models` 非空的子密钥；空数组 = 不限制（`modelAllowed` 的既有语义）。
  */
+/**
+ * 解析「媒体能力」用哪个 realm。
+ *
+ * ## 🔴 为什么不直接用 `?realm=` 的默认值
+ *
+ * 生图 / 检索 / 抓网页**只有国际版账号能做**（实测国内 `401`、国际 `200`）。
+ * 而客户端（Cherry Studio / ChatBox / Open WebUI…）**根本没法在配置里加
+ * 查询参数** —— 它们只能填一个基础地址。
+ *
+ * ⇒ 默认值必须是 **global**，而不是给对话用的 `cn`。
+ *
+ * ## 解析顺序
+ *
+ * 1. 调用方**显式**给了 `?realm=` ⇒ 用它（尊重显式意图，包括传 `cn` 时如实报错）；
+ * 2. 没给 ⇒ 看 `global` 分片有没有**可用的国际版账号**：
+ *    - 有 ⇒ `global`（绝大多数部署的正常路径）；
+ *    - 没有 ⇒ 回落到 `cn`，让下面的 `mediaCapable` 如实报「只有国际版支持」，
+ *      而不是报「没有可用账号」—— 后者会让用户以为是账号掉线。
+ *
+ * ⚠️ 这里只决定**报错文案的准确性**，不决定成败：真正的闸门是
+ * `mediaCapable(realm)`。所以「探测账号」失败（DO 读不到）也不该抛错，
+ * 回落到 `global` 让下游走正常的错误路径。
+ */
+async function resolveMediaRealm(env: Env, url: URL): Promise<string> {
+  const explicit = url.searchParams.get('realm')
+  if (explicit !== null && explicit !== '') return explicit
+  try {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    const accounts = await pool.listAccounts('global', Date.now())
+    const hasIntl = accounts.some(
+      (a) => !a.disabled && (a.provider ?? DEFAULT_PROVIDER) === WORKBUDDY_INTL.id,
+    )
+    return hasIntl ? 'global' : 'cn'
+  } catch {
+    return 'global'
+  }
+}
+
 async function subkeyModelDenied(
   request: Request,
   record: ApiKeyRecord | undefined,
@@ -4697,6 +4902,24 @@ function hourUtc8(now: number): number {
 const REFRESH_LEAD_MS = 3_600_000
 
 /**
+ * **保活间隔**：到期时间未知的凭据，多久没刷新就无条件刷一次（24 小时）。
+ *
+ * ## 为什么需要它（2026-11-05）
+ *
+ * `refreshExpiringCredentials` 原来的判据只有「距过期不足 1 小时」。
+ * 而**国内版凭据的 `expiresAt` 大量是 0（未知）** ⇒ 判据永远不成立
+ * ⇒ 这些账号只能靠「请求撞到 401」才续期，几天不用就掉登录。
+ *
+ * 社区同类实现（`workbuddy2api-panel` 的 `schedule.keepalive`）普遍有
+ * 「每天无条件保活一次」的独立任务，理由相同：**refresh token 自己也会过期**。
+ *
+ * ⚠️ 取 24 小时而不是更短：cron 每小时跑一次，更短的间隔会让每个整点
+ * 都对同一批账号打一次续期（白耗上游配额，也扩大风控暴露面）。
+ * ⚠️ 只对**到期时间未知**的生效 —— 有明确时间的仍由 `REFRESH_LEAD_MS` 精确管理。
+ */
+const KEEPALIVE_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+/**
  * 扫一遍所有账号，把**快过期**的凭据提前续掉。
  *
  * 这是「动不动就掉登录」的根治手段：把「撞到 401 才续期」变成
@@ -4709,8 +4932,12 @@ const REFRESH_LEAD_MS = 3_600_000
  * ⚠️ 逐账号 try：单条失败不影响其他账号（一个坏凭据不该让全场不续期）。
  *
  * ⚠️ `expiresAt` 为 0 表示**未知**（不是「已过期」）—— 那是导入凭据时
- * 上游没给过期时间的情形。**不拿它去续期**（无从判断该不该续），
- * 留待请求路径的 401 兜底。
+ * 上游没给过期时间的情形。
+ *
+ * 🔴 **2026-11-05 修正**：原来这里写的是「不拿它去续期（无从判断该不该续）」，
+ * 结果国内版（`expiresAt` 大量为 0）**永远走不到续期**，只能等 401 兜底 ——
+ * 表现就是「几天不用就掉登录」。现在改为：到期时间未知的走
+ * `KEEPALIVE_INTERVAL_MS` 的**保活**（距上次写入超过 24h 就刷一次）。
  */
 /**
  * 把后台任务（续期 / 余额刷新）的失败写进**面板日志**，而不是只进 console
@@ -4767,17 +4994,45 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
       if (credential === undefined) continue
 
       const expiresAt = credential.expiresAt
-      // ⚠️ `0` = **未知**，不是「已过期」（见函数注释）。
-      if (!Number.isFinite(expiresAt) || expiresAt <= 0) continue
-      // 还没到「提前量」窗口 ⇒ 不动它（避免每个整点都白打一次上游）。
-      if (expiresAt - now > REFRESH_LEAD_MS) continue
+      /**
+       * 🔴 **到期时间未知（0）的凭据也必须保活**（2026-11-05 补）。
+       *
+       * 原实现：`expiresAt <= 0 ⇒ continue`。理由是「0 = 未知，无从判断该不该续」。
+       * 但**国内版的凭据就有大量 expiresAt=0**（上游不下发过期时间，导入形态也不带）
+       * ⇒ 这条策略对它们**永远不触发**，只能等请求撞 401 才续期。
+       * 用户感受到的就是「几天不用就掉登录」。
+       *
+       * ⇒ 改成两条触发条件，**任一满足**就续：
+       *   ① 距过期不足 `REFRESH_LEAD_MS`（原有逻辑，精确）；
+       *   ② 到期时间未知，且**距上次写入超过 `KEEPALIVE_INTERVAL_MS`**（新增，兜底）。
+       *
+       * ⚠️ ② 的节流靠「凭据表的 `updated_at`」，不是内存变量 ——
+       * cron 每次都可能是新 isolate，内存变量留不住。
+       * ⚠️ 有明确到期时间的不走 ②：它们由 ① 精确管理，多刷一次是白打上游。
+       */
+      const expiryKnown = Number.isFinite(expiresAt) && expiresAt > 0
+      let due = false
+      let reason = ''
+      if (expiryKnown) {
+        // 还没到「提前量」窗口 ⇒ 不动它（避免每个整点都白打一次上游）。
+        due = expiresAt - now <= REFRESH_LEAD_MS
+        reason = `距过期 ${Math.round((expiresAt - now) / 60_000)} 分钟`
+      } else {
+        const last = await pool.credentialUpdatedAt(account.uid).catch(() => undefined)
+        // 读不到时间戳 ⇒ 按「很久没刷」处理（宁可多刷一次，也不要让它烂在那里）
+        const idle = last === undefined ? Number.POSITIVE_INFINITY : now - last
+        due = idle >= KEEPALIVE_INTERVAL_MS
+        reason = last === undefined
+          ? '到期时间未知且无刷新记录'
+          : `到期时间未知，已 ${Math.round(idle / 3_600_000)} 小时未刷新`
+      }
+      if (!due) continue
 
       try {
         const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
         await pool.putCredential(account.uid, fresh, now)
         console.log(
-          `[cron] ${providerId} ${account.uid} 主动续期成功`
-            + `（原过期于 ${new Date(expiresAt).toISOString()}）`,
+          `[cron] ${providerId} ${account.uid} 主动续期成功（${reason}）`,
         )
       } catch (error) {
         // ⚠️ 如实记原因。**不惩罚账号** —— 续期失败可能是网络抖动，
@@ -4821,8 +5076,7 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
  * - **停用账号也刷新**：用户可能只是临时停用，余额仍需准确（且不消耗请求配额
  *   —— 这是只读端点）。但为省上游调用，**优先只刷启用中的**。
  */
-async function refreshAccountBalances(env: Env, now: number): Promise<void> {
-  let refreshed = 0
+async function refreshAccountBalances(env: Env, now: number): Promise<void> {  let refreshed = 0
   let failed = 0
   let skipped = 0
 
@@ -4855,7 +5109,46 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {
       }
 
       try {
-        const b = await provider.balance(credential, AbortSignal.timeout(20_000))
+        /**
+         * 🔴 **余额刷新也要走续期重试**（2026-11-05 补，线上实测事故）。
+         *
+         * ## 事故
+         *
+         * AMD VPS 上的国内账号 `2f7e22bc`（Enki）**连续 13 天**每小时报
+         * `余额查询失败（auth_error）：upstream 401`，共 **293 次**：
+         * - `expiresAt` 写着 **11-14 才过期** ⇒ `refreshExpiringCredentials` 永远跳过；
+         * - 它当时**没有流量**（`lastSuccess` 停在 10-23），所以请求路径的
+         *   `withRefreshRetry` 也永远轮不到它；
+         * - 余额刷新**只打请求、不试续期** ⇒ 它就这样空转了两周，面板显示「正常」。
+         *
+         * ## 根因（比「refresh token 失效」更普遍）
+         *
+         * **「只看本地记录的时间」这个判据本身是错的**：`expiresAt` 是本地记的，
+         * 上游完全可能**提前吊销**（实测就是）。只要这样，续期就永远不会触发。
+         *
+         * ⇒ 正确判据是**由实际失败驱动**：撞到鉴权错误就先续期一次再重试。
+         * 这与请求路径 `withRefreshRetry` 是同一条纪律，只是这里原来漏了。
+         *
+         * ⚠️ 只对**鉴权类**错误续期（429/5xx 续期没意义，只会白打上游）。
+         * ⚠️ 续期失败**不惩罚账号**（可能是网络抖动），仍按「本轮失败」记录。
+         */
+        let b: Awaited<ReturnType<typeof provider.balance>>
+        try {
+          b = await provider.balance(credential, AbortSignal.timeout(20_000))
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          const isAuth = /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|\b401\b|\b403\b/i.test(message)
+          if (!isAuth || provider.refresh === undefined) throw error
+          console.warn(`[cron] ${providerId} ${account.uid} 余额刷新撞鉴权错误，尝试续期：${message}`)
+          const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
+          await pool.putCredential(account.uid, fresh, now)
+          console.log(`[cron] ${providerId} ${account.uid} 续期成功，重试余额查询`)
+          credential = fresh
+          b = await provider.balance(fresh, AbortSignal.timeout(20_000))
+        }
+        // ⚠️ 走到这里说明「续期也救不回来」或「本来就不是鉴权错误」——
+        // 成功路径必须清零鉴权失败计数（否则偶发失败会累积成误判）。
+        await pool.noteAuthSuccess(account.uid).catch(() => undefined)
         await pool.updateBalance(account.uid, now, {
           credits: b.total,
           expiring: b.expiring,
@@ -4874,6 +5167,36 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {
         failed += 1
         const message = error instanceof Error ? error.message : String(error)
         console.warn(`[cron] ${providerId} ${account.uid} 余额刷新失败（保持原值）：`, message)
+
+        /**
+         * 🔴 **鉴权失败连续 3 次 ⇒ 自动标记「需重新登录」**（2026-11-05 补）。
+         *
+         * 事故：账号 `2f7e22bc` 连续 13 天每小时 401（293 次），
+         * 面板一直显示「正常」—— 没有任何机制把「一直 401」变成可见状态。
+         *
+         * ⚠️ 只在**已经尝试过续期**（上面那段）仍然鉴权失败时才走到这里 ⇒
+         * 「能自动续期的过期」不会被误杀，只有续期也救不回来的才判死。
+         * ⚠️ 阈值 3 与 `session_dead` 同口径（单次多为网络抖动）。
+         * ⚠️ 只禁用、**不删除凭据** —— 用户重新登录即可恢复，积分也还在。
+         */
+        const isAuth = /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|\b401\b|\b403\b/i.test(message)
+        if (isAuth && provider.refresh !== undefined) {
+          const verdict = await pool
+            .noteAuthFailure(account.uid, now, `${providerId} 鉴权失败（续期后仍失败）`)
+            .catch(() => undefined)
+          if (verdict?.disabled === true) {
+            console.warn(
+              `[cron] ${providerId} ${account.uid} 连续 ${verdict.streak} 次鉴权失败，已自动停用（需重新登录）`,
+            )
+            logBackgroundFailure(pool, {
+              uid: account.uid,
+              provider: providerId,
+              action: 'cron:auth',
+              message: `连续 ${verdict.streak} 次鉴权失败（续期也无法恢复），已自动停用，请到面板重新登录`,
+            })
+          }
+        }
+
         // 🔴 同时写进面板日志（与续期失败同处理）。
         logBackgroundFailure(pool, {
           uid: account.uid,

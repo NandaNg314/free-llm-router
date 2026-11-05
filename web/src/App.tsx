@@ -17,6 +17,7 @@ const UsagePage = lazy(() => import('@/pages/UsagePage').then((m) => ({ default:
 const TasksPage = lazy(() => import('@/pages/TasksPage').then((m) => ({ default: m.TasksPage })))
 const ModelsPage = lazy(() => import('@/pages/ModelsPage').then((m) => ({ default: m.ModelsPage })))
 const ConfigPage = lazy(() => import('@/pages/ConfigPage').then((m) => ({ default: m.ConfigPage })))
+const MediaPage = lazy(() => import('@/pages/MediaPage').then((m) => ({ default: m.MediaPage })))
 
 export function App() {
   const [authed, setAuthed] = useState(() => !!auth.get())
@@ -75,6 +76,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
           {view === 'usage' && <UsagePage />}
           {view === 'tasks' && <TasksPage />}
           {view === 'models' && <ModelsPage />}
+          {view === 'media' && <MediaPage />}
           {view === 'config' && <ConfigPage />}
         </Suspense>
       </main>

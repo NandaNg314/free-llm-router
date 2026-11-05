@@ -29,4 +29,16 @@ for f in tests/*.test.ts; do
     --outfile="$OUT/$name.test.mjs" --log-level=warning
 done
 
-node --test "$OUT"/*.test.mjs
+# ⚠️ 分两批跑：node-runtime 会真起 HTTP 服务并写到 stdout，
+# 与 `node --test` 的 IPC 通道抢同一根管道，偶发
+# `Unable to deserialize cloned data` —— 那是**测试运行器**的损坏，不是用例失败
+#（单独跑它能 10/10 通过）。把它隔离出来单跑，避免污染全量结果。
+RUNTIME="$OUT/node-runtime.test.mjs"
+if [ -f "$RUNTIME" ]; then
+  echo "── node-runtime（会起 HTTP 服务，单独跑）──"
+  node --test "$RUNTIME" || exit 1
+  echo "── 其余用例 ──"
+  node --test $(ls "$OUT"/*.test.mjs | grep -v 'node-runtime')
+else
+  node --test "$OUT"/*.test.mjs
+fi
