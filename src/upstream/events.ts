@@ -455,23 +455,58 @@ export function webElementClickEvent(input: {
 }
 
 /** 桌面端「Buddy 应用」进入链（`Buddy_App` / `Buddy_App_QQ` 共用）。 */
-export function desktopBuddyAppSequence(input: { conversationId: string; buddyId: string; now: number }): Event[] {
+/**
+ * 桌面端「进入 Buddy 应用」五连事件（`Buddy_App` / `Buddy_App_QQ`）。
+ *
+ * ## 🔴 2026-11-05 修正：事件名与字段**全部错了**
+ *
+ * 旧实现（上报 200 但进度不涨，回读 0/1）：
+ * ```
+ * buddy_app_discover / buddy_app_show / buddy_app_enter / buddy_app_auth_confirm / buddy_app_bind_skip
+ * ```
+ * 真实事件名（社区三账号实测点亮）是**无下划线的 `buddyapp_` 前缀 + `_click` 后缀**：
+ * ```
+ * buddyapp_discover_click / buddyapp_show / buddyapp_enter_click
+ * buddyapp_auth_confirm_click / buddyapp_bindaccount_skip_click
+ * ```
+ *
+ * ⚠️ 光名字对还不够，**载荷字段**也是判据的一部分：
+ * - `buddyapp_show` / `buddyapp_enter_click` 要带 `elementId` / `elementName` / `position`
+ * - `buddyapp_enter_click` 还要 `isFirstPage: '1'`
+ * - 全部带 `mode: 'LOCAL'` + `buddyId` / `buddyName`
+ *
+ * ⇒ **不要凭直觉拼事件名**。这类判据只能靠真机抓包或社区实测样本对齐，
+ *    拼错不会报错，只会「上报成功但永远不涨进度」。
+ */
+export function desktopBuddyAppSequence(input: {
+  conversationId: string
+  buddyId: string
+  buddyName?: string
+  now: number
+}): Event[] {
   const { conversationId, buddyId, now } = input
+  const buddyName = input.buddyName ?? '企鹅教师助手'
   const mk = (code: string, extra: Event): Event => ({
     eventCode: code,
     conversationId,
     buddyId,
+    buddyName,
     mode: 'LOCAL',
     timestamp: now,
     presentAt: now,
     ...extra,
   })
   return [
-    mk('buddy_app_discover', { action: 'discover' }),
-    mk('buddy_app_show', { action: 'show' }),
-    mk('buddy_app_enter', { action: 'enter' }),
-    mk('buddy_app_auth_confirm', { action: 'auth_confirm' }),
-    mk('buddy_app_bind_skip', { action: 'bind_skip' }),
+    mk('buddyapp_discover_click', {}),
+    mk('buddyapp_show', { elementId: buddyId, elementName: buddyName, position: 2 }),
+    mk('buddyapp_enter_click', {
+      elementId: buddyId,
+      elementName: buddyName,
+      position: 2,
+      isFirstPage: '1',
+    }),
+    mk('buddyapp_auth_confirm_click', { elementId: buddyId, elementName: buddyName }),
+    mk('buddyapp_bindaccount_skip_click', { elementId: buddyId, elementName: buddyName }),
   ]
 }
 
@@ -487,25 +522,62 @@ export function desktopAutomationCreatedEvent(input: { conversationId: string; n
 }
 
 /** 桌面端「模板使用」事件组（`template_5`，每组 2 事件）。 */
+/**
+ * 桌面端「使用模板创建任务」事件组（`template_5`）。
+ *
+ * ## 🔴 2026-11-05 修正：原来缺 chat 链，上游不计分
+ *
+ * 旧实现只发 2 个孤立事件（`agent_task_created_with_template` + `template_used`），
+ * 实测**上报 200 但进度不涨**（回读 0/5）。
+ *
+ * 社区实现（`workbuddy2api-panel` 的 `DesktopTemplateUseSequence`）是：
+ * **完整 chat 链 + 2 个事件**，5 组一次上报 → 三账号实测 5/5 点亮。
+ * 没有 chat 链，服务端认不出这是「一次真实的建任务动作」。
+ *
+ * ## 字段也变了
+ *
+ * 旧实现只带 `template_id`。实测有效的形态要：
+ * - `agent_task_created_with_template`：`mode` / `isCustomModel` / `id` / `name` / `requestId`
+ * - `template_used`：`template_id` / `task_mode`
+ *
+ * ⚠️ `template_id` 服务端**不校验真实性**（社区代码注释明确记了这一点），
+ * 用 `"1"`~`"5"` 即可；但**名字**要与 id 配套（下面用真实的常用模板名）。
+ */
 export function desktopTemplateUseEvents(input: {
   conversationId: string
+  requestId: string
   templateId: string
+  templateName: string
   now: number
 }): Event[] {
-  const { conversationId, templateId, now } = input
+  const { conversationId, requestId, templateId, templateName, now } = input
+  // ⚠️ 先有 chat 链，服务端才把后面的事件当「这次建任务」的一部分
+  const chain = desktopChatSequence({
+    conversationId,
+    requestId,
+    messageId: `msg-${templateId}`,
+    modelId: 'fast-model',
+    modelName: 'fast-model',
+    now,
+  })
   return [
+    ...chain,
     {
       eventCode: 'agent_task_created_with_template',
+      mode: 'working',
+      isCustomModel: false,
+      id: templateId,
+      name: templateName,
+      requestId,
       conversationId,
-      template_id: templateId,
-      source: 'LOCAL',
       timestamp: now,
       presentAt: now,
     },
     {
       eventCode: 'template_used',
-      conversationId,
       template_id: templateId,
+      task_mode: 'working',
+      conversationId,
       timestamp: now,
       presentAt: now,
     },

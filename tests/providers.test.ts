@@ -2583,3 +2583,53 @@ test('🔴 指定专家任务：必须按关键词搜市场，不能只看默认
   assert.ok(/find\(\(e\) => e\.expertId === named\.expertId\)/.test(actions),
     '⚠️ 必须按 expertId 精确匹配（不能按名字）')
 })
+
+test('🔴 Buddy_App 事件名必须是 buddyapp_*_click 形态（旧名上报成功但不计分）', () => {
+  // 2026-11-05 实测：旧实现发的是
+  //   buddy_app_discover / buddy_app_show / buddy_app_enter / ...
+  // 上报 HTTP 200，但回读进度恒 0/1。
+  //
+  // 社区三账号实测点亮的事件名是**无下划线 + _click 后缀**：
+  //   buddyapp_discover_click / buddyapp_show / buddyapp_enter_click
+  //   buddyapp_auth_confirm_click / buddyapp_bindaccount_skip_click
+  //
+  // ⚠️ 这类判据**拼错不报错**，只表现为「永远不涨进度」—— 必须靠测试钉住。
+  const src = readFileSync('src/upstream/events.ts', 'utf8')
+  for (const name of [
+    'buddyapp_discover_click',
+    'buddyapp_show',
+    'buddyapp_enter_click',
+    'buddyapp_auth_confirm_click',
+    'buddyapp_bindaccount_skip_click',
+  ]) {
+    assert.ok(src.includes(`'${name}'`), `⚠️ 必须使用真实事件名 ${name}`)
+  }
+  // 旧名不得再出现在代码里（注释里可以提，用于记录教训）
+  const codeOnly = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+  assert.ok(!/buddy_app_discover|buddy_app_enter/.test(codeOnly),
+    '⚠️ 不得回退到旧事件名')
+})
+
+test('🔴 template_5 事件组必须带 chat 链（缺链上游不计分）', () => {
+  // 2026-11-05 实测：旧实现只发 2 个孤立事件 → 回读 0/5。
+  // 社区实现是「完整 chat 链 + agent_task_created_with_template + template_used」，
+  // 三账号 5 组一次上报即 5/5 点亮。
+  const src = readFileSync('src/upstream/events.ts', 'utf8')
+  const start = src.indexOf('export function desktopTemplateUseEvents')
+  const body = src.slice(start, start + 1800)
+  assert.ok(/desktopChatSequence\(/.test(body), '⚠️ 必须先构造 chat 链')
+  assert.ok(/agent_task_created_with_template/.test(body))
+  assert.ok(/template_used/.test(body))
+  // ⚠️ 字段也要对：mode/isCustomModel/id/name/requestId 与 template_id/task_mode
+  assert.ok(/isCustomModel/.test(body), '⚠️ 缺 isCustomModel 字段')
+  assert.ok(/task_mode/.test(body), '⚠️ 缺 task_mode 字段')
+
+  // 模板 id 不能用编造值
+  // ⚠️ 先剥注释：注释里**记录**了旧的错误写法（`wb2api-template-N`），
+  //    直接搜会假失败 —— 本项目踩过好几次「断言命中注释」。
+  const actions = readFileSync('src/taskrunner/actions.ts', 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '')
+  assert.ok(!/wb2api-template-/.test(actions), '⚠️ 不得使用编造的模板 id')
+  assert.ok(/\['1', '深度研究'\]/.test(actions), '⚠️ 必须用真实模板名')
+})

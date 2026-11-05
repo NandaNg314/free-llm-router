@@ -496,12 +496,30 @@ const ACTIONS: Record<string, ActionHandler> = {
       const fingerprint = desktopFingerprint({
         uid: ctx.uid, nickname: ctx.nickname, machineId, sessionId, now: Date.now(),
       })
+      /**
+       * ⚠️ 模板 id 用 `"1"`~`"5"`，**不是**编造的 `wb2api-template-N`。
+       *
+       * 社区实测（`workbuddy2api-panel` 的 `runTemplateUse`）：
+       * 「template_id 服务端不校验真实性」，用 `"1"`~`"5"` 就能点亮；
+       * 而名字要用真实模板名，否则事件形态与客户端不符。
+       * ⇒ **五组必须用不同的 id**（同一个 id 发 5 次只算 1 次）。
+       */
+      const TEMPLATES: Array<[string, string]> = [
+        ['1', '深度研究'],
+        ['2', '周报生成'],
+        ['3', '竞品分析'],
+        ['4', '活动策划'],
+        ['5', '代码评审'],
+      ]
       let sent = 0
       for (let i = 0; i < need; i += 1) {
         const ids = newIds()
+        const [tplId, tplName] = TEMPLATES[i % TEMPLATES.length] as [string, string]
         const events = desktopTemplateUseEvents({
           conversationId: ids.conversationId,
-          templateId: `wb2api-template-${i}`,
+          requestId: ids.requestId,
+          templateId: tplId,
+          templateName: tplName,
           now: Date.now(),
         })
         const result = await reportDesktop(

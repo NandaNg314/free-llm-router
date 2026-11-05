@@ -182,10 +182,31 @@ test('Buddy 应用链：5 个事件，mode=LOCAL', () => {
   }
 })
 
-test('模板使用：每组 2 事件，含 template_used 判据', () => {
-  const evs = desktopTemplateUseEvents({ conversationId: 'c1', templateId: 't1', now: NOW })
-  assert.equal(evs.length, 2)
-  assert.deepEqual(evs.map((e) => e.eventCode), ['agent_task_created_with_template', 'template_used'])
+test('模板使用：chat 链 + 2 个任务事件（缺链上游不计分）', () => {
+  // 🔴 2026-11-05 实测修正：旧实现只发 2 个**孤立**事件，上报 200 但回读 0/5。
+  // 社区实现是「完整 chat 链 + agent_task_created_with_template + template_used」，
+  // 三账号 5 组一次上报即 5/5 点亮 ⇒ 必须先有 chat 链。
+  const evs = desktopTemplateUseEvents({
+    conversationId: 'c1', requestId: 'r1', templateId: '1', templateName: '深度研究', now: NOW,
+  })
+  const codes = evs.map((e) => e.eventCode)
+  // 末尾两个是任务事件，前面必须是 chat 链
+  assert.equal(codes.at(-2), 'agent_task_created_with_template')
+  assert.equal(codes.at(-1), 'template_used')
+  assert.ok(codes.includes('chat_request_send') || codes.includes('chat_message_response'),
+    '⚠️ 缺 chat 链：服务端认不出这是「一次真实的建任务动作」')
+  assert.ok(evs.length > 2, '⚠️ 必须带 chat 链，不能只有 2 个孤立事件')
+
+  // ⚠️ 字段名也要对（实测有效形态）
+  const created = evs.find((e) => e.eventCode === 'agent_task_created_with_template')
+  assert.equal(created?.mode, 'working')
+  assert.equal(created?.isCustomModel, false)
+  assert.equal(created?.id, '1')
+  assert.equal(created?.name, '深度研究')
+  assert.equal(created?.requestId, 'r1')
+  const used = evs.find((e) => e.eventCode === 'template_used')
+  assert.equal(used?.template_id, '1')
+  assert.equal(used?.task_mode, 'working')
 })
 
 test('灵感案例：判据是 playbook_prompt_send（不是曝光/点击）', () => {
