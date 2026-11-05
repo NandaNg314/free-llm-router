@@ -148,15 +148,30 @@ const ACTIONS: Record<string, ActionHandler> = {
   },
 
   /**
-   * 查询余额（**只读**，结果只用于展示）。
+   * 查询余额并**回写账号池**。
    *
-   * ⚠️ 原文写「用于签到后解冻冷却账号」—— 那是假的：这里既不写 `credits`，
-   * 也不调 `clearHardIfRecovered`。解冻只发生在两条余额刷新入口
-   *（`/admin/accounts/balance` 与整点 cron），见 `src/index.ts`。
+   * ## 🔴 2026-11-05 修复：原来只读不写，导致「跑完任务面板积分纹丝不动」
+   *
+   * 缺陷：任务跑完了、上游领奖确实成功了，但这里**从不调用 `pool.updateBalance`**。
+   * 结果用户在前端点了「执行每日任务」，任务全部成功，回到面板看积分**数字完全没变**！
+   * 必须手动去点账号卡片的「刷新积分」才会变。
+   *
+   * ⇒ 现在查到最新余额后，立刻回写账号池的 `credits`，并顺带解冻 402（hard）。
    */
   async balance(ctx, _step, env): Promise<ActionResult> {
     try {
       const result = await fetchBalance({ uid: ctx.uid, accessToken: ctx.accessToken }, env, ctx.now)
+      try {
+        const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(ctx.realm))
+        await pool.updateBalance(ctx.uid, ctx.now, {
+          credits: result.total,
+          expiring: result.expiring,
+          earliestExpiry: result.earliestExpiry,
+        })
+        await pool.clearHardIfRecovered(ctx.uid, result.total, ctx.now).catch(() => {})
+      } catch (error) {
+        console.warn(`[taskrunner] 回写账号 ${ctx.uid} 余额失败：`, error)
+      }
       return {
         ok: true,
         detail: `余额 ${result.total}${result.expiring > 0 ? `（其中 ${result.expiring} 即将过期）` : ''}，${result.packages.length} 个包`,

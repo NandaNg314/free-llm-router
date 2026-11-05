@@ -155,6 +155,10 @@ export function planGrowth(options?: { includeRealChat?: boolean }): TaskStep[] 
     steps.push({ code, action: 'verifyAndClaim', delayMs: includeRealChat ? GAP.claimPoll : GAP.report })
   }
 
+  // 🔴 最终收尾：全部任务做完并领奖后，查一次最新余额并自动回写账号池
+  // （2026-11-05 修复：原来 growth 计划末尾没有这一步，导致跑完任务后面板积分不刷新）
+  steps.push({ code: '_probe', action: 'balance', delayMs: 0 })
+
   return steps
 }
 

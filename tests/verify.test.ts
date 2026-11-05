@@ -218,7 +218,11 @@ test('成长计划：零消耗动作数与动作表一致', () => {
   assert.ok(acceptIdx > 0, '⚠️ 计划里必须有 acceptPending（否则未接受的任务不计分）')
   assert.ok(acceptIdx < steps.findIndex((s) => s.action === 'chat5'),
     '⚠️ acceptPending 必须在成长动作之前')
-  assert.equal(steps.length, actions.length * 2 + 3 + 3)
+  // ⚠️ `+1` 的 balance 步是 2026-11-05 补齐的：
+  // 领奖完成后必须查一次最新余额并回写账号池，否则面板上的积分数字永不刷新。
+  const balanceIdx = steps.findIndex((s) => s.action === 'balance')
+  assert.ok(balanceIdx > 0, '⚠️ 计划末尾必须有 balance 步骤（否则跑完任务不刷新积分）')
+  assert.equal(steps.length, actions.length * 2 + 3 + 3 + 1)
 })
 
 test('⚠️ 活动类动作**不得**带 verifyAndClaim（它们没有 task code）', () => {
