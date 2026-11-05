@@ -9,6 +9,7 @@
  * ├── start-windows.bat       ← Windows 双击这个
  * ├── start-mac-linux.sh      ← macOS / Linux 用这个
  * ├── start-local.mjs         ← 真正的启动器
+ * ├── update-local.mjs        ← 升级用（只换程序本体，不碰数据）
  * ├── dist/server.mjs         ← 单文件服务（含面板，2.6MB）
  * └── README.txt             ← 使用说明
  * ```
@@ -41,7 +42,7 @@ rmSync(join(ROOT, 'release-local'), { recursive: true, force: true })
 mkdirSync(OUT, { recursive: true })
 
 // ③ 复制必需文件
-const FILES = ['start-windows.bat', 'start-mac-linux.sh', 'start-local.mjs']
+const FILES = ['start-windows.bat', 'start-mac-linux.sh', 'start-local.mjs', 'update-local.mjs']
 for (const f of FILES) {
   if (!existsSync(join(ROOT, f))) {
     console.error(`❌ 缺 ${f}`)
@@ -69,17 +70,61 @@ writeFileSync(join(OUT, 'README.txt'), `free-llm-router 本地版 v${version}
 
 怎么用（三步）
 --------------
-1. 装 Node.js 22 或更高版本：https://nodejs.org/
-   （安装时勾选 "Add to PATH"）
+第 1 步：安装 Node.js（只需要装一次）
 
-2. 启动：
-   - Windows：双击 start-windows.bat
-   - macOS / Linux：终端里执行 ./start-mac-linux.sh
-     （第一次可能需要先 chmod +x start-mac-linux.sh）
+  Node.js 是运行本程序的"引擎"，必须先装好。版本要 22 或更高。
 
-3. 浏览器会自动打开控制台。如果没打开，手动访问屏幕上显示的地址：
-   http://127.0.0.1:11451/panel/
-   登录口令也会显示在同一个窗口里，复制粘贴即可。
+  ◆ Windows
+    1) 打开 https://nodejs.org/zh-cn
+    2) 点绿色的大按钮下载 **LTS**（长期支持版），下载的是 .msi 安装包
+    3) 双击安装，一路点「下一步」
+       ⚠️ 中途有个选项叫 "Add to PATH"（添加到环境变量），**必须保持勾选**
+          默认就是勾上的，不要取消
+    4) 装完**重启电脑**（或者至少关掉所有命令行窗口再重开）
+    5) 验证：按 Win+R，输入 cmd 回车，在黑色窗口里敲：
+           node -v
+       回车后如果看到类似 v22.x.x 或更高，就成功了
+
+  ◆ macOS
+    方法一（推荐，如果有 Homebrew）：
+         打开「终端」，执行：brew install node
+    方法二（图形安装）：
+         打开 https://nodejs.org/zh-cn → 下载 LTS 的 .pkg → 双击安装
+    验证：终端里敲 node -v，看到 v22.x.x 或更高即可
+
+  ◆ Linux
+    用官方源或 nvm 安装 Node 22+，装完执行 node -v 确认。
+    例（Ubuntu/Debian，用 nvm）：
+         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+         nvm install 22
+
+  ⚠️ 如果 node -v 提示"不是内部或外部命令"／"command not found"
+     ⇒ 说明没装成功，或者 PATH 没生效。
+     - Windows：重装一次，确认勾了 "Add to PATH"，然后重启电脑
+     - Mac/Linux：关掉终端重新打开（安装后需要重载环境变量）
+
+
+第 2 步：启动程序
+
+  ◆ Windows
+      双击 start-windows.bat
+      （如果 Windows 弹出"已保护你的电脑"：点「更多信息」→「仍要运行」）
+
+  ◆ macOS / Linux
+      打开终端，cd 到这个文件夹，执行：
+          chmod +x start-mac-linux.sh     ← 只有第一次需要
+          ./start-mac-linux.sh
+      （或者直接：node start-local.mjs）
+
+
+第 3 步：打开控制台
+
+  程序启动后会自动弹出浏览器。如果没弹，手动复制屏幕上显示的地址：
+      http://127.0.0.1:11451/panel/
+  登录口令也在同一个窗口里，复制粘贴进登录框即可。
+
+  ⚠️ 这个黑色窗口**不能关** —— 关掉程序就停了。
+     要停止时按 Ctrl+C，或直接关窗口。
 
 
 第一次进来先做什么
@@ -99,12 +144,32 @@ unsupported_realm。
 
 数据在哪
 --------
-.data/router.db   —— 账号、用量、日志（SQLite 单文件）
+data/router.db   —— 账号、用量、日志（SQLite 单文件）
 .env             —— 登录口令与加密密钥（首次运行自动生成）
 
 ⚠️ 备份 = 把 .env 和 data/ 一起复制走。
    ⚠️ 只备份 data/ 而丢了 .env 里的 CREDENTIAL_KEY，
       所有账号凭据都会解不开，只能重新登录。
+
+
+怎么更新（重要）
+----------------
+这个包**不会自动更新**，需要你手动做一次。流程：
+
+1. 去 https://github.com/NandaNg314/free-llm-router/releases 下载新版 zip
+2. 解压到**任意一个新目录**（比如 free-llm-router-local-new/）
+   ⚠️ 千万不要直接覆盖旧目录！那会把你的账号数据一起盖掉。
+3. 打开**旧目录**的终端，执行：
+      node update-local.mjs ../free-llm-router-local-new
+4. 重启程序（双击 start-windows.bat / 跑 start-mac-linux.sh）
+
+升级脚本**只替换程序本体**（dist/server.mjs 与几个启动脚本），
+**绝不碰** .env 和 data/ —— 账号、密钥、用量都还在。
+
+想回滚：脚本更新前会自动备份成 dist/server.mjs.bak-<时间戳>，
+把那个文件改名回 dist/server.mjs 即可。
+
+查当前版本：浏览器打开 http://127.0.0.1:11451/version
 
 
 常见问题
@@ -118,6 +183,11 @@ A: node start-local.mjs --host 0.0.0.0
 
 Q: 关掉窗口就停了？
 A: 是的，这是本地版。想要常驻可以用 Docker 或部署到服务器（见仓库 DEPLOY.md）。
+
+Q: 更新后账号没了？
+A: 正常情况不会 —— 升级脚本不碰 data/ 和 .env。
+   如果真的没了，检查是不是解压时「直接覆盖」了旧目录。
+   有备份的话，把 .env 和 data/ 拷回来即可恢复。
 `)
 
 // ⑤ 🔴 硬检查：绝对不能带出密钥或凭据
@@ -141,7 +211,7 @@ const looksLikeKey = (text) => {
   }
   return undefined
 }
-for (const f of ['start-local.mjs', 'README.txt', 'dist/server.mjs']) {
+for (const f of ['start-local.mjs', 'update-local.mjs', 'README.txt', 'dist/server.mjs']) {
   const hit = looksLikeKey(readFileSync(join(OUT, f), 'utf8'))
   if (hit !== undefined) {
     console.error(`❌ ${f} 里疑似有 API Key（${hit}），已中止`)

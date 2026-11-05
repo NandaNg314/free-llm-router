@@ -153,6 +153,7 @@ async function loadAggregateCatalogForModels(
 }
 
 import { jsonError } from './gateway/http.js'
+import { APP_VERSION } from './version.js'
 import { bindBuddy, WORKBUDDY_INTL } from './providers/buddy.js'
 import {
   DEFAULT_PROVIDER,
@@ -1299,6 +1300,34 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // ── 免鉴权：存活探针（不含任何敏感信息） ──
   if (path === '/healthz') {
     return json({ ok: true, service: 'free-llm-router' })
+  }
+
+  /**
+   * 版本信息（**免鉴权**，但只有版本号，不含任何部署细节）。
+   *
+   * ## 为什么单独开一个端点
+   *
+   * 本地版用户需要知道两件事：
+   * 1. **我现在是哪个版本** —— 出问题时好报给我们；
+   * 2. **有没有新版** —— 否则他们永远是拿到包那天的那一版。
+   *
+   * ⚠️ 只回版本号与仓库地址，**不回**任何配置、密钥、账号信息。
+   * ⚠️ 免鉴权是刻意的：登录页就要显示版本（那时还没有密钥）。
+   */
+  if (path === '/version') {
+    return json({
+      name: 'free-llm-router',
+      version: APP_VERSION,
+      /**
+       * ⚠️ 指向**我们自己的仓库**（origin = NandaNg314/free-llm-router），
+       * 不是上游。
+       *
+       * 为什么重要：本地版用户查新版、报问题、看更新说明，看的都该是
+       * **实际发布这套代码的地方**。指到上游会让用户拿着我们的版本号去
+       * 对别人的更新日志 —— 版本号对不上，问题也提到错的地方。
+       */
+      repo: 'https://github.com/NandaNg314/free-llm-router',
+    })
   }
 
   // ── 管理面板静态资源（**免鉴权**，但统统加安全响应头） ──
