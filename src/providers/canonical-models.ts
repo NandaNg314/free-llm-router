@@ -104,12 +104,39 @@ export const EXCLUDED_ALIASES: ReadonlySet<string> = new Set([
  * ⚠️ 必须用 `Object.hasOwn` 查（见 {@link canonicalKeyFor} 的说明）——
  * 普通字面量对 `constructor` 会返回 `Object` 构造函数。
  *
- * 目前只有一条：lobsterai 的 `deepseek-flash` 实际就是 `deepseek-v4-1-flash`。
- * ⚠️ qoder 的 `dfmodel` 与 `qfmodel` **故意不登记** —— 无法确证它们对应哪个
- * 真实模型，猜错会让用户拿到一个他没选的模型。
+ * 补丁的键是**原始 realId**（`canonicalKeyFor` 先查补丁、后归一化），
+ * 故这里写原始 id，不是 `normalizeModelKey` 处理后的形态。
+ *
+ * | 渠道 | 原始 realId | 不经补丁会得到的键 | 原因 |
+ * |---|---|---|---|
+ * | `lobsterai` | `deepseek-flash` | `deepseek-flash` | 与 id 无字面关系，实际就是 V4.1-Flash |
+ * | `raccoon` | `sn-deepseek-v4-1-flash-1017` | `deepseek-v4-1-flash-1017` | 末尾 `-1017` 是**渠道版本号** |
+ * | `qoder` | `dfmodel` | `deepseek-flash` | 走 name 通道，展示名正是 `DeepSeek-Flash` |
+ *
+ * ⚠️ `qoder/dfmodel` 的登记依据是**用户要求 + 它的展示名正是 `DeepSeek-Flash`**
+ *（同步自上游 `916242d`）。诚实记录一个限制：用真实对话问过它的底层模型，
+ * 它只答自己是「Qoder」（产品名，不是模型名），**无法用对话验证它究竟是不是
+ * V4.1-Flash**。旧注释原本写「故意不登记，猜错会让用户拿到他没选的模型」——
+ * 那条顾虑是对的，但用户已明确把 `DeepSeek-Flash` 点名为要归并的对象。
+ *
+ * ⚠️ `qoder/qfmodel`（Qwen3.8-Flash）**不登记** —— 那是另一个厂商的模型，
+ * 登记只会把两个不同厂商的模型混在一起。
  */
 export const CANONICAL_OVERRIDES: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   lobsterai: { 'deepseek-flash': 'deepseek-v4-1-flash' },
+
+  // raccoon 的 `-1017` 是渠道版本号，字面推导救不回来。
+  // ⚠️ 同时登记去掉 `sn-` 的形态：`normalizeModelKey` 会剥 `sn-`，
+  // 而补丁查的是**原值**，两种写法在目录里都见过。
+  raccoon: {
+    'sn-deepseek-v4-1-flash-1017': 'deepseek-v4-1-flash',
+    'deepseek-v4-1-flash-1017': 'deepseek-v4-1-flash',
+  },
+
+  // qoder 走 `name` 通道（见 `PRIMARY_CHANNEL`），故键是**原始 realId** `dfmodel`。
+  // 它的展示名 `DeepSeek-Flash` 归一后是 `deepseek-flash`，与 `deepseek-v4-1-flash`
+  // 是两个键 ⇒ 必须在这里并掉。
+  qoder: { dfmodel: 'deepseek-v4-1-flash' },
 }
 
 /**

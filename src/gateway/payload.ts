@@ -58,6 +58,40 @@ export function translateMaxCompletionTokens(body: Record<string, unknown>): voi
 }
 
 /**
+ * 请求体里**是否带图片**（纯函数，聚合路由用）。
+ *
+ * ## 为什么需要它（同步自上游 XuexGao/free-llm-router `916242d`）
+ *
+ * 聚合会在同一规范名的**多个渠道**之间挑一个。这些渠道的图片能力**不一致**
+ *（实测 `codearts` 的 DeepSeek 不支持图片，而 `trae` / `qoder` 支持）。
+ *
+ * ⚠️ 若不带这个判据，带图请求会**随机**落到不支持的那家并被上游拒绝 ——
+ * 「有时能用、有时失败」比明确报「不支持」更糟（用户无法判断该重试还是换模型）。
+ *
+ * ⇒ 聚合路由用它在**派发前**过滤候选：带图 ⇒ 只留 `supportsImage` 的；
+ * 纯文本 ⇒ 不过滤。这样目录能如实报「支持图片」（确实有渠道能处理），
+ * 且不会随机失败。两处**必须成对**（见 `aggregate.ts` 的 `imageCapableOf`）。
+ *
+ * 只认 OpenAI 标准的 `image_url` 内容块 —— 不做模糊匹配（`type` 里含
+ * "image" 的字面猜测会把 `image_generation` 之类的工具声明误判成输入图）。
+ */
+export function requestHasImage(body: unknown): boolean {
+  if (body === null || typeof body !== 'object') return false
+  const messages = (body as Record<string, unknown>).messages
+  if (!Array.isArray(messages)) return false
+  for (const raw of messages) {
+    if (raw === null || typeof raw !== 'object') continue
+    const content = (raw as Record<string, unknown>).content
+    if (!Array.isArray(content)) continue
+    for (const part of content) {
+      if (part === null || typeof part !== 'object') continue
+      if ((part as Record<string, unknown>).type === 'image_url') return true
+    }
+  }
+  return false
+}
+
+/**
  * 归一化 `tool_choice`：上游该字段是 **string**，对象形式会 400 `code=11101`。
  *
  * - `'auto'` / `'none'` / `'required'`（大小写/空白不敏感）→ 规范小写透传；

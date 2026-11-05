@@ -33,7 +33,7 @@ export { mapErrorToPunishment }
 import { classify, mapErrorToPunishment, type ErrorKind } from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
-import { cleanupToolPairing, prepareChatBody, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
+import { cleanupToolPairing, prepareChatBody, requestHasImage, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
 import { BodyTooLargeError, readJsonCapped } from './body.js'
 import { resolveSafetyFor, safetyConfigFor } from './safety.js'
 import { throttleUpstream } from './throttle.js'
@@ -46,6 +46,9 @@ import {
 } from './zero-output.js'
 import { DEFAULT_PROVIDER, findProvider, providerIds } from '../providers/index.js'
 import { bindBuddy } from '../providers/buddy.js'
+// ⚠️ 裸名别名（官方拼写 → 聚合规范名）—— 与 canonical-models 共用同一张表，
+// 免得「面板显示的规范名」与「路由认识的别名」两处各写一份、慢慢分叉。
+import { aggregateAliasForBareModel } from '../providers/canonical-models.js'
 import {
   AGGREGATE_AUTO,
   AGGREGATE_PROVIDER_ID,
@@ -937,6 +940,22 @@ export async function handleChatCompletions(
   // 前缀大小写不敏感（与 `splitModelName` 一致）：`Aggregate/auto` 若漏到默认供应商，
   // 小写化后会以 `aggregate/auto` 打上游 ⇒ 11102 ⇒ 被记成模型冷却。
   const rawLower = rawModel.toLowerCase()
+
+  // 🔴 **裸名别名必须先判**（同步自上游 `598eaa0`）——
+  // 顺序不可改：命中后 `providerId` 会被设成 `aggregate`，而它**不在注册表里**
+  // （虚拟 provider），若走到下面「按注册表查供应商」那步会报「未知供应商 aggregate」。
+  //
+  // 解决的问题：客户端写官方拼写 `DeepSeek-V4.1-Flash`（大写 + 点）时，
+  // 裸名被**原样**送给默认供应商 buddy，而 buddy 的真实 id 是小写
+  // `deepseek-v4.1-flash` ⇒ 上游回 11102 `model [...] service info not found`
+  // ⇒ 被归类为 `model_unavailable` ⇒ **写 6 小时模型级冷却**。
+  // 用户看到的是「模型不存在」，其实是拼写没归一。
+  //
+  // ⚠️ 只在**裸名**（不含 `/`）时生效：显式写 `buddy/xxx` 的用户意图明确，不该被改写。
+  // ⚠️ 查不到别名就保持原行为（回落默认供应商并如实报错），
+  //   不让「随便写写也能通」成为预期。
+  const bareAlias = rawModel.includes('/') ? undefined : aggregateAliasForBareModel(rawModel)
+
   if (rawLower === AGGREGATE_PROVIDER_ID || rawLower.startsWith(AGG_PREFIX)) {
     return await handleAggregateChat({
       model: rawModel.slice(AGG_PREFIX.length),
@@ -944,6 +963,14 @@ export async function handleChatCompletions(
       // 本分支在它**之前**执行（必须早于 `splitModelName`），
       // 引用未初始化的 `const` 会抛 TDZ 错误。判据与外层**逐字一致**：
       // OpenAI 规范里 `stream` 缺省是 `false`（非流式）。
+      wantsStream: (rawBody as Record<string, unknown>).stream === true,
+      rawBody, request, env, realm, ctx, sessionKey,
+    })
+  }
+
+  if (bareAlias !== undefined) {
+    return await handleAggregateChat({
+      model: bareAlias,
       wantsStream: (rawBody as Record<string, unknown>).stream === true,
       rawBody, request, env, realm, ctx, sessionKey,
     })
@@ -4040,9 +4067,33 @@ async function handleAggregateChat(input: {
     }
   }
 
+  // 🔴 **图片能力下沉到路由**（同步自上游 `916242d`）。
+  //
+  // 目录侧 `imageCapableOf` 用 `some`（任一渠道支持就报「支持」），因为
+  // `codearts` 的 DeepSeek 不支持图片而 `trae` / `qoder` 支持 —— 若用 `every`
+  // 则整个模型被标成不支持，用户的需求没被解决。
+  //
+  // ⚠️ 但「目录报支持」必须配「路由不把图发给不支持的家」，否则就退回
+  // 「有时能用、有时失败」—— 那比明确不支持更糟（用户无法判断该重试还是换模型）。
+  // ⇒ 带图请求**只发给 `supportsImage` 的候选**；纯文本请求不过滤。
+  const hasImage = requestHasImage(rawBody)
+  const routed = hasImage ? filtered.filter((c) => c.supportsImage === true) : filtered
+  if (hasImage && routed.length === 0) {
+    // ⚠️ 如实说清「为什么不给用」，而不是笼统报「没有候选」——
+    // 用户的下一步动作不同（换模型 vs 重新登录）。
+    return {
+      response: jsonError(
+        400,
+        `聚合模型「${model}」的所有候选渠道都不支持图片输入。`
+          + '请改用明确支持图片的渠道（如 `trae/` 或 `loomy/` 前缀的模型）。',
+        'image_not_supported',
+      ),
+    }
+  }
+
   // 探测到期时刻并做临期优先排序。
-  const expiry = await probeExpiries(env, realm, filtered, request.signal)
-  const ranked = rankCandidates(filtered, (c) => expiry.get(`${c.provider}\u0000${c.realId}`) ?? EXPIRY_UNUSABLE)
+  const expiry = await probeExpiries(env, realm, routed, request.signal)
+  const ranked = rankCandidates(routed, (c) => expiry.get(`${c.provider}\u0000${c.realId}`) ?? EXPIRY_UNUSABLE)
 
   if (ranked.length === 0) {
     // ⚠️ 如实区分「查不到额度」与「没有候选」—— 用户的下一步动作不同。

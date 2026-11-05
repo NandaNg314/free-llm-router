@@ -526,7 +526,12 @@ test('⚠️ /v1/models 的每个条目都应有 name（aggregate 曾是整列�
   const src = readFileSync('src/index.ts', 'utf8')
   const i = src.indexOf('AGGREGATE_AUTO}')
   assert.ok(i > 0, '应能定位 aggregate 条目构造')
-  const seg = src.slice(i, i + 900)
+  // ⚠️ 窗口从 `aggregate/auto` 取到显式的结束锚点（不再靠魔法数字 ——
+  // 给聚合条目补 `supportsImage` 注释后那段变长，900 字截断造成过假失败）。
+  // 守的是**不变式**（两条都有 name），不钉排版。
+  const end = src.indexOf('errors.push', i)
+  assert.ok(end > i, '应能定位聚合目录构造的结束锚点')
+  const seg = src.slice(i, end)
   assert.ok(/name:\s*'自动选择/.test(seg), '⚠️ aggregate/auto 必须给 name')
   assert.ok(/name:\s*v\.name\s*\|\|\s*v\.key/.test(seg),
     '⚠️ 虚拟模型必须有 name（并兜底到 key，避免空单元格）')

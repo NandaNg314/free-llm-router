@@ -20,9 +20,11 @@ import {
   buildVirtualModels,
   AGGREGATE_ALLOWED_KEYS,
   expiryLabel,
+  imageCapableOf,
   pickSoonestProvider,
   rankCandidates,
 } from '../src/gateway/aggregate.js'
+import { requestHasImage } from '../src/gateway/payload.js'
 import {
   canonicalDisplayName,
   canonicalKeyFor,
@@ -2416,3 +2418,87 @@ test('🔴 findErrorFrameInRaw 必须同时认「裸 JSON」与「SSE 帧」两�
   assert.equal(findErrorFrameInRaw(''), undefined)
   assert.equal(findErrorFrameInRaw('data: [DONE]\n\n'), undefined)
 })
+
+test('🔴 聚合图片能力：目录口径是 some，但带图请求必须只发给支持的渠道', () => {
+  // ## 同步自上游 `916242d`（用户报「自动 DeepSeek 不支持图像识别」）
+  //
+  // 两层根因：① 聚合目录**没发** `supportsImage`，客户端按 OpenAI 惯例默认
+  // 「不支持」；② `codearts` 的 DeepSeek 确实不支持图片。
+  //
+  // ⚠️⚠️ 修法**必须成对**：目录用 `some`（任一渠道支持就报支持），
+  // 路由侧（`requestHasImage`）带图请求只发给 `supportsImage` 的候选。
+  // 只改 `some` 而不在路由侧过滤 ⇒ 退回「有时能用、有时失败」。
+  const cats = [
+    { provider: 'trae', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', supportsImage: true }] },
+    { provider: 'codearts', models: [{ id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', supportsImage: false }] },
+  ]
+  const vms = buildVirtualModels(cats)
+  const ds = vms.find((v) => v.key === 'deepseek-v4-1-flash')
+  assert.ok(ds !== undefined, '应有 deepseek-v4-1-flash 虚拟模型')
+
+  // ① 候选逐条带上游真实能力位（不得按同族推断）
+  assert.equal(ds.candidates.find((c) => c.provider === 'trae')?.supportsImage, true)
+  assert.equal(ds.candidates.find((c) => c.provider === 'codearts')?.supportsImage, false)
+
+  // ② 目录口径 = some（部分支持也算支持，否则用户依然不能传图）
+  assert.equal(ds.supportsImage, true, '⚠️ 目录必须报「支持」（任一候选能处理）')
+  assert.equal(imageCapableOf([]), false, '⚠️ 空候选不算支持')
+
+  // ③ 路由侧判据：带图 ⇒ 只留支持的；纯文本 ⇒ 不过滤
+  const imageBody = { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }] }] }
+  const textBody = { messages: [{ role: 'user', content: '你好' }] }
+  assert.equal(requestHasImage(imageBody), true)
+  assert.equal(requestHasImage(textBody), false)
+  // ⚠️ 只认 `image_url`：工具声明里的 image 字样不得被误判成输入图
+  assert.equal(requestHasImage({ messages: [{ role: 'user', content: 'a' }], tools: [{ type: 'image_generation' }] }), false)
+  assert.equal(requestHasImage(null), false)
+
+  // ④ 两者必须**同时**接线（源码级钉住「只修一半」）
+  const server = readFileSync('src/gateway/server.ts', 'utf8')
+  assert.ok(/requestHasImage\(rawBody\)/.test(server),
+    '⚠️ 聚合路由必须按实际请求过滤候选（否则带图会随机落到不支持的家）')
+  assert.ok(/routed\.length === 0/.test(server),
+    '⚠️ 全都支持不了时必须如实报错，而不是回退到不过滤')
+  const idx = readFileSync('src/index.ts', 'utf8')
+  assert.ok(/supportsImage: v\.supportsImage/.test(idx),
+    '⚠️ /v1/models 的聚合条目必须转发能力位（否则客户端仍显示不支持）')
+})
+
+test('🔴 DeepSeek Flash 变体必须归并（raccoon 版本号 / qoder 代号）', () => {
+  // ## 同步自上游 `916242d`（用户要求「所有 DeepSeek-Flash 归类为 DeepSeek-V4.1-Flash」）
+  //
+  // ⚠️ 补丁查的是**原始 realId**（`canonicalKeyFor` 先查补丁、后归一化）。
+  const raccoon = canonicalKeyFor('raccoon', 'sn-deepseek-v4-1-flash-1017', 'DeepSeek V4.1 Flash')
+  assert.equal(raccoon?.key, 'deepseek-v4-1-flash', '⚠️ raccoon 的 -1017 是渠道版本号，必须归并')
+  assert.equal(raccoon?.via, 'patch')
+
+  const qoder = canonicalKeyFor('qoder', 'dfmodel', 'DeepSeek-Flash')
+  assert.equal(qoder?.key, 'deepseek-v4-1-flash', '⚠️ qoder 的 dfmodel 展示名正是 DeepSeek-Flash')
+  assert.equal(qoder?.via, 'patch')
+
+  // ⚠️ qoder 的 qfmodel 是 Qwen3.8-Flash（另一厂商）—— 不得被归并进来
+  const qwen = canonicalKeyFor('qoder', 'qfmodel', 'Qwen3.8-Flash')
+  assert.notEqual(qwen?.key, 'deepseek-v4-1-flash', '⚠️ 不同厂商的模型不得混为一谈')
+
+  // ⚠️ 原型链守卫仍然有效（补丁表是普通字面量）：必须返回字符串键，
+  // 而不是 `Object` 构造函数（不变式与上面「原型链守卫」那条一致）。
+  const proto = canonicalKeyFor('constructor', 'constructor', 'constructor')
+  assert.ok(proto === undefined || typeof proto.key === 'string',
+    '⚠️ constructor 不得命中 Object 构造函数')
+})
+
+test('🔴 裸名别名必须在 splitModelName 之前判定（否则报「未知供应商 aggregate」）', () => {
+  // 同步自上游 `598eaa0`。客户端写官方拼写 `DeepSeek-V4.1-Flash`（大写 + 点）时，
+  // 裸名被原样送给 buddy ⇒ 上游 11102 ⇒ 被记成 6 小时模型级冷却。
+  const server = readFileSync('src/gateway/server.ts', 'utf8')
+  const alias = server.indexOf('aggregateAliasForBareModel(rawModel)')
+  const split = server.indexOf('const routed = splitModelName(rawModel')
+  assert.ok(alias > 0, '⚠️ 裸名别名必须真的接线（本地曾定义了却零调用者）')
+  assert.ok(split > 0, '应仍走 splitModelName')
+  assert.ok(alias < split,
+    '⚠️ 别名必须先于 splitModelName（aggregate 不在注册表里，晚判会报「未知供应商」）')
+  // ⚠️ 只在裸名时生效：显式前缀是用户的明确意图
+  assert.ok(/rawModel\.includes\('\/'\) \? undefined : aggregateAliasForBareModel/.test(server),
+    '⚠️ 显式写 provider/xxx 时不得被改写成聚合')
+})
+

@@ -1114,9 +1114,13 @@ function annotateModelEntry(
       : undefined
   const maxOut =
     typeof entry.maxOutput === 'number' && entry.maxOutput > 0 ? entry.maxOutput : undefined
-  // ⚠️ 聚合是虚拟路由，上游不给 `supportsImage`；但它承载的模型均支持视觉，
-  //    判成「纯文本」会让用户无法给 `aggregate/*` 发图。
-  const acceptsImage = entry.supportsImage === true || providerId === AGGREGATE_PROVIDER_ID
+  // ⚠️ 聚合是虚拟路由，**能力位要由聚合层如实给出**（`buildVirtualModels` 已按
+  //    真实候选算好 `supportsImage`，见 `imageCapableOf`）。
+  //    曾用 `|| providerId === AGGREGATE_PROVIDER_ID` 无条件放行 —— 那等于
+  //    「所有聚合模型都支持图片」，与路由侧（带图请求只发给 `supportsImage` 的
+  //    候选）自相矛盾：目录说支持、实际却回 `400 image_not_supported`。
+  //    同步自上游 `916242d`。
+  const acceptsImage = entry.supportsImage === true
   const isFree = entry.isFree === true
 
   // ── 路径 1：名称承载渠道 + 倍率 ──
@@ -4429,6 +4433,16 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
             object: 'model',
             owned_by: AGGREGATE_PROVIDER_ID,
             name: '自动选择（临期优先）',
+            // ## 🔴 自动模型必须暴露图片能力（同步自上游 `916242d`）
+            //
+            // ⚠️ 根因是**我们没往外发这个字段**，不是能力缺失：聚合条目此前只有
+            // id/name，客户端读不到 `supportsImage` 就按 OpenAI 惯例默认「不支持」
+            // ⇒ 面板和客户端都显示「自动 DeepSeek 不支持图像识别」。
+            //
+            // ⚠️ `auto` 跨**多个规范名**，候选池大得多 ⇒ 口径用 `every`（保守），
+            // 与 `imageCapableOf`（同一规范名的多个渠道，用 `some`）不同。
+            // 路由侧仍会按实际请求再过滤一次（见 `requestHasImage`），故是双保险。
+            supportsImage: virtuals.length > 0 && virtuals.every((v) => v.supportsImage),
           },
           AGGREGATE_PROVIDER_ID,
         ),
@@ -4442,6 +4456,10 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
               owned_by: AGGREGATE_PROVIDER_ID,
               // ⚠️ 兜底到 key：万一某条目 name 为空，也不该给一个空单元格
               name: v.name || v.key,
+              // ⚠️ 用 `VirtualModel.supportsImage`（已按「任一候选支持」的
+              // 口径算好），不要在这里再各算一遍 —— 两处判据分叉必然
+              // 出现「目录说支持、实际却随机失败」。
+              supportsImage: v.supportsImage,
             },
             AGGREGATE_PROVIDER_ID,
           ),
