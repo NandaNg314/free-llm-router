@@ -4790,6 +4790,10 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           ...(typeof body.aspect_ratio === 'string' && body.aspect_ratio !== ''
             ? { aspectRatio: body.aspect_ratio }
             : {}),
+          ...(typeof body.resolution === 'string' && body.resolution !== ''
+            ? { resolution: body.resolution }
+            : {}),
+          ...(typeof body.enable_audio === 'boolean' ? { enableAudio: body.enable_audio } : {}),
           ...(firstImage === undefined ? {} : { image: firstImage }),
           ...(lastImage === undefined ? {} : { lastImage }),
         },
@@ -4800,7 +4804,8 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         status: r.status,
         // ⚠️ 明确告诉调用方去哪查、多久查 —— 否则客户端不知道 73 秒这件事
         hint: '已提交。用 POST /v1/videos/tasks {"task_id":"…"} 查状态，通常 60–120 秒出片。'
-          + '内容是「真实地点 + 人物」时可能被上游风控拒绝（会返回 failed 与具体原因）。',
+          + '⚠️ 涉政 / 真实领导人 / 敏感事件等题材会被上游内容审核拒绝（返回 failed 与原因，不扣积分）；'
+          + '普通题材（动物 / 静物 / 风景）不受影响。',
       })
     } catch (error) {
       return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')

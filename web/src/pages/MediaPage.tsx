@@ -86,6 +86,48 @@ export function MediaPage() {
  *
  * ⇒ 走网关的同源代理 `/admin/media/proxy`，浏览器就当成同源资源，能正常下载。
  */
+/**
+ * 图片预览（带失败兜底）。
+ *
+ * ## ⚠️ 为什么不用 `<img src={直链}>`
+ *
+ * 上游是跨域 COS，浏览器请求会带 `Referer`，被防盗链拦成 403 ——
+ * 表现就是**破图标 + 一片空白**（用户实测反馈）。
+ * 走 `/admin/media/proxy` 同源代理后浏览器才当成普通资源。
+ *
+ * ⚠️ 代理也可能失败（签名过期 / 网络）。这时不能留个破图标让人猜，
+ *    要明确说「预览失败，可以点下载或打开」。
+ */
+function ImagePreview({ url, index }: { url: string; index: number }) {
+  const [failed, setFailed] = useState(false)
+
+  if (failed) {
+    return (
+      <div className="bg-muted/30 flex aspect-square w-full flex-col items-center justify-center gap-2 p-4 text-center">
+        <AlertTriangle className="text-muted-foreground size-6" />
+        <span className="text-muted-foreground text-xs leading-relaxed">
+          预览加载失败
+          <br />
+          （链接可能已过期）
+        </span>
+        <div className="flex gap-1.5">
+          <MediaActions url={url} filename={`generated-${Date.now()}-${index + 1}.png`} />
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <img
+      src={mediaProxyUrl(url)}
+      alt={`生成结果 ${index + 1}`}
+      className="aspect-square w-full object-cover"
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  )
+}
+
 function MediaActions({ url, filename }: { url: string; filename: string }) {
   const [busy, setBusy] = useState(false)
 
@@ -288,7 +330,9 @@ function ImageTab() {
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {data.data.map((img, i) => (
                 <div key={img.url} className="group ring-foreground/10 relative overflow-hidden rounded-xl ring-1">
-                  <img src={img.url} alt={`生成结果 ${i + 1}`} className="aspect-square w-full object-cover" loading="lazy" />
+                  {/* ⚠️ 必须走同源代理：直链是跨域 COS，浏览器带 Referer 会被防盗链拦掉，
+                      表现就是「破图标 + 一堆空白」（实测）。代理之后浏览器当成同源资源。 */}
+                  <ImagePreview url={img.url} index={i} />
                   <div className="absolute inset-x-0 bottom-0 flex items-center gap-1.5 bg-gradient-to-t from-black/70 to-transparent p-2 opacity-0 transition-opacity group-hover:opacity-100">
                     <MediaActions url={img.url} filename={`generated-${Date.now()}-${i + 1}.png`} />
                   </div>
@@ -396,7 +440,7 @@ function VideoTab() {
           </div>
         </div>
         <div className="text-muted-foreground mt-2 text-xs">
-          ⚠️ 单次约 <b>29 积分</b>；「真实地点 + 人物」的组合容易被上游风控拒绝（会明确报原因，不退款）。
+          ⚠️ 成功出片约 <b>29 积分</b>；涉政 / 真实领导人 / 敏感事件等题材会被上游风控拒绝（会明确报原因），<b>失败不扣积分</b>。普通题材（动物、静物、风景）不受影响。
         </div>
       </div>
 
@@ -424,7 +468,13 @@ function VideoTab() {
 
             {task.status === 'completed' && (task.data ?? []).map((v) => (
               <div key={v.url} className="space-y-2">
-                <video src={v.url} controls playsInline className="w-full rounded-xl ring-1 ring-black/10" />
+                {/* 同图片：跨域直链在 <video> 里同样加载不出（只有进度条没有画面） */}
+                <video
+                  src={mediaProxyUrl(v.url)}
+                  controls
+                  playsInline
+                  className="w-full rounded-xl ring-1 ring-black/10"
+                />
                 <div className="flex flex-wrap items-center gap-2">
                   <MediaActions url={v.url} filename={`video-${Date.now()}.mp4`} />
                   <span className="text-warning text-xs">直链约 12 小时后失效，需要请立即下载</span>

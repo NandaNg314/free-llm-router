@@ -342,20 +342,50 @@ export interface VideoTaskResult {
 /**
  * 提交视频生成（`POST /v2/videos/generations`）。
  *
+ * ## 🔴 真实请求结构（2026-11-05 从社区协议文档核对，修正了本文件此前的三处错误）
+ *
+ * ```json
+ * {
+ *   "prompt": "...",
+ *   "model": "kling-video-v3",
+ *   "seconds": 4,
+ *   "negative_prompt": "...",
+ *   "watermark": true,
+ *   "image_url": "...",        // ← 图生视频的首帧（**不是 image**）
+ *   "last_image_url": "...",   // ← 尾帧（**不是 last_image**）
+ *   "extra_parameters": {      // ← 分辨率/音频/比例嵌在这层里（**不是顶层**）
+ *     "resolution": "768P",
+ *     "enable_audio": true,
+ *     "aspect_ratio": "16:9"   // ⚠️ 仅文生视频有效
+ *   }
+ * }
+ * ```
+ *
+ * ⚠️⚠️ **这是三处同型错误，都出在「凭直觉拼字段名」上**：
+ * 1. `image` → 真实是 **`image_url`**；`last_image` → **`last_image_url`**
+ *    （用户实测反馈「加了图片也没出现图的内容」—— 就是因为字段名错，上游直接忽略）；
+ * 2. `aspect_ratio` 原放在**顶层**，真实位置是 `extra_parameters` 内；
+ * 3. `extra_parameters` 这层完全没发（分辨率、音频开关都在里面）。
+ *
+ * ⚠️ 教训：**上游字段名不能猜**。为名一致的 `images/edits` 用 `image`，
+ *    而 `videos/generations` 用 `image_url` —— 同一家厂商、同一条通道，命名却不同。
+ *
  * ## ⚠️ 这是**异步**的，不要同步等
  *
  * 实测（2026-11-05）：4 秒片子 **73 秒**出片。直接等会超过多数 HTTP 客户端超时，
  * 所以这里只提交、立刻返回 `task_id`，出片靠 {@link getVideoTask} 轮询。
  *
- * ## ⚠️ 风控会直接拒
+ * ## ⚠️ 内容合规
  *
  * 实测同一天两次提交：
  * - 「一个人在北京天安门广场骑自行车」⇒ **62 秒后 `failed`**，
  *   `error.message = "Failure to pass the risk control system"`；
  * - 「一只橘色的小猫在阳光下的草地上奔跑」⇒ 73 秒 `completed`。
  *
- * ⇒ **含真实地点 + 人物的组合容易被拦**。调用方必须把 `failed` 的
- * `error.message` 原样交给用户 —— 笼统报「生成失败」会让人反复重试同一个 prompt。
+ * ⇒ 拦的是**内容合规**（涉政 / 真实领导人 / 敏感事件），不是「画面里有人」。
+ *    换普通题材（动物、静物、风景）即可正常出片。
+ *    调用方必须把 `failed` 的 `error.message` 原样交给用户 ——
+ *    笼统报「生成失败」会让人反复重试同一个 prompt。
  */
 export async function submitVideo(
   ctx: { uid: string; accessToken: string },
@@ -365,15 +395,20 @@ export async function submitVideo(
     model?: string
     seconds?: number
     aspectRatio?: string
+    /** 分辨率（如 `768P`），进 `extra_parameters`。 */
+    resolution?: string
+    /** 是否生成音轨（上游默认 true）。 */
+    enableAudio?: boolean
     /**
      * 图生视频的**首帧**（可选）。
      *
+     * ⚠️ 上游字段名是 **`image_url`**（不是 `image`）—— 写错会被静默忽略，
+     *    表现为「加了图但生成结果和纯文本一样」。
      * ⚠️ 必须是**公网可访问的 URL** 或 **`data:` URL** —— 上游要能直接取到它，
-     * 不接受裸 base64。我们**不会**替你下载或转存图片：
-     * 那会让网关变成图片托管，且失败时用户不知道是图的问题还是网络的问题。
+     * 不接受裸 base64。我们**不会**替你下载或转存图片。
      */
     image?: string
-    /** 尾帧（可选，同样要 URL / data URL）。 */
+    /** 尾帧（可选，字段名 **`last_image_url`**）。 */
     lastImage?: string
   },
 ): Promise<VideoSubmitResult> {
@@ -382,6 +417,19 @@ export async function submitVideo(
     ? Math.min(Math.max(Math.round(input.seconds), 1), 15) // 实测支持 4–15
     : 5
   const aspect = (input.aspectRatio ?? '').trim() || '16:9'
+  const hasImage = input.image !== undefined && input.image !== ''
+
+  /**
+   * `extra_parameters` 里放什么。
+   *
+   * ⚠️ `aspect_ratio` **仅文生视频有效**（社区协议文档明确）——
+   *    图生视频时比例跟着输入图走，传了也会被忽略。
+   *    这里图生图时不传，避免制造「我设了 9:16 却没生效」的误解。
+   */
+  const extra: Record<string, unknown> = {}
+  if (!hasImage) extra.aspect_ratio = aspect
+  if (input.resolution !== undefined && input.resolution !== '') extra.resolution = input.resolution
+  if (input.enableAudio !== undefined) extra.enable_audio = input.enableAudio
 
   const { data } = await mediaCall<{ id?: unknown; task_id?: unknown; status?: unknown }>(
     ctx, env, '/v2/videos/generations',
@@ -389,10 +437,11 @@ export async function submitVideo(
       model,
       prompt: input.prompt,
       seconds,
-      aspect_ratio: aspect,
-      wait: false,
-      ...(input.image === undefined || input.image === '' ? {} : { image: input.image }),
-      ...(input.lastImage === undefined || input.lastImage === '' ? {} : { last_image: input.lastImage }),
+      watermark: true,
+      // ⚠️ 字段名是 image_url / last_image_url，**不是 image / last_image**
+      ...(hasImage ? { image_url: input.image } : {}),
+      ...(input.lastImage === undefined || input.lastImage === '' ? {} : { last_image_url: input.lastImage }),
+      ...(Object.keys(extra).length === 0 ? {} : { extra_parameters: extra }),
     },
   )
 

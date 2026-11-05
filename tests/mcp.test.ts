@@ -180,7 +180,7 @@ test('🔴 视频提交响应里的任务 id 在 `id` 字段，不是 `task_id`'
 })
 
 test('🔴 视频 failed 必须把上游原话交出去（风控原因）', () => {
-  // 实测「真实地点 + 人物」会被拦：
+  // 实测内容合规类题材（涉政/真实领导人）会被拦：
   // {"status":"failed","error":{"message":"Failure to pass the risk control system"}}
   // 笼统报「生成失败」会让用户反复重试同一个 prompt。
   const src = readFileSync('src/upstream/media.ts', 'utf8')
@@ -189,4 +189,29 @@ test('🔴 视频 failed 必须把上游原话交出去（风控原因）', () =
   const idx = readFileSync('src/index.ts', 'utf8')
   assert.ok(/\.\.\.\(r\.error === undefined \? \{\} : \{ error: \{ message: r\.error \} \}\)/.test(idx),
     '⚠️ 端点必须把 failed 原因透出去')
+})
+
+test('🔴 图生视频必须用 image_url（不是 image），且 extra_parameters 要嵌套', () => {
+  // ## 2026-11-05 用户实测反馈：「加了图片也没出现图的内容」
+  //
+  // 根因：**三处字段名凭直觉拼错**，上游静默忽略（不报错、照样出片）：
+  //   1. `image`        → 真实是 **`image_url`**
+  //   2. `last_image`   → 真实是 **`last_image_url`**
+  //   3. `aspect_ratio` 原放顶层 → 真实在 **`extra_parameters`** 里
+  //
+  // ⚠️ 同一家厂商、同一条媒体通道：`images/edits` 用 `image`，
+  //    而 `videos/generations` 用 `image_url`。**命名不能靠类推。**
+  const src = readFileSync('src/upstream/media.ts', 'utf8')
+  const start = src.indexOf('export async function submitVideo')
+  const body = src.slice(start, start + 4000)
+
+  assert.ok(/image_url: input\.image/.test(body), '⚠️ 首帧必须是 image_url')
+  assert.ok(/last_image_url: input\.lastImage/.test(body), '⚠️ 尾帧必须是 last_image_url')
+  assert.ok(!/\bimage: input\.image/.test(body.replace(/image_url: input\.image/g, '')),
+    '⚠️ 不得再用 image（会被上游忽略）')
+  assert.ok(/extra_parameters/.test(body), '⚠️ aspect_ratio/resolution 必须嵌在 extra_parameters')
+
+  // ⚠️ aspect_ratio 仅文生视频有效 —— 图生视频时不该传（制造「设了没生效」的误解）
+  assert.ok(/if \(!hasImage\) extra\.aspect_ratio/.test(body),
+    '⚠️ 图生视频不应传 aspect_ratio')
 })
