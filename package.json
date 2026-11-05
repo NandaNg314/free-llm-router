@@ -14,7 +14,9 @@
     "build:web": "node scripts/embed-web.mjs",
     "start": "node dist/server.mjs",
     "start:node": "node dist/server.mjs",
-    "test": "bash scripts/test.sh"
+    "test": "bash scripts/test.sh",
+    "local": "node start-local.mjs",
+    "build:local": "node scripts/build-local-release.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261016.1",

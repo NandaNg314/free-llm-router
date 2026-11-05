@@ -37,3 +37,10 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# 本地版发布包产物（含 2.6MB 的 server.mjs，不该进仓库）
+release-local/
+
+# 本地版运行时数据（账号凭据 + 密钥，绝不入库）
+data/
+.env
