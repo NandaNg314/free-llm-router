@@ -18,10 +18,10 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Dialog } from '@/components/ui/dialog'
-import { Select } from '@/components/ui/input'
+import { Select, Switch } from '@/components/ui/input'
 import { Empty, Progress, ProviderAvatar, Skeleton } from '@/components/ui/misc'
 import { Table, TD, TH, THead, TR } from '@/components/ui/table'
-import { useRoutingConfig } from '@/lib/config'
+import { useRoutingConfig, useSaveRouting } from '@/lib/config'
 import { useAccounts, useProviders } from '@/lib/queries'
 import { navigate } from '@/lib/router'
 import {
@@ -80,6 +80,7 @@ export function TasksPage() {
   const accounts = useAccounts()
   const providers = useProviders()
   const routing = useRoutingConfig()
+  const saveRouting = useSaveRouting()
   const [last, setLast] = useState<Last | null>(null)
   const [confirmClaim, setConfirmClaim] = useState(false)
 
@@ -96,19 +97,43 @@ export function TasksPage() {
     <>
       <PageHeader title="任务中心" description="点一下就跑完，不用选账号。所有任务都是幂等的，重复点也安全。" />
 
+      {/*
+        🔴 自动调度面板（2026-11-05 从「只读提示条 + 去配置」改成可直接开关）。
+        用户要求「任务中心可选开启」—— 之前只有配置页一个总开关，
+        每次想看状态还得跳页，改完再跳回来。
+
+        ⚠️ 只搬表面、不改后端：仍写 `autoTaskCron` 这一个字段，
+        两条设置路径（这里 / 配置页）操作的是**同一个**值，不会分叉。
+      */}
       <div
         className={cn(
-          'mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border px-4 py-2.5 text-[13px]',
+          'mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border px-4 py-3 text-[13px]',
           auto ? 'bg-card' : 'border-warning/40 bg-warning/8',
         )}
       >
-        <Clock className="text-muted-foreground size-4" />
-        <span className="font-medium">自动调度{auto ? '已开启' : '已关闭'}</span>
-        <span className="text-muted-foreground">
-          {auto ? '每天北京时间 01:00 跑完整的 Buddy 每日任务，09:00 和 21:00 各签到一次。' : '定时签到与每日任务不会自动执行，只能在这里手动点。'}
-        </span>
-        <button className="text-primary ml-auto cursor-pointer text-[13px] font-medium hover:underline" onClick={() => navigate('config')}>
-          去配置
+        <Clock className={cn('size-4 shrink-0', auto ? 'text-muted-foreground' : 'text-warning')} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 font-medium">
+            自动调度
+            <Badge tone={auto ? 'success' : 'warning'}>{auto ? '已开启' : '已关闭'}</Badge>
+          </div>
+          <div className="text-muted-foreground mt-0.5">
+            {auto
+              ? '每天北京时间 01:00 跑完整的 Buddy 每日任务（签到 + 成长任务 + 领奖），09:00 / 21:00 各签到一次；国际版账号每天自动跑一次网页活跃打卡。'
+              : '定时任务不会自动执行，只能在这里手动点。开关打开后立刻生效，不用重启。'}
+          </div>
+        </div>
+        <Switch
+          label="自动调度"
+          checked={auto}
+          disabled={routing.isLoading || saveRouting.isPending}
+          onCheckedChange={(v) => saveRouting.mutate({ autoTaskCron: v })}
+        />
+        <button
+          className="text-primary cursor-pointer text-[13px] font-medium hover:underline"
+          onClick={() => navigate('config')}
+        >
+          更多设置
         </button>
       </div>
 

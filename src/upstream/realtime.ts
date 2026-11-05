@@ -115,15 +115,31 @@ export async function marketExpertList(
   ctx: { uid: string; accessToken: string },
   env: Env,
   expertType: string,
+  /**
+   * 可选：按关键词搜索。
+   *
+   * ## 🔴 为什么必须支持它（2026-11-05 实测）
+   *
+   * 专家库有 **37501 个**（agent 33892 + team 3609）。原来固定
+   * `page:1, page_size:20`，**只能看到推荐排序的前 20 个** ——
+   * 想按 id 精确找某位专家（例如任务要求的「卖得好」）**永远找不到**，
+   * 表现为「专家市场列表里没有这个 id」，而它其实存在。
+   *
+   * ⇒ 上游支持 `keyword` 过滤（实测「中国电商运营专家」命中 7 条）。
+   *    调用方拿到结果后**再按 expertId 精确匹配**，不靠名字猜。
+   */
+  keyword?: string,
+  pageSize = 20,
 ): Promise<MarketExpert[]> {
   const bases = resolveUpstream(env)
   const body: Record<string, unknown> = {
     page: 1,
-    page_size: 20,
+    page_size: pageSize,
     sort_by: 'reco_rank',
     sort_order: 'desc',
   }
   if (expertType !== '') body.expert_type = expertType
+  if (keyword !== undefined && keyword.trim() !== '') body.keyword = keyword.trim()
 
   const res = await callUpstream<{ experts?: unknown }>({
     method: 'POST',

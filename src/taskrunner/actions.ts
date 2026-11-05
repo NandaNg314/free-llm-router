@@ -93,6 +93,11 @@ export interface ActionResult {
 export const NEEDS_REAL_CHAT: ReadonlySet<string> = new Set([
   'Model_chat_GLM5.2',
   'expert_5',
+  // 2026-11-05 新增的 4 个指定专家任务（每个都要真实对话）
+  'expert_use_maidehao',
+  'expert_use_douyinyin',
+  'expert_use_shangjia_xuanchuan',
+  'expert_use_bowangwang',
   'Expert_team_use_3',
   'skill_1',
   'Expert_lighthouse',
@@ -645,6 +650,43 @@ const ACTIONS: Record<string, ActionHandler> = {
   },
 
   /**
+   * `expert_use_maidehao` / `douyinyin` / `shangjia_xuanchuan` / `bowangwang`
+   * —— 2026-11-05 新增的 4 个「体验某专家并完成一次对话」任务（各 +50 积分）。
+   *
+   * ## 🔴 为什么要单开动作，而不是复用 `expert5`
+   *
+   * `expert5` 走的是「从**专家市场**随机取前 N 个」——这 4 个任务要求的是
+   * **指定专家**（例如必须召唤「中国电商运营专家」），从市场乱取碰不到它们。
+   *
+   * ## 专家 id 从哪来（**不是猜的**）
+   *
+   * 上游任务列表的 `jump_url` 里直接写着 `expertId`：
+   * ```
+   * expert_use_maidehao          → ex_GDl31WahyIH0
+   * expert_use_douyinyin         → ex_FbY5nlWTqDod
+   * expert_use_shangjia_xuanchuan→ ex_Weo3x2EZuSDm
+   * expert_use_bowangwang        → ex_WZY136wV5aMt
+   * ```
+   * ⇒ 这里用**固定表**，但**名字与分类仍从任务列表读**（见 `namedExpert`），
+   * 因为事件链要带 `displayNameZh` / `professionZh`，编造会让上游判据不认。
+   *
+   * ⚠️ 专家 id 失效时（上游换人）表现为「召唤链上报成功但进度不涨」——
+   * 这时要重新 dump 任务的 `jump_url` 对齐，**不要凭名字去市场搜**（重名很多）。
+   */
+  async expertUseMaidehao(ctx, _step, env): Promise<ActionResult> {
+    return await runNamedExpert(ctx, env, 'expert_use_maidehao', NAMED_EXPERTS.expert_use_maidehao)
+  },
+  async expertUseDouyinyin(ctx, _step, env): Promise<ActionResult> {
+    return await runNamedExpert(ctx, env, 'expert_use_douyinyin', NAMED_EXPERTS.expert_use_douyinyin)
+  },
+  async expertUseShangjia(ctx, _step, env): Promise<ActionResult> {
+    return await runNamedExpert(ctx, env, 'expert_use_shangjia_xuanchuan', NAMED_EXPERTS.expert_use_shangjia_xuanchuan)
+  },
+  async expertUseBowangwang(ctx, _step, env): Promise<ActionResult> {
+    return await runNamedExpert(ctx, env, 'expert_use_bowangwang', NAMED_EXPERTS.expert_use_bowangwang)
+  },
+
+  /**
    * `black_cat`：夜猫子——窗口内做若干次 glm-5.2 真实对话并上报。
    *
    * ⚠️ 只补**差额**（先读进度），且每次之间 4 秒间隔（Go 侧实测）。
@@ -920,3 +962,106 @@ export const headerBuilders = {
 export const MP_MACHINE_ID_FOR_TEST = MP_MACHINE_ID
 /** 供单测核对事件类型。 */
 export type { Event }
+
+/**
+ * 「指定专家」任务表（v0.9.66）。
+ *
+ * ## 专家 id 的来源（**只读 dump 实测，不是猜的**）
+ *
+ * `GET /v2/activity/growth/tasks` 返回的每个任务都带 `jump_url`，
+ * 其中 4 个 `expert_use_*` 的 deeplink 里**直接写着 expertId**：
+ *
+ * ```
+ * expert_use_maidehao           → ex_GDl31WahyIH0   「中国电商运营专家」   +50
+ * expert_use_douyinyin          → ex_FbY5nlWTqDod   「抖音策略师」         +50
+ * expert_use_shangjia_xuanchuan → ex_Weo3x2EZuSDm   「商家宣传页与海报设计师」+50
+ * expert_use_bowangwang         → ex_WZY136wV5aMt   「直播电商教练」       +50
+ * ```
+ *
+ * ⚠️ `WorkBuddy_Valorant`（无畏契约拼豆专家）**不在表里** —— 它的 `jump_url`
+ * 是 `workbuddy://expert`（没有 expertId），只能从市场搜，另走
+ * {@link runValorantExpert}。
+ *
+ * ⚠️ 这些 id 是**上游数据**，会随运营活动变。失效的表现是
+ * 「召唤链上报成功但进度不涨」—— 届时重新 dump `jump_url` 对齐，
+ * **不要凭名字去市场搜**（同名/近名专家很多，搜错会白烧一次对话）。
+ */
+const NAMED_EXPERTS: Record<string, { expertId: string; name: string; keyword: string }> = {
+  // ⚠️ `name` 是**市场里的真实名字**，不是任务标题 —— 实测两者不一致：
+  //     任务「中国电商运营专家」在市场里叫「卖得好」
+  //     任务「抖音策略师」在市场里叫「斗音音」
+  //     任务「商家宣传页与海报设计师」在市场里叫「商家宣传设计师」
+  //     任务「直播电商教练」在市场里叫「播旺旺」
+  //   名字只用于日志展示；**匹配一律按 expertId**。
+  // ⚠️ `keyword` 用于搜索：专家库有 **3.7 万个**，翻页永远翻不到，
+  //    必须按关键词缩小范围再按 id 匹配。
+  expert_use_maidehao: { expertId: 'ex_GDl31WahyIH0', name: '卖得好', keyword: '中国电商运营专家' },
+  expert_use_douyinyin: { expertId: 'ex_FbY5nlWTqDod', name: '斗音音', keyword: '抖音策略师' },
+  expert_use_shangjia_xuanchuan: { expertId: 'ex_Weo3x2EZuSDm', name: '商家宣传设计师', keyword: '商家宣传页与海报设计师' },
+  expert_use_bowangwang: { expertId: 'ex_WZY136wV5aMt', name: '播旺旺', keyword: '直播电商教练' },
+}
+
+/**
+ * 跑一次「指定专家」任务：召唤 → 真实对话 → 使用事件。
+ *
+ * ## 名字与分类**从任务列表读**，不用表里的
+ *
+ * 事件链要带 `displayNameZh` / `professionZh` / `categories`，
+ * 上游判据会核对。表里只存 id 与中文名（排障用），
+ * 真实字段一律取自市场列表 —— 编造名字会让「上报 200 但进度不涨」。
+ *
+ * ⚠️ 市场列表里找不到该 id 时**如实报错**，不回退成「随便找一个」：
+ * 那会烧掉一次真实对话配额，还点亮不了任务。
+ */
+async function runNamedExpert(
+  ctx: ActionContext,
+  env: Env,
+  taskCode: string,
+  named: { expertId: string; name: string; keyword: string } | undefined,
+): Promise<ActionResult> {
+  if (named === undefined) return { ok: false, detail: `${taskCode}：任务表里没有这个专家 id` }
+  try {
+    // 先看这个任务是否已经达标/领过 —— 已完成的账号不必再烧一次对话
+    const tasks = await listTasks({ uid: ctx.uid, accessToken: ctx.accessToken, realm: ctx.realm }, env)
+    const task = tasks.find((t) => t.taskCode === taskCode)
+    if (task !== undefined && task.claimed) return { ok: true, detail: `${taskCode} 已完成并领取，跳过` }
+
+    /**
+     * 🔴 **必须按关键词搜，不能直接用默认列表**
+     *
+     * 专家库 3.7 万个，默认列表只给推荐前 20 个 —— 目标专家**永远不在里面**。
+     * 我第一版就是这样，报「不在专家市场列表里（市场共 20 位）」，
+     * 看起来像上游换了专家，其实是我只看了第一页。
+     *
+     * ⚠️ 搜到之后**仍按 expertId 精确匹配**：关键词会命中同类多个专家
+     *（实测「中国电商运营专家」命中 7 条），靠名字猜会召唤错人。
+     */
+    const market = await marketExpertList(
+      { uid: ctx.uid, accessToken: ctx.accessToken },
+      env,
+      'agent',
+      named.keyword,
+      50,
+    )
+    const expert = market.find((e) => e.expertId === named.expertId)
+    if (expert === undefined) {
+      return {
+        ok: false,
+        detail: `${taskCode}：搜索「${named.keyword}」得到 ${market.length} 位专家，`
+          + `但里面没有 ${named.expertId}（「${named.name}」）—— 上游可能下架或换了 id，需重新对齐 jump_url`,
+      }
+    }
+
+    const outcome = await expertUseChain(
+      { uid: ctx.uid, accessToken: ctx.accessToken, nickname: ctx.nickname },
+      env,
+      expert,
+      (events) => reportDesktop({ uid: ctx.uid, accessToken: ctx.accessToken }, env, sanitizeEvents(events)),
+    )
+    return outcome.ok
+      ? { ok: true, detail: `已召唤「${named.name}」并完成对话` }
+      : { ok: false, detail: `${taskCode}：${outcome.detail}` }
+  } catch (error) {
+    return { ok: false, detail: describeError(error, taskCode) }
+  }
+}

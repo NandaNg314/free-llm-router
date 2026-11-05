@@ -49,6 +49,12 @@ const ZERO_COST_ACTIONS: ReadonlyArray<{ code: string; action: string }> = [
  */
 export const REAL_CHAT_ACTIONS: ReadonlyArray<{ code: string; action: string }> = [
   { code: 'expert_5', action: 'expert5' },
+  // 2026-11-05 上游新增的 4 个「体验指定专家」任务（各 +50 积分）。
+  // 每个都要真实召唤 + 一次对话，故归在真实对话组（默认不进 cron）。
+  { code: 'expert_use_maidehao', action: 'expertUseMaidehao' },
+  { code: 'expert_use_douyinyin', action: 'expertUseDouyinyin' },
+  { code: 'expert_use_shangjia_xuanchuan', action: 'expertUseShangjia' },
+  { code: 'expert_use_bowangwang', action: 'expertUseBowangwang' },
   { code: 'Expert_team_use_3', action: 'expertTeamUse3' },
   { code: 'skill_1', action: 'skill1' },
   { code: 'Expert_lighthouse', action: 'expertLighthouse' },

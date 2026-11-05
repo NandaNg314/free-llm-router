@@ -2559,3 +2559,27 @@ test('🔴 余额刷新撞 401 必须尝试续期，续期救不回来才自动�
     '⚠️ normalizeAccountState 必须携带它（否则老记录读出来是 undefined）')
 })
 
+
+test('🔴 指定专家任务：必须按关键词搜市场，不能只看默认前 20 条', () => {
+  // ## 2026-11-05 实测踩到的坑（代价：一次失败的真实对话）
+  //
+  // 专家库有 **37501 个**（agent 33892 + team 3609），而 `marketExpertList`
+  // 原来固定 `page:1, page_size:20` ⇒ **只能看到推荐排序前 20 个**。
+  // 任务要求的「卖得好」等专家**永远不在里面**，报错是
+  // 「不在专家市场列表里（市场共 20 位）」—— 看起来像上游换了专家，
+  // 其实是只看了一页。
+  //
+  // ⇒ 修法：带上 `keyword` 过滤（实测「中国电商运营专家」命中 7 条），
+  //   搜到后**再按 expertId 精确匹配**（关键词会命中同类多个，靠名字猜会召唤错人）。
+  const realtime = readFileSync('src/upstream/realtime.ts', 'utf8')
+  assert.ok(/keyword\?: string/.test(realtime), '⚠️ marketExpertList 必须支持 keyword')
+  assert.ok(/body\.keyword = keyword\.trim\(\)/.test(realtime), '⚠️ keyword 要进请求体')
+
+  const actions = readFileSync('src/taskrunner/actions.ts', 'utf8')
+  assert.ok(/named\.keyword/.test(actions), '⚠️ 指定专家任务必须传关键词')
+
+  // ⚠️ 任务标题 ≠ 市场里的产品名，名字只用于日志，匹配一律按 id
+  assert.ok(/ex_GDl31WahyIH0/.test(actions), '⚠️ 必须按 expertId 匹配')
+  assert.ok(/find\(\(e\) => e\.expertId === named\.expertId\)/.test(actions),
+    '⚠️ 必须按 expertId 精确匹配（不能按名字）')
+})
