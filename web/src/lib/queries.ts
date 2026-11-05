@@ -368,3 +368,53 @@ export function useWebFetch() {
     onError: (e) => toast.error('抓取失败', { description: e.message }),
   })
 }
+
+/** 把本地图片文件读成 `data:` URL（上游要求 data URL 或公网 URL）。 */
+export function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader()
+    r.onload = () => resolve(String(r.result))
+    r.onerror = () => reject(new Error('读取图片失败'))
+    r.readAsDataURL(file)
+  })
+}
+
+/** 图生图（`/v1/images/edits`）。 */
+export function useEditImage() {
+  return useMutation<
+    { created: number; data: GeneratedImage[]; usage?: { credit?: number } },
+    Error,
+    { prompt: string; image: string[]; size?: string }
+  >({
+    mutationFn: (v) => api('/v1/images/edits', { json: v, timeoutMs: 180_000 }),
+    onError: (e) => toast.error('生成失败', { description: e.message }),
+  })
+}
+
+// ── 视频（异步：提交 → 轮询） ──
+
+export interface VideoTask {
+  id: string
+  status: string
+  data?: Array<{ url: string }>
+  seconds?: number
+  usage?: { credit?: number }
+  error?: { message: string }
+  hint?: string
+}
+
+export function useSubmitVideo() {
+  return useMutation<{ id: string; status: string; hint?: string }, Error, { prompt: string; seconds?: number; aspect_ratio?: string; image?: string }>({
+    mutationFn: (v) => api('/v1/videos/generations', { json: v, timeoutMs: 120_000 }),
+    onError: (e) => toast.error('提交失败', { description: e.message }),
+  })
+}
+
+/** 查视频任务（**POST**，不是 GET —— 上游那样写会 404）。 */
+export const checkVideoTask = (taskId: string) =>
+  api<VideoTask>('/v1/videos/tasks', { json: { task_id: taskId }, timeoutMs: 60_000 })
+
+/** 媒体直链的**同源代理**（跨域资源浏览器不让 download，必须走它）。 */
+export function mediaProxyUrl(url: string): string {
+  return `/admin/media/proxy?url=${encodeURIComponent(url)}`
+}

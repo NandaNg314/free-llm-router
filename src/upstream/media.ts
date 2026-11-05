@@ -206,7 +206,19 @@ export async function generateImage(
 export async function editImage(
   ctx: { uid: string; accessToken: string },
   env: Env,
-  input: { prompt: string; image: string; model?: string; size?: string },
+  input: {
+    prompt: string
+    /**
+     * 输入图。支持两种：
+     * - 字符串：单张（公网 URL 或 `data:` URL）
+     * - 数组：多张（上游 `image` 字段是 **data URL 数组**）
+     *
+     * ⚠️ 我们**不下载、不转存**图片 —— 上游要能直接取到它。
+     */
+    image: string | string[]
+    model?: string
+    size?: string
+  },
 ): Promise<ImageGenResult> {
   const model = (input.model ?? '').trim() || INTl_IMAGE_MODEL
   const { data, credit } = await mediaCall<{
@@ -216,7 +228,8 @@ export async function editImage(
   }>(ctx, env, '/v2/images/edits', {
     model,
     prompt: input.prompt,
-    image: input.image,
+    // ⚠️ 单张时上游也接受字符串，但多张必须是数组 —— 统一传数组最省心
+    image: Array.isArray(input.image) ? input.image : [input.image],
     ...(input.size === undefined ? {} : { size: input.size }),
   })
 
@@ -347,7 +360,22 @@ export interface VideoTaskResult {
 export async function submitVideo(
   ctx: { uid: string; accessToken: string },
   env: Env,
-  input: { prompt: string; model?: string; seconds?: number; aspectRatio?: string },
+  input: {
+    prompt: string
+    model?: string
+    seconds?: number
+    aspectRatio?: string
+    /**
+     * 图生视频的**首帧**（可选）。
+     *
+     * ⚠️ 必须是**公网可访问的 URL** 或 **`data:` URL** —— 上游要能直接取到它，
+     * 不接受裸 base64。我们**不会**替你下载或转存图片：
+     * 那会让网关变成图片托管，且失败时用户不知道是图的问题还是网络的问题。
+     */
+    image?: string
+    /** 尾帧（可选，同样要 URL / data URL）。 */
+    lastImage?: string
+  },
 ): Promise<VideoSubmitResult> {
   const model = (input.model ?? '').trim() || INTl_VIDEO_MODEL
   const seconds = typeof input.seconds === 'number' && input.seconds > 0
@@ -357,7 +385,15 @@ export async function submitVideo(
 
   const { data } = await mediaCall<{ id?: unknown; task_id?: unknown; status?: unknown }>(
     ctx, env, '/v2/videos/generations',
-    { model, prompt: input.prompt, seconds, aspect_ratio: aspect, wait: false },
+    {
+      model,
+      prompt: input.prompt,
+      seconds,
+      aspect_ratio: aspect,
+      wait: false,
+      ...(input.image === undefined || input.image === '' ? {} : { image: input.image }),
+      ...(input.lastImage === undefined || input.lastImage === '' ? {} : { last_image: input.lastImage }),
+    },
   )
 
   // ⚠️ 提交响应里任务 id 在 `id`（不是 `task_id`）；两个都认，防止上游改字段

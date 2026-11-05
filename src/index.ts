@@ -4599,13 +4599,35 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       return jsonError(400, `图像编辑目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
     }
     const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
-    const image = typeof body.image === 'string' ? body.image.trim() : ''
+    /**
+     * 输入图：**字符串或字符串数组**都接受。
+     *
+     * ⚠️ 上游 `image` 字段是 **data URL 数组**（社区实测），单张也统一成数组传。
+     * ⚠️ 必须是**公网可访问的 URL** 或 **`data:` URL** —— 我们**不下载、不转存**。
+     *    裸 base64 上游取不到，传了只会得到一句含糊的失败，故提前拦掉并说清原因。
+     */
+    const rawImage = body.image
+    const images: string[] = Array.isArray(rawImage)
+      ? rawImage.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map((x) => x.trim())
+      : typeof rawImage === 'string' && rawImage.trim() !== ''
+        ? [rawImage.trim()]
+        : []
     if (prompt === '') return jsonError(400, 'prompt 必填', 'invalid_request')
-    if (image === '') {
+    if (images.length === 0) {
       return jsonError(
         400,
         'image 必填。**本网关不会替你下载图片** —— 请传公网可访问的 URL 或 `data:` URL，'
           + '上游要能直接取到它。',
+        'invalid_request',
+      )
+    }
+    // 裸 base64（既不是 URL 也不是 data:）提前拒掉：上游只会回一句含糊的失败
+    const bad = images.find((x) => !/^(https?:\/\/|data:image\/)/i.test(x))
+    if (bad !== undefined) {
+      return jsonError(
+        400,
+        'image 必须是 http(s) URL 或 `data:image/...;base64,...`。'
+          + '如果是本地图片，前端可以用 FileReader 读成 data URL 再传。',
         'invalid_request',
       )
     }
@@ -4619,7 +4641,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         env,
         {
           prompt,
-          image,
+          image: images,
           ...(typeof body.model === 'string' && body.model !== '' ? { model: body.model } : {}),
           ...(typeof body.size === 'string' && body.size !== '' ? { size: body.size } : {}),
         },
@@ -4704,6 +4726,27 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
     if (prompt === '') return jsonError(400, 'prompt 必填', 'invalid_request')
 
+    /**
+     * 图生视频（可选）：`image` 是**首帧**，`last_image` 是尾帧。
+     *
+     * ⚠️ 与改图同样的纪律：必须是 http(s) URL 或 `data:image/...`，
+     * 我们**不下载、不转存**。裸 base64 提前拒绝并说清原因
+     *（上游取不到时只会回一句含糊的失败）。
+     */
+    const pickImage = (v: unknown): string | undefined =>
+      typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined
+    const firstImage = pickImage(body.image)
+    const lastImage = pickImage(body.last_image)
+    for (const [name, url] of [['image', firstImage], ['last_image', lastImage]] as const) {
+      if (url !== undefined && !/^(https?:\/\/|data:image\/)/i.test(url)) {
+        return jsonError(
+          400,
+          `${name} 必须是 http(s) URL 或 \`data:image/...;base64,...\`。`,
+          'invalid_request',
+        )
+      }
+    }
+
     const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
     if (credential === undefined) return jsonError(503, '没有可用的国际版账号', 'no_available_account')
 
@@ -4718,6 +4761,8 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           ...(typeof body.aspect_ratio === 'string' && body.aspect_ratio !== ''
             ? { aspectRatio: body.aspect_ratio }
             : {}),
+          ...(firstImage === undefined ? {} : { image: firstImage }),
+          ...(lastImage === undefined ? {} : { lastImage }),
         },
       )
       return json({
@@ -4764,6 +4809,65 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           ? { hint: '视频是签名直链（约 12 小时有效），需要请立即下载。' }
           : {}),
       })
+    } catch (error) {
+      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
+    }
+  }
+
+  // ── 媒体**代理下载**（解决图片/视频直链的跨域问题） ──
+  //
+  // ## 为什么需要它
+  //
+  // 上游返回的是 COS **签名直链**（图片约 24h、视频约 12h 有效）。
+  // 浏览器里 `<a download>` 对**跨域**资源不生效 —— 点击只会跳转打开，
+  // 而不是下载。而 `fetch(url).then(blob)` 又会被 COS 的 CORS 拦掉。
+  //
+  // ⇒ 由网关**代理一次**：服务端拿到字节再原样回给浏览器，
+  //   同源 ⇒ `download` 属性可用、`fetch` 不会被拦。
+  //
+  // ⚠️ **只允许代理上游白名单域名**：这是个开放代理的经典漏洞入口
+  //（攻击者拿我们的 Worker/服务器去打任意目标）。用前缀白名单硬拦。
+  if (path === '/admin/media/proxy' && request.method === 'GET') {
+    const target = url.searchParams.get('url') ?? ''
+    /**
+     * ⚠️ **只允许腾讯云 COS 域名**。
+     *
+     * 这是开放代理的经典漏洞入口：不加限制的话，任何人都能拿我们的服务
+     * 去打任意目标（内网扫描、蹭带宽、当跳板）。用**后缀白名单**硬拦，
+     * 不用 `includes`（`evil-myqcloud.com` 会被 `includes` 放过）。
+     */
+    let host = ''
+    try {
+      const u = new URL(target)
+      host = u.protocol === 'https:' ? u.hostname.toLowerCase() : ''
+    } catch {
+      host = ''
+    }
+    const allowed = host !== ''
+      && (host.endsWith('.myqcloud.com') || host.endsWith('.tencentcos.cn'))
+    if (!allowed) {
+      return jsonError(
+        400,
+        '只允许代理上游媒体直链（*.myqcloud.com）。这是**有意限制**：'
+          + '开放任意 URL 代理会让本服务变成可被滥用的跳板。',
+        'invalid_request',
+      )
+    }
+    try {
+      const upstream = await fetch(target, { signal: AbortSignal.timeout(120_000) })
+      if (!upstream.ok || upstream.body === null) {
+        return jsonError(502, `上游媒体取回失败：HTTP ${upstream.status}`, 'upstream_error')
+      }
+      // ⚠️ 流式回传，不缓冲：视频 6.8MB、超时/内存都不该堆在网关里
+      const headers = new Headers()
+      const ct = upstream.headers.get('content-type')
+      if (ct !== null) headers.set('content-type', ct)
+      const cl = upstream.headers.get('content-length')
+      if (cl !== null) headers.set('content-length', cl)
+      // 让浏览器把它当附件下载（前端仍可用 download 属性覆盖文件名）
+      headers.set('content-disposition', 'attachment')
+      headers.set('cache-control', 'private, max-age=300')
+      return new Response(upstream.body, { status: 200, headers })
     } catch (error) {
       return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
     }
