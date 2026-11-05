@@ -74,7 +74,7 @@ import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
 import { handleResponses } from './gateway/responses.js'
 import { handleChatCompletions, refineModelScoped, resetMaxRotateCache } from './gateway/server.js'
 import { handleMcp } from './gateway/mcp.js'
-import { editImage, generateImage, mediaCapable, webFetch, webSearch } from './upstream/media.js'
+import { editImage, generateImage, getVideoTask, mediaCapable, submitVideo, webFetch, webSearch } from './upstream/media.js'
 import { resetSafetyConfigCache, resolveSafetyFor } from './gateway/safety.js'
 import {
   emptyApiKeyUsage,
@@ -4679,6 +4679,91 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         { url: target },
       )
       return json(r)
+    } catch (error) {
+      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
+    }
+  }
+
+  // ── 视频生成（异步，2026-11-05 实测可用） ──
+  //
+  // ## 为什么是「提交 + 轮询」而不是一次返回
+  //
+  // 实测 4 秒片子 **73 秒**出片。同步等会超过多数客户端超时（默认 30–60 秒），
+  // 请求被客户端断开后用户什么也拿不到，还照样扣积分。
+  //
+  // ## ⚠️ 查询用 POST，不是 GET
+  //
+  // `GET /v2/videos/generations/{id}` 返回 `404 page not found`。
+  // 真实路径是 `POST /v2/videos/tasks` + `{task_id}`。
+  if (path === '/v1/videos/generations' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const realm = await resolveMediaRealm(env, url)
+    if (!mediaCapable(realm)) {
+      return jsonError(400, `视频生成目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
+    }
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
+    if (prompt === '') return jsonError(400, 'prompt 必填', 'invalid_request')
+
+    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
+    if (credential === undefined) return jsonError(503, '没有可用的国际版账号', 'no_available_account')
+
+    try {
+      const r = await submitVideo(
+        { uid: credential.uid, accessToken: credential.credential.accessToken },
+        env,
+        {
+          prompt,
+          ...(typeof body.model === 'string' && body.model !== '' ? { model: body.model } : {}),
+          ...(typeof body.seconds === 'number' ? { seconds: body.seconds } : {}),
+          ...(typeof body.aspect_ratio === 'string' && body.aspect_ratio !== ''
+            ? { aspectRatio: body.aspect_ratio }
+            : {}),
+        },
+      )
+      return json({
+        id: r.taskId,
+        object: 'video',
+        status: r.status,
+        // ⚠️ 明确告诉调用方去哪查、多久查 —— 否则客户端不知道 73 秒这件事
+        hint: '已提交。用 POST /v1/videos/tasks {"task_id":"…"} 查状态，通常 60–120 秒出片。'
+          + '内容是「真实地点 + 人物」时可能被上游风控拒绝（会返回 failed 与具体原因）。',
+      })
+    } catch (error) {
+      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
+    }
+  }
+
+  // ── 查询视频任务 ──
+  if (path === '/v1/videos/tasks' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    const taskId = typeof body.task_id === 'string' ? body.task_id.trim() : ''
+    if (taskId === '') return jsonError(400, 'task_id 必填', 'invalid_request')
+    const realm = await resolveMediaRealm(env, url)
+    if (!mediaCapable(realm)) {
+      return jsonError(400, `视频生成目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
+    }
+    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
+    if (credential === undefined) return jsonError(503, '没有可用的国际版账号', 'no_available_account')
+    try {
+      const r = await getVideoTask(
+        { uid: credential.uid, accessToken: credential.credential.accessToken },
+        env,
+        taskId,
+      )
+      return json({
+        id: r.taskId,
+        object: 'video',
+        status: r.status,
+        ...(r.urls.length === 0 ? {} : { data: r.urls.map((u) => ({ url: u })) }),
+        ...(r.durationSeconds === undefined ? {} : { seconds: r.durationSeconds }),
+        ...(r.credit === undefined ? {} : { usage: { credit: r.credit } }),
+        // ⚠️ `failed` 必须把上游原话交出去（例如风控拦截），
+        // 笼统报「生成失败」会让用户反复重试同一个 prompt。
+        ...(r.error === undefined ? {} : { error: { message: r.error } }),
+        ...(r.status === 'completed'
+          ? { hint: '视频是签名直链（约 12 小时有效），需要请立即下载。' }
+          : {}),
+      })
     } catch (error) {
       return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
     }

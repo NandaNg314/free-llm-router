@@ -302,3 +302,127 @@ export async function webFetch(
     content: typeof data.content === 'string' ? data.content : '',
   }
 }
+
+// ─────────────────────── 视频（可灵） ───────────────────────
+
+/** 视频任务状态（上游原样，不做归并 —— `in_progress` / `queued` 都有意义）。 */
+export type VideoStatus = 'queued' | 'in_progress' | 'completed' | 'failed' | string
+
+export interface VideoSubmitResult {
+  taskId: string
+  status: VideoStatus
+}
+
+export interface VideoTaskResult {
+  taskId: string
+  status: VideoStatus
+  /** 出片后才有（签名直链，约 12 小时有效）。 */
+  urls: string[]
+  /** 实际时长（秒；`completed` 后上游才给）。 */
+  durationSeconds: number | undefined
+  /** 消耗积分（`completed` 后才有）。 */
+  credit: number | undefined
+  /** 失败原因（上游原话，例如风控拦截）。 */
+  error: string | undefined
+}
+
+/**
+ * 提交视频生成（`POST /v2/videos/generations`）。
+ *
+ * ## ⚠️ 这是**异步**的，不要同步等
+ *
+ * 实测（2026-11-05）：4 秒片子 **73 秒**出片。直接等会超过多数 HTTP 客户端超时，
+ * 所以这里只提交、立刻返回 `task_id`，出片靠 {@link getVideoTask} 轮询。
+ *
+ * ## ⚠️ 风控会直接拒
+ *
+ * 实测同一天两次提交：
+ * - 「一个人在北京天安门广场骑自行车」⇒ **62 秒后 `failed`**，
+ *   `error.message = "Failure to pass the risk control system"`；
+ * - 「一只橘色的小猫在阳光下的草地上奔跑」⇒ 73 秒 `completed`。
+ *
+ * ⇒ **含真实地点 + 人物的组合容易被拦**。调用方必须把 `failed` 的
+ * `error.message` 原样交给用户 —— 笼统报「生成失败」会让人反复重试同一个 prompt。
+ */
+export async function submitVideo(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+  input: { prompt: string; model?: string; seconds?: number; aspectRatio?: string },
+): Promise<VideoSubmitResult> {
+  const model = (input.model ?? '').trim() || INTl_VIDEO_MODEL
+  const seconds = typeof input.seconds === 'number' && input.seconds > 0
+    ? Math.min(Math.max(Math.round(input.seconds), 1), 15) // 实测支持 4–15
+    : 5
+  const aspect = (input.aspectRatio ?? '').trim() || '16:9'
+
+  const { data } = await mediaCall<{ id?: unknown; task_id?: unknown; status?: unknown }>(
+    ctx, env, '/v2/videos/generations',
+    { model, prompt: input.prompt, seconds, aspect_ratio: aspect, wait: false },
+  )
+
+  // ⚠️ 提交响应里任务 id 在 `id`（不是 `task_id`）；两个都认，防止上游改字段
+  const taskId = typeof data.id === 'string' ? data.id
+    : typeof data.task_id === 'string' ? data.task_id : ''
+  if (taskId === '') throw new UpstreamError({
+    kind: 'unknown', httpStatus: 200,
+    message: '提交成功但响应里没有任务 id（字段既不是 id 也不是 task_id）',
+    detail: JSON.stringify(data).slice(0, 300),
+  })
+
+  return { taskId, status: typeof data.status === 'string' ? data.status : 'queued' }
+}
+
+/**
+ * 查询视频任务（**`POST /v2/videos/tasks`**，body `{task_id}`）。
+ *
+ * ⚠️⚠️ **不是 GET `/v2/videos/generations/{id}`** —— 那条路径返回
+ * `404 page not found`。我第一版就是按 REST 习惯写的 GET，结果永远查不到状态，
+ * 看起来像「视频一直卡在排队」。
+ */
+export async function getVideoTask(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+  taskId: string,
+): Promise<VideoTaskResult> {
+  const { data } = await mediaCall<{
+    id?: unknown
+    task_id?: unknown
+    status?: unknown
+    data?: unknown
+    url?: unknown
+    video_url?: unknown
+    usage?: unknown
+    error?: unknown
+  }>(ctx, env, '/v2/videos/tasks', { task_id: taskId })
+
+  const status = typeof data.status === 'string' ? data.status : ''
+
+  // 出片地址：`data[]` 数组为主，也见过顶层 `url` / `video_url`
+  const urls: string[] = []
+  if (Array.isArray(data.data)) {
+    for (const item of data.data) {
+      if (item === null || typeof item !== 'object') continue
+      const rec = item as Record<string, unknown>
+      const u = typeof rec.url === 'string' ? rec.url : ''
+      if (u !== '') urls.push(u)
+    }
+  }
+  if (urls.length === 0) {
+    const flat = typeof data.video_url === 'string' ? data.video_url : typeof data.url === 'string' ? data.url : ''
+    if (flat !== '') urls.push(flat)
+  }
+
+  const usage = data.usage !== null && typeof data.usage === 'object' ? (data.usage as Record<string, unknown>) : {}
+  const err = data.error !== null && typeof data.error === 'object'
+    ? (data.error as Record<string, unknown>)
+    : undefined
+
+  return {
+    taskId: typeof data.id === 'string' ? data.id : taskId,
+    status,
+    urls,
+    durationSeconds: typeof usage.output_video_duration === 'number' ? usage.output_video_duration : undefined,
+    credit: typeof usage.credit === 'number' ? usage.credit : undefined,
+    error: err !== undefined && typeof err.message === 'string' ? err.message : undefined,
+  }
+}

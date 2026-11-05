@@ -158,3 +158,35 @@ test('🔴 生图必须带 model（不带时上游回 14401 route config not fou
     '⚠️ 调用方没给 model 时必须填默认值')
   assert.ok(/model,/.test(src), '⚠️ 请求体必须带 model 字段')
 })
+
+test('🔴 视频查询必须用 POST /v2/videos/tasks，不是 GET 路径', () => {
+  // 2026-11-05 实测：`GET /v2/videos/generations/{id}` 返回
+  // `404 page not found`。我第一版按 REST 习惯写的 GET，
+  // 结果永远查不到状态 —— 看起来像「视频一直卡在排队」。
+  const src = readFileSync('src/upstream/media.ts', 'utf8')
+  assert.ok(/\/v2\/videos\/tasks/.test(src), '⚠️ 查询路径必须是 /v2/videos/tasks')
+  assert.ok(/task_id: taskId/.test(src), '⚠️ 查询要传 task_id（body 里）')
+  // 不得出现 GET 形式的按 id 路径拼接
+  assert.ok(!/videos\/generations\/\$\{/.test(src),
+    '⚠️ 不能用 /v2/videos/generations/{id}（404）')
+})
+
+test('🔴 视频提交响应里的任务 id 在 `id` 字段，不是 `task_id`', () => {
+  // 实测提交响应：{"data":{"id":"1372715883-WandVideo-…","status":"queued"}}
+  // 只认 `task_id` 会把成功提交误判成「没拿到 id」。
+  const src = readFileSync('src/upstream/media.ts', 'utf8')
+  assert.ok(/typeof data\.id === 'string' \? data\.id/.test(src), '⚠️ 必须优先读 data.id')
+  assert.ok(/data\.task_id/.test(src), '⚠️ 同时兼容 task_id（上游可能改字段）')
+})
+
+test('🔴 视频 failed 必须把上游原话交出去（风控原因）', () => {
+  // 实测「真实地点 + 人物」会被拦：
+  // {"status":"failed","error":{"message":"Failure to pass the risk control system"}}
+  // 笼统报「生成失败」会让用户反复重试同一个 prompt。
+  const src = readFileSync('src/upstream/media.ts', 'utf8')
+  assert.ok(/error: err !== undefined && typeof err\.message === 'string' \? err\.message/.test(src),
+    '⚠️ 必须解析 error.message')
+  const idx = readFileSync('src/index.ts', 'utf8')
+  assert.ok(/\.\.\.\(r\.error === undefined \? \{\} : \{ error: \{ message: r\.error \} \}\)/.test(idx),
+    '⚠️ 端点必须把 failed 原因透出去')
+})
