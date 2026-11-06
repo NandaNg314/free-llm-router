@@ -321,6 +321,11 @@ export interface PickRequest {
   /** 已尝试过的 uid，必须排除（跨重试保留，否则会在账号间无限来回）。 */
   exclude: string[]
   now: number
+  /**
+   * 是否仅限消耗快过期积分（专属安全保护模式）。
+   * 为 true 时，没有即将过期积分的账号将被直接过滤排除；全池耗尽时返回 expiringCreditsExhausted。
+   */
+  expiringOnly?: boolean
 }
 
 /** 选号结果。 */
@@ -337,6 +342,8 @@ export interface PickResult {
   lockedByPermanent?: true
   /** 因锁被滤掉的候选数（仅供错误信息展示）。 */
   lockedSkipped?: number
+  /** 是否因仅消耗临期积分模式把全部候选滤空（保护永久积分）。 */
+  expiringCreditsExhausted?: true
   /** 「只用指定账号」但它不可用（见 {@link PinnedUnavailable}）。 */
   pinnedUnavailable?: true
   pinnedUid?: string
@@ -696,6 +703,7 @@ export class AccountPoolDO extends DurableObject<Env> {
     //（参考实现的纪律：回落会绕过锁、照样烧永久积分，使锁形同虚设）。
     const permLocks = await this.getPermanentLocks()
     let permLockSkipped = 0
+    let expiringOnlySkipped = 0
     // ⚠️ 在读账号**之前**取（`getSafetyConfig` 有缓存，代价可忽略），
     // 避免循环里每条账号都 await 一次。
     //
@@ -752,6 +760,16 @@ export class AccountPoolDO extends DurableObject<Env> {
         continue
       }
 
+      // ── 临期专享保护过滤 ──
+      if (request.expiringOnly === true) {
+        const hasExpiring = state.creditsExpiring > 0 && state.creditsEarliestExpiry > now
+        if (!hasExpiring) {
+          expiringOnlySkipped += 1
+          if (isPin) pinReason = '该账号已无即将过期的积分（临期保护模式生效）'
+          continue
+        }
+      }
+
       // ── 永久积分锁过滤 ──
       //
       // 判定「只剩永久额度」用**快照三元组**（AccountState 已有，无需再打上游）：
@@ -794,13 +812,10 @@ export class AccountPoolDO extends DurableObject<Env> {
     }
 
     if (candidates.length === 0) {
-      // ⚠️ 因永久锁被滤空时，返回值里带上**可读的原因**（而不是 undefined）。
-      // 调用方（网关）把它翻译成用户可见错误 —— 这正是 §7.2「失败必须显式」：
-      // 用户必须知道「账号是好的，只是永久积分锁住了」，否则会误以为服务故障。
+      if (request.expiringOnly === true && expiringOnlySkipped > 0) {
+        return { expiringCreditsExhausted: true, lockedSkipped: expiringOnlySkipped } as PickResult
+      }
       if (permLockSkipped > 0) {
-        // ⚠️ 刻意用独立类型（不塞进 PickResult）：state 是必填字段，
-        // 把它置 undefined 会骗过类型系统、让所有调用方都要判空 ——
-        // 独立判别联合让「锁了」与「选到号」在类型层就分开。
         return { lockedByPermanent: true, lockedSkipped: permLockSkipped } as PickResult
       }
       return undefined
@@ -872,15 +887,23 @@ export class AccountPoolDO extends DurableObject<Env> {
       // 当调用时间戳相同时（如均为 0），按 uid 字符串稳定排序，
       // 确保请求严格在池中多个账号之间均匀交替轮转，
       // 单账号 RPM 严格压低至 1/N，避免单个账号连续承载高频流量导致上游频次瞬间超限。
-      // `expiry`（临期优先）：有到期时刻的号按「最早到期」升序排在前面，先烧快过期的积分；
-      // 不知道到期时刻（0 / 已过）的号视为最晚，彼此之间仍按最久未用轮换。
+      // `expiry`（临期优先）：
+      // 真正有快过期积分（creditsExpiring > 0 且未过期）的号排在第一梯队，按最早到期时刻升序排序（先烧快过期的积分）；
+      // 到期时刻相近时，临期额度多的优先消耗；
+      // 一个账号的临期额度消耗完（creditsExpiring <= 0），自动掉入第二梯队，让位给其他有临期额度的号；
+      // 没有快过期积分的账号视为最晚（Number.POSITIVE_INFINITY），彼此之间按最久未用轮换。
       // `roundrobin`：只按最久未用轮换。
+      const hasExpiring = (s: AccountState): boolean =>
+        s.creditsExpiring > 0 && s.creditsEarliestExpiry > now
       const expiryOf = (s: AccountState): number =>
-        strategy === 'expiry' && s.creditsEarliestExpiry > now ? s.creditsEarliestExpiry : Number.POSITIVE_INFINITY
+        strategy === 'expiry' && hasExpiring(s) ? s.creditsEarliestExpiry : Number.POSITIVE_INFINITY
       const sorted = [...pool].sort((a, b) => {
         const ea = expiryOf(a)
         const eb = expiryOf(b)
         if (ea !== eb) return ea < eb ? -1 : 1
+        if (hasExpiring(a) && hasExpiring(b) && a.creditsExpiring !== b.creditsExpiring) {
+          return b.creditsExpiring - a.creditsExpiring
+        }
         const diff = this.notePickedAt(a.uid) - this.notePickedAt(b.uid)
         return diff !== 0 ? diff : a.uid.localeCompare(b.uid)
       })
@@ -1574,6 +1597,8 @@ export class AccountPoolDO extends DurableObject<Env> {
     usage?: { input: number; output: number },
     /** 本次成功实际使用的模型名（用于反证对应的模型冷却）。 */
     model?: string,
+    /** 本次请求实际扣减的积分（若有，将实时从 creditsExpiring / credits 中扣减）。 */
+    costCredits?: number,
   ): Promise<void> {
     const state = this.readState(uid)
     if (state === undefined) return
@@ -1591,6 +1616,13 @@ export class AccountPoolDO extends DurableObject<Env> {
     if (usage !== undefined) {
       state.tokenUsage.input += usage.input
       state.tokenUsage.output += usage.output
+    }
+
+    if (typeof costCredits === 'number' && costCredits > 0) {
+      if (state.creditsExpiring > 0) {
+        state.creditsExpiring = Math.max(0, state.creditsExpiring - costCredits)
+      }
+      state.credits = Math.max(0, state.credits - costCredits)
     }
 
     // 用「真实成功」反证弱证据的模型冷却（见上方注释）。

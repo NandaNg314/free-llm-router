@@ -23,6 +23,8 @@ export interface Account {
   disabled: boolean
   reason: string
   credits: number
+  creditsExpiring?: number
+  creditsEarliestExpiry?: number
   coolKind: string
   until: number
   successCount: number

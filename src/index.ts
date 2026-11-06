@@ -4178,6 +4178,14 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     // ⚠️ 只回可展示字段，**绝不回凭据**
     return json({
       realm,
+      summary: {
+        totalCredits: accounts.reduce((acc, cur) => acc + (cur.credits || 0), 0),
+        totalExpiringCredits: accounts.reduce((acc, cur) => acc + (cur.creditsExpiring || 0), 0),
+        earliestExpiry: accounts.reduce((min, cur) => {
+          if (!cur.creditsEarliestExpiry || cur.creditsEarliestExpiry <= Date.now()) return min
+          return min === 0 ? cur.creditsEarliestExpiry : Math.min(min, cur.creditsEarliestExpiry)
+        }, 0),
+      },
       accounts: accounts.map((a) => ({
         uid: a.uid,
         // ⚠️ 必须回传 provider：面板靠它把账号分到各家卡片下。
@@ -4188,6 +4196,8 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         disabled: a.disabled,
         reason: a.reason,
         credits: a.credits,
+        creditsExpiring: a.creditsExpiring ?? 0,
+        creditsEarliestExpiry: a.creditsEarliestExpiry ?? 0,
         coolKind: a.coolKind,
         until: a.until,
         lastCheckinDay: a.lastCheckinDay,

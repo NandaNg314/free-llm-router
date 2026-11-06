@@ -15,6 +15,7 @@ import {
   Search,
   Shield,
   Snowflake,
+  Sparkles,
   Star,
   Timer,
   Trash2,
@@ -110,6 +111,19 @@ export function ProvidersPage() {
     return customOrder ? all : [...all].sort((a, b) => (byProvider.get(b.id)?.length ?? 0) - (byProvider.get(a.id)?.length ?? 0))
   }, [providers.data, customOrder, byProvider])
 
+  const totalExpiring = useMemo(
+    () => (accounts.data ?? []).reduce((sum, a) => sum + (a.creditsExpiring ?? 0), 0),
+    [accounts.data],
+  )
+  const earliestExpiryTs = useMemo(
+    () =>
+      (accounts.data ?? []).reduce((min, a) => {
+        if (!a.creditsEarliestExpiry || a.creditsEarliestExpiry <= Date.now()) return min
+        return min === 0 ? a.creditsEarliestExpiry : Math.min(min, a.creditsEarliestExpiry)
+      }, 0),
+    [accounts.data],
+  )
+
   return (
     <>
       <PageHeader
@@ -122,7 +136,7 @@ export function ProvidersPage() {
         }
       />
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         <StatCard label="总账号" value={c?.total ?? 0} icon={Users} tone="primary" loading={!c} sub={`分布在 ${withAccounts} 家供应商`} />
         <StatCard
           label="可用"
@@ -152,7 +166,15 @@ export function ProvidersPage() {
           onClick={() => setFilter('disabled')}
         />
         <StatCard
-          className="col-span-2 md:col-span-1"
+          label="临期积分总计"
+          value={fmtInt(totalExpiring)}
+          icon={Sparkles}
+          tone={totalExpiring > 0 ? 'warning' : 'primary'}
+          loading={!accounts.data}
+          sub={totalExpiring > 0 && earliestExpiryTs > 0 ? `最早 ${fmtRelative(earliestExpiryTs)}到期` : '无即将过期积分'}
+        />
+        <StatCard
+          className="col-span-2 md:col-span-1 xl:col-span-1"
           label="供应商"
           value={providers.data?.providers.length ?? 0}
           icon={Layers}
@@ -527,7 +549,22 @@ export function AccountsTable({
                     </div>
                   )}
                 </TD>
-                <TD className="tabular text-right font-medium">{fmtInt(a.credits)}</TD>
+                <TD className="tabular text-right">
+                  <div className="font-medium text-foreground">{fmtInt(a.credits)}</div>
+                  {(a.creditsExpiring ?? 0) > 0 ? (
+                    <div
+                      className="mt-0.5 flex items-center justify-end gap-1 text-[11px] font-normal text-amber-500"
+                      title={a.creditsEarliestExpiry ? `最早到期时刻：${new Date(a.creditsEarliestExpiry).toLocaleString()}` : ''}
+                    >
+                      <span>临期 {fmtInt(a.creditsExpiring ?? 0)}</span>
+                      {a.creditsEarliestExpiry && a.creditsEarliestExpiry > Date.now() && (
+                        <span className="text-[10px] text-muted-foreground">({fmtRelative(a.creditsEarliestExpiry)}到期)</span>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="mt-0.5 text-[10.5px] font-normal text-muted-foreground">纯永久</div>
+                  )}
+                </TD>
                 {!compact && (
                   <TD className="tabular text-muted-foreground hidden text-right lg:table-cell">
                     <span className="text-foreground">{fmtInt(a.successCount)}</span> / {fmtInt(a.errTotal)}

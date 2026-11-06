@@ -699,14 +699,19 @@ async function pickCandidate(
   preferred?: string,
   /** 请求级指定账号（`X-FLR-Account`）。 */
   pinned?: string,
+  expiringOnly?: boolean,
 ): Promise<Candidate | PinBlocked | undefined> {
   const result = await pool.pick({
     realm, provider, model, exclude, now,
     ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
     ...(pinned !== undefined && pinned !== '' ? { pinned } : {}),
+    ...(expiringOnly === true ? { expiringOnly: true } : {}),
   })
   if (result !== undefined && result.pinnedUnavailable === true) {
     return { pinBlocked: true, picked: result }
+  }
+  if (result !== undefined && (result as { expiringCreditsExhausted?: true }).expiringCreditsExhausted === true) {
+    throw new Error('当前所有可用账号的快过期积分均已耗尽。已自动停止派发以保护您的永久积分。')
   }
   // ── 永久积分锁：把「锁了」翻译成**用户可见的明确错误** ──
   //
@@ -940,6 +945,7 @@ export async function handleChatCompletions(
   // 前缀大小写不敏感（与 `splitModelName` 一致）：`Aggregate/auto` 若漏到默认供应商，
   // 小写化后会以 `aggregate/auto` 打上游 ⇒ 11102 ⇒ 被记成模型冷却。
   const rawLower = rawModel.toLowerCase()
+  const isExpiringOnly = rawLower.startsWith('expiring/')
 
   // 🔴 **裸名别名必须先判**（同步自上游 `598eaa0`）——
   // 顺序不可改：命中后 `providerId` 会被设成 `aggregate`，而它**不在注册表里**
@@ -1113,7 +1119,7 @@ export async function handleChatCompletions(
   }
 
   if (providerId !== DEFAULT_PROVIDER) {
-    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey })
+    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey, expiringOnly: isExpiringOnly })
   }
 
   // ⚠️ **必须把请求体里的 model 改写成去前缀的裸名**（实测踩到的真实缺陷，
@@ -1345,6 +1351,7 @@ export async function handleChatCompletions(
       pool, realm, model, tried, now, DEFAULT_PROVIDER,
       buddyPreferred === undefined ? '' : buddyPreferred,
       pinnedHeader,
+      isExpiringOnly,
     )
     // ── 只用指定账号但它不可用：直接报它的原因（不换号、不跨渠道容灾）──
     if (candidate !== undefined && 'pinBlocked' in candidate) {
@@ -2372,7 +2379,8 @@ export async function handleProviderChat(input: {
    * ⚠️ ≥1 时**不再触发**反向容灾，避免与 buddy 路径形成无限相互递归。
    */
   failoverDepth?: number
-}): Promise<GatewayResult> {  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey } = input
+  expiringOnly?: boolean
+}): Promise<GatewayResult> {  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey, expiringOnly } = input
   const failoverDepth = input.failoverDepth ?? 0
 
   const provider = findProvider(providerId)
@@ -2568,6 +2576,7 @@ export async function handleProviderChat(input: {
       realm: activeRealm, provider: providerId, model, exclude: tried, now,
       ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
       ...(pinnedHeader !== '' ? { pinned: pinnedHeader } : {}),
+      ...(expiringOnly === true ? { expiringOnly: true } : {}),
     })
     // ── 只用指定账号但它不可用：显式报原因，**不换号、不跨渠道容灾** ──
     if (picked !== undefined && picked.pinnedUnavailable === true) {
@@ -2576,6 +2585,13 @@ export async function handleProviderChat(input: {
         status: lastError?.status ?? 503,
         message: describePinBlocked(picked, pinnedHeader !== '', lastError?.message),
         kind: lastError?.kind ?? 'pinned_account_unavailable',
+      }
+      break
+    }
+    if (picked !== undefined && (picked as { expiringCreditsExhausted?: true }).expiringCreditsExhausted === true) {
+      lastError = {
+        status: 402,
+        message: '当前所有可用账号的快过期积分均已耗尽。已自动停止派发以保护您的永久积分。',
       }
       break
     }
@@ -3991,8 +4007,9 @@ async function handleAggregateChat(input: {
   realm: string
   ctx?: ExecutionContext
   sessionKey: string
+  expiringOnly?: boolean
 }): Promise<GatewayResult> {
-  const { model, rawBody, request, env, realm, ctx, sessionKey } = input
+  const { model, rawBody, request, env, realm, ctx, sessionKey, expiringOnly } = input
 
   const virtuals = await loadAggregateCatalog(env, realm, { signal: request.signal })
   if (virtuals.length === 0) {
@@ -4133,6 +4150,7 @@ async function handleAggregateChat(input: {
         // ⚠️ 聚合层**自己**有候选轮转循环，故禁止它内部的跨渠道容灾
         //（否则单个候选失败会先容灾一轮，与聚合的轮转叠加，白白放大请求）。
         failoverDepth: 1,
+        expiringOnly: input.expiringOnly,
       })
     } catch (error) {
       lastError = {

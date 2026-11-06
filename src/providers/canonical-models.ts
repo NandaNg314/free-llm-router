@@ -162,6 +162,7 @@ export const CANONICAL_NAMES: Readonly<Record<string, string>> = {
   'glm-5v-turbo': 'GLM-5V-Turbo',
   'kimi-k3': 'Kimi K3',
   'kimi-k3-1': 'Kimi K3.1',
+  'kimi-k3-1-pro': 'Kimi K3.1 Pro',
   'kimi-k2-8-preview': 'Kimi K2.8 Preview',
   'kimi-k2-7': 'Kimi K2.7',
   'kimi-k2-7-code': 'Kimi K2.7 Code',
