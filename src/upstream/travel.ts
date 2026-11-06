@@ -139,22 +139,35 @@ export function isAlreadyDeparted(code: number | undefined, msg: string): boolea
 export async function travelDepart(
   ctx: { uid: string; accessToken: string },
   env: Env,
+  locationId = 1,
 ): Promise<{ departed: boolean; detail: string }> {
-  const r = await growthCall(ctx, env, 'POST', '/activity/growth/buddy/travel/depart', '{}')
-  if (r.ok) return { departed: true, detail: '已派出旅行' }
-  // 「已达上限 / 已在旅行中」都不是失败：今天已经派过了。
-  // ⚠️ 判据同 `travelClaim`：要覆盖上游实际会回的多种文案
-  //（`limit` / `already` / `traveling` / `in progress` / 中文），
-  // 漏一个就会把「正常状态」报成红色错误。
-  if (isAlreadyDeparted(r.code, r.msg)) {
-    return { departed: false, detail: '今日已派出过（幂等命中）' }
+  const payloads = [
+    JSON.stringify({ location_id: locationId }),
+    JSON.stringify({ locationId }),
+    '{}',
+  ]
+  let lastR: { ok: boolean; httpStatus: number; code: number | undefined; msg: string; raw: string } = {
+    ok: false,
+    httpStatus: 0,
+    code: undefined,
+    msg: '',
+    raw: '',
+  }
+  for (const body of payloads) {
+    const r = await growthCall(ctx, env, 'POST', '/activity/growth/buddy/travel/depart', body)
+    if (r.ok) return { departed: true, detail: '已派出旅行' }
+    // 「已达上限 / 已在旅行中」都不是失败：今天已经派过了。
+    if (isAlreadyDeparted(r.code, r.msg)) {
+      return { departed: false, detail: '今日已派出过（幂等命中）' }
+    }
+    lastR = r
   }
   throw new UpstreamError({
     kind: 'unknown',
-    httpStatus: r.httpStatus,
-    code: r.code,
-    message: `派出旅行失败：${r.msg || r.raw.slice(0, 120)}`,
-    detail: r.raw.slice(0, 400),
+    httpStatus: lastR.httpStatus,
+    code: lastR.code,
+    message: `派出旅行失败：${lastR.msg || lastR.raw.slice(0, 120)}`,
+    detail: lastR.raw.slice(0, 400),
   })
 }
 

@@ -793,15 +793,22 @@ const ACTIONS: Record<string, ActionHandler> = {
   async travel(ctx, _step, env): Promise<ActionResult> {
     try {
       const before = await travelStatus({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
-      const claimed = await travelClaim({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
-      const departed = await travelDepart({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
-      const parts: string[] = [
-        claimed.claimed ? `已领取（${claimed.detail}）` : `无可领取（${claimed.detail}）`,
-        departed.departed ? `已出发（${departed.detail}）` : `未出发（${departed.detail}）`,
-      ]
-      // `TravelStatus` 只有 state / destination / dailyLimitReached（没有「剩余次数」）
+      const parts: string[] = []
       if (before.destination !== '') parts.push(`目的地 ${before.destination}`)
-      if (before.dailyLimitReached) parts.push('今日已达上限')
+      if (before.dailyLimitReached) {
+        return { ok: true, detail: '今日已达旅行上限（已完成）' }
+      }
+
+      if (before.state === 'arrived') {
+        const claimed = await travelClaim({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+        parts.push(claimed.claimed ? `已领取（${claimed.detail}）` : `无可领取（${claimed.detail}）`)
+      } else if (before.state === 'traveling') {
+        parts.push('正在旅行中，等待归来')
+        return { ok: true, detail: parts.join('；') }
+      }
+
+      const departed = await travelDepart({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      parts.push(departed.departed ? `已出发（${departed.detail}）` : `未出发（${departed.detail}）`)
       return { ok: true, detail: parts.join('；') }
     } catch (error) {
       return { ok: false, detail: describeError(error, '猫猫旅行') }

@@ -32,19 +32,25 @@ import { desktopHeaders } from './headers.js'
 /** 国际版 web 域（**固定**，不跟随 `UPSTREAM_WEB_BASE`）。 */
 export const INTl_WEB_BASE = 'https://www.workbuddy.ai'
 
+/** 国内版 agenttool 域（`copilot.tencent.com`，挂载搜索与抓取）。 */
+export const CN_AGENT_TOOL_BASE = 'https://copilot.tencent.com'
+
 /** 媒体生成 / 检索用的模型（国际版 `/v3/config` 实测下发）。 */
 export const INTl_IMAGE_MODEL = 'hy-image-3.5'
 export const INTl_VIDEO_MODEL = 'kling-video-v3'
 
 /**
- * 国际版能力是否可用（**按 realm 判断**，不按账号猜）。
- *
- * ⚠️ 只有 `global` 分片有这些权限（见文件头对照表）。
- * 调用方必须在**无权限时如实报错**，而不是静默回落成「对话」——
- * 那会让用户以为「联网检索返回的是模型编的」。
+ * 媒体能力是否可用（生图、视频等目前只有国际版支持）。
  */
 export function mediaCapable(realm: string): boolean {
   return realm === 'global'
+}
+
+/**
+ * 搜索与抓取能力是否可用（国内版与国际版均支持，国内站需补齐官方 IDE 桌面头）。
+ */
+export function webToolCapable(realm: string): boolean {
+  return realm === 'global' || realm === 'cn'
 }
 
 /** 生图结果（上游 `data` 原样透传，我们只补一层错误语义）。 */
@@ -55,42 +61,73 @@ export interface ImageGenResult {
   credit: number | undefined
 }
 
-/** 联网检索结果。 */
+/** 联网检索结果（满足 DSH Search API 契约）。 */
 export interface SearchResult {
   query: string
-  results: Array<{ title: string; url: string; snippet: string; date?: string }>
+  results: Array<{ title: string; url: string; snippet: string; date: null }>
   total: number | undefined
 }
 
-/** 网页抓取结果。 */
+/** 网页抓取结果（满足 DSH Fetch API 契约）。 */
 export interface FetchResult {
   url: string
   title: string
   content: string
 }
 
+function agentToolTraceparent(): string {
+  const buf = new Uint8Array(24)
+  crypto.getRandomValues(buf)
+  const hex = Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('')
+  return `00-${hex.slice(0, 32)}-${hex.slice(32)}-01`
+}
+
+function buildCnAgentToolHeaders(uid: string, accessToken: string, enterpriseId?: string): Record<string, string> {
+  const cleanUid = uid.replace(/^buddy:|^workbuddy:/, '')
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    Authorization: `Bearer ${accessToken}`,
+    'X-Requested-With': 'XMLHttpRequest',
+    'X-IDE-Type': 'WorkBuddy',
+    'X-IDE-Name': 'WorkBuddy',
+    'X-IDE-Version': '5.8.3',
+    'X-Private-Data': 'true',
+    'X-Codebuddy-Request': '1',
+    'X-Agent-Intent': 'craft',
+    'X-Agent-Purpose': 'conversation',
+    'X-Agent-Type': 'main',
+    'X-Product': 'SaaS',
+    'X-User-Id': cleanUid,
+  }
+  if (enterpriseId) {
+    headers['X-Tenant-Id'] = enterpriseId
+    headers['X-Enterprise-Id'] = enterpriseId
+  }
+  headers['traceparent'] = agentToolTraceparent()
+  return headers
+}
+
 /**
- * 国际版「媒体 / 工具」族通用请求。
- *
- * ⚠️ **必须用 `INTl_WEB_BASE`**（`www.workbuddy.ai`），不是 chat 域 ——
- * 这是上面那个「404 Route Not Found」坑的根因。
- * ⚠️ 头族用 `desktopHeaders`（与 growth/report 同源）：实测这组头能过 APISIX，
- * 换 CLI 头也行，但既然已验证这条，就固定用它，不再猜。
+ * 通用「媒体 / 工具」族请求：支持国际版与国内版（国内版自动补齐桌面端 IDE 头）。
  */
 async function mediaCall<T = unknown>(
-  ctx: { uid: string; accessToken: string },
+  ctx: { uid: string; accessToken: string; realm?: string; enterpriseId?: string },
   env: Env,
   path: string,
   body: unknown,
   timeoutMs = 120_000,
 ): Promise<{ data: T; raw: string; credit: number | undefined }> {
-  // ⚠️ **必须用国际版固定域**，不能用 `resolveUpstream(env).web` ——
-  // 后者的默认值是国内域 `www.workbuddy.cn`，在那里这些端点一律 401。
+  const isCn = ctx.realm === 'cn'
   const base = INTl_WEB_BASE
+  const endpointBase = isCn ? CN_AGENT_TOOL_BASE : base
+  const headers = isCn
+    ? buildCnAgentToolHeaders(ctx.uid, ctx.accessToken, ctx.enterpriseId)
+    : desktopHeaders({ uid: ctx.uid.replace(/^workbuddy:/, ''), accessToken: ctx.accessToken })
   const res = await callUpstream({
     method: 'POST',
-    url: `${base}${path}`,
-    headers: desktopHeaders({ uid: ctx.uid.replace(/^workbuddy:/, ''), accessToken: ctx.accessToken }),
+    url: `${endpointBase}${path}`,
+    headers,
     body: JSON.stringify(body),
     timeoutMs,
   })
@@ -252,36 +289,55 @@ export async function editImage(
   }
 }
 
+function siteFallbackUrl(site: unknown): string {
+  if (typeof site !== 'string') return ''
+  const s = site.trim()
+  if (!s || s.includes(' ') || !s.includes('.')) return ''
+  return `https://${s.replace(/^\.+|\.+$/g, '')}`
+}
+
+/** 官方默认的网页抓取提取 Prompt。 */
+export const DEFAULT_WEB_FETCH_PROMPT =
+  'Extract the main content of this page as clean Markdown. Keep headings, lists, code blocks and key facts. Remove navigation, ads and boilerplate.'
+
 /**
  * 联网检索（`POST /agenttool/v1/search`）。
- *
- * ⚠️ 实测**查询本身免费**（响应里没有 credit 字段）。但其结果会被注入对话上下文，
- * 那部分按 token 计费 —— 所以别在一个请求里检索几十次。
+ * 支持国内版（带 IDE 桌面头）与国际版，结果适配 DSH Search API 形状。
  */
 export async function webSearch(
-  ctx: { uid: string; accessToken: string },
+  ctx: { uid: string; accessToken: string; realm?: string; enterpriseId?: string },
   env: Env,
-  input: { query: string; maxResults?: number },
+  input: { query: string; maxResults?: number; count?: number },
 ): Promise<SearchResult> {
-  const maxResults = typeof input.maxResults === 'number' && input.maxResults > 0
-    ? Math.min(input.maxResults, 20)
+  const countRaw = input.count ?? input.maxResults
+  const maxResults = typeof countRaw === 'number' && countRaw > 0
+    ? Math.min(countRaw, 20)
     : 5
   const { data } = await mediaCall<{
     query?: unknown
     results?: unknown
     total_results?: unknown
-  }>(ctx, env, '/agenttool/v1/search', { query: input.query, max_results: maxResults })
+  }>(ctx, env, '/agenttool/v1/search', {
+    query: input.query,
+    type: 'text2text',
+    max_results: maxResults,
+  }, 20_000)
 
   const results: SearchResult['results'] = []
   if (Array.isArray(data.results)) {
     for (const item of data.results) {
       if (item === null || typeof item !== 'object') continue
       const rec = item as Record<string, unknown>
+      let url = typeof rec.url === 'string' ? rec.url.trim() : ''
+      if (url === '') {
+        url = siteFallbackUrl(rec.site)
+      }
+      if (url === '') continue // DSH 解码器要求非空 URL
       results.push({
         title: typeof rec.title === 'string' ? rec.title : '',
-        url: typeof rec.url === 'string' ? rec.url : '',
+        url,
         snippet: typeof rec.snippet === 'string' ? rec.snippet : '',
-        ...(typeof rec.date === 'string' ? { date: rec.date } : {}),
+        date: null,
       })
     }
   }
@@ -294,25 +350,39 @@ export async function webSearch(
 
 /**
  * 抓网页正文（`POST /agenttool/v1/webfetch`）。
- *
- * ⚠️ 返回的 `content` 是**已经转成 markdown 的正文**（上游做完了提取与清洗）。
- * 不要自己再解析一遍 HTML。
+ * 支持国内版与国际版，上游返回 markdown 正文，适配 DSH Fetch API 形状。
  */
 export async function webFetch(
-  ctx: { uid: string; accessToken: string },
+  ctx: { uid: string; accessToken: string; realm?: string; enterpriseId?: string },
   env: Env,
-  input: { url: string },
+  input: { url: string; prompt?: string },
 ): Promise<FetchResult> {
   const { data } = await mediaCall<{
     url?: unknown
     title?: unknown
     content?: unknown
-  }>(ctx, env, '/agenttool/v1/webfetch', { url: input.url })
+  }>(ctx, env, '/agenttool/v1/webfetch', {
+    url: input.url,
+    format: 'markdown',
+    prompt: input.prompt || DEFAULT_WEB_FETCH_PROMPT,
+    timeout: 30,
+    max_length: 100000,
+  }, 30_000)
+
+  const content = typeof data.content === 'string' ? data.content : ''
+  if (!content) {
+    throw new UpstreamError({
+      kind: 'unknown',
+      httpStatus: 502,
+      message: '上游未返回可用的页面正文',
+      detail: '上游 webfetch 响应缺少有效 content',
+    })
+  }
 
   return {
     url: typeof data.url === 'string' ? data.url : input.url,
     title: typeof data.title === 'string' ? data.title : '',
-    content: typeof data.content === 'string' ? data.content : '',
+    content,
   }
 }
 

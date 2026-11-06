@@ -918,10 +918,17 @@ const FINGERPRINT_LITERALS = [
   'Main branch (',
   'You are a coding agent running in the Codex CLI',
   'github.com/anthropics/',
+  'are paths the user',
+  'workspace root',
+  'DeepSeek Harness Web GUI',
+  'the DeepSeek Harness Web GUI',
+  'Grok Build',
+  'released by xAI',
 ]
 const FINGERPRINT_CI = /x-anthropic-billing-header|Sisyphus-Junior - Focused executor from OhMyOpenCode/i
 const FINGERPRINT_REWRITES: ReadonlyArray<readonly [string, string]> = [
   ["You are Claude Code, Anthropic's official CLI for Claude", "You are Claude Code, Anthropic's official CLI tool for Claude"],
+  ["You are Claude Code, Anthropic's official CLI for Claude.", "You are Claude Code, Anthropic's official CLI tool for Claude."],
   ['Main branch (you will usually use this for PRs)', 'Default branch (you will usually use this for PRs)'],
   [
     'You are a coding agent running in the Codex CLI, a terminal-based coding assistant.',
@@ -931,11 +938,21 @@ const FINGERPRINT_REWRITES: ReadonlyArray<readonly [string, string]> = [
     'To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues',
     'To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues',
   ],
+  ['are paths the user', 'are paths that the user'],
+  ['workspace root', 'workspace base'],
+  [
+    'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.',
+    'You are interacting with the user through a Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.',
+  ],
+  ['the DeepSeek Harness Web GUI', 'a Web GUI'],
+  ['Grok released by xAI', 'WorkBuddy'],
+  ['Grok Build', 'WorkBuddy'],
 ]
 const OMO_JUNIOR_RE = /Sisyphus-Junior - Focused executor from OhMyOpenCode/gi
 const BILLING_HDR_RE = /x-anthropic-billing-header:[^;\r\n]*;?\s*/gi
 const BARE_BILLING_HDR_RE = /x-anthropic-billing-header/gi
 const CC_KV_RE = /\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*/gi
+const GROK_XAI_RE = /You are(?:[^\n]{0,256}?)released by xAI/gi
 
 
 /**
@@ -972,6 +989,7 @@ function hasFingerprint(text: string, identity: boolean): boolean {
 export function scrubFingerprintText(text: string, identity = false, trim = true): string {
   if (text === '' || !hasFingerprint(text, identity)) return text
   let out = text.replace(OMO_JUNIOR_RE, 'Sisyphus-Junior - Focused executor')
+  out = out.replace(GROK_XAI_RE, 'You are WorkBuddy')
   if (identity) out = out.replace(IDENTITY_RE, IDENTITY_REPLACEMENT)
   for (const [from, to] of FINGERPRINT_REWRITES) out = out.replaceAll(from, to)
   out = out.replaceAll(FP_BARE, FP_SAFE)

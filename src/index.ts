@@ -4686,53 +4686,104 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     }
   }
 
-  // ── 联网检索（官方 agenttool 透传） ──
+  // ── 联网检索（官方 agenttool 透传，按 DSH 与 OpenAI 兼容格式） ──
   //
-  // ⚠️ 这是**非 OpenAI 标准**的扩展端点（OpenAI 没有搜索 API）。
-  // MCP 客户端（Claude Code / Cursor / Cline）走 `/mcp` 的同名工具。
+  // ⚠️ 适配 DSH Search API 与扩展端点。
+  // 兼容入参：query, count, max_results, need_content, ori_question
   if (path === '/v1/search' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const realm = await resolveMediaRealm(env, url)
-    if (!mediaCapable(realm)) {
-      return jsonError(400, `联网检索目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
-    }
     const query = typeof body.query === 'string' ? body.query.trim() : ''
-    if (query === '') return jsonError(400, 'query 必填', 'invalid_request')
-    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
-    if (credential === undefined) return jsonError(503, '没有可用的国际版账号', 'no_available_account')
-    try {
-      const r = await webSearch(
-        { uid: credential.uid, accessToken: credential.credential.accessToken },
-        env,
-        { query, ...(typeof body.max_results === 'number' ? { maxResults: body.max_results } : {}) },
-      )
-      return json({ query: r.query, results: r.results, ...(r.total === undefined ? {} : { total_results: r.total }) })
-    } catch (error) {
-      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
+    if (query === '') return jsonError(400, 'query 不能为空', 'invalid_request_error')
+
+    const countRaw = body.count ?? body.max_results
+    const maxResults = typeof countRaw === 'number' && countRaw > 0 ? Math.min(countRaw, 20) : 5
+
+    const preferredRealm = (await resolveMediaRealm(env, url)) as 'cn' | 'global'
+    const realmCandidates: Array<{ realm: 'cn' | 'global'; providerId: string }> =
+      preferredRealm === 'global'
+        ? [
+            { realm: 'global', providerId: WORKBUDDY_INTL.id },
+            { realm: 'cn', providerId: DEFAULT_PROVIDER },
+          ]
+        : [
+            { realm: 'cn', providerId: DEFAULT_PROVIDER },
+            { realm: 'global', providerId: WORKBUDDY_INTL.id },
+          ]
+
+    let lastError: unknown
+    for (const cand of realmCandidates) {
+      const picked = await pickCredential(env, cand.realm, cand.providerId)
+      if (picked === undefined) continue
+      try {
+        const enterpriseId = picked.credential.extras?.enterpriseId || picked.credential.extras?.enterprise_id
+        const r = await webSearch(
+          {
+            uid: picked.uid,
+            accessToken: picked.credential.accessToken,
+            realm: cand.realm,
+            enterpriseId,
+          },
+          env,
+          { query, count: maxResults },
+        )
+        return json({ results: r.results })
+      } catch (error) {
+        lastError = error
+        console.warn(`[websearch] 分片 ${cand.realm} 账号 ${picked.uid} 搜索失败，尝试下一候选：`, error)
+      }
     }
+
+    if (lastError !== undefined) {
+      return jsonError(502, lastError instanceof Error ? lastError.message : String(lastError), 'upstream_error')
+    }
+    return jsonError(503, '没有可用的搜索凭据（请先登录国内或国际版账号）', 'no_available_account')
   }
 
-  // ── 抓网页正文（官方 agenttool 透传，返回 markdown） ──
+  // ── 抓网页正文（官方 agenttool 透传，返回 DSH 兼容结构） ──
   if (path === '/v1/fetch' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const realm = await resolveMediaRealm(env, url)
-    if (!mediaCapable(realm)) {
-      return jsonError(400, `网页抓取目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
-    }
     const target = typeof body.url === 'string' ? body.url.trim() : ''
-    if (!/^https?:\/\//i.test(target)) return jsonError(400, 'url 必须是 http(s) 地址', 'invalid_request')
-    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
-    if (credential === undefined) return jsonError(503, '没有可用的国际版账号', 'no_available_account')
-    try {
-      const r = await webFetch(
-        { uid: credential.uid, accessToken: credential.credential.accessToken },
-        env,
-        { url: target },
-      )
-      return json(r)
-    } catch (error) {
-      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
+    if (!/^https?:\/\//i.test(target)) return jsonError(400, 'url 必须是 http(s) 绝对地址', 'invalid_request_error')
+
+    const preferredRealm = (await resolveMediaRealm(env, url)) as 'cn' | 'global'
+    const realmCandidates: Array<{ realm: 'cn' | 'global'; providerId: string }> =
+      preferredRealm === 'global'
+        ? [
+            { realm: 'global', providerId: WORKBUDDY_INTL.id },
+            { realm: 'cn', providerId: DEFAULT_PROVIDER },
+          ]
+        : [
+            { realm: 'cn', providerId: DEFAULT_PROVIDER },
+            { realm: 'global', providerId: WORKBUDDY_INTL.id },
+          ]
+
+    let lastError: unknown
+    for (const cand of realmCandidates) {
+      const picked = await pickCredential(env, cand.realm, cand.providerId)
+      if (picked === undefined) continue
+      try {
+        const enterpriseId = picked.credential.extras?.enterpriseId || picked.credential.extras?.enterprise_id
+        const r = await webFetch(
+          {
+            uid: picked.uid,
+            accessToken: picked.credential.accessToken,
+            realm: cand.realm,
+            enterpriseId,
+          },
+          env,
+          { url: target },
+        )
+        return json({ content: r.content })
+      } catch (error) {
+        lastError = error
+        console.warn(`[webfetch] 分片 ${cand.realm} 账号 ${picked.uid} 抓取失败，尝试下一候选：`, error)
+      }
     }
+
+    if (lastError !== undefined) {
+      return jsonError(502, lastError instanceof Error ? lastError.message : String(lastError), 'upstream_error')
+    }
+    return jsonError(503, '没有可用的抓取凭据（请先登录国内或国际版账号）', 'no_available_account')
   }
 
   // ── 视频生成（异步，2026-11-05 实测可用） ──

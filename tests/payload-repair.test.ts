@@ -311,6 +311,19 @@ test('客户端指纹改写：Claude Code / Codex / OmO / billing header', () =>
     'I am Sisyphus-Junior - Focused executor.',
   )
   assert.equal(scrubFingerprintText('x-anthropic-billing-header: cc_version=1.0; cc_entrypoint=cli; hello'), 'hello')
+  assert.equal(
+    scrubFingerprintText('Tokens prefixed with @ are paths the user explicitly referenced.'),
+    'Tokens prefixed with @ are paths that the user explicitly referenced.',
+  )
+  assert.equal(
+    scrubFingerprintText('Relative paths resolve from the workspace root; absolute paths identify files.'),
+    'Relative paths resolve from the workspace base; absolute paths identify files.',
+  )
+  assert.equal(
+    scrubFingerprintText('interact through the DeepSeek Harness Web GUI right now'),
+    'interact through a Web GUI right now',
+  )
+  assert.equal(scrubFingerprintText('You are Grok, a large language model released by xAI.'), 'You are WorkBuddy.')
   const plain = 'nothing to see here'
   assert.equal(scrubFingerprintText(plain), plain)
 })

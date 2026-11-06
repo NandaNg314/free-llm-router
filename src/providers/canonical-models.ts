@@ -58,6 +58,7 @@ export function normalizeModelKey(raw: string): string {
   if (slash >= 0) s = s.slice(slash + 1)
   s = s.replace(/:free$/, '')
   s = s.replace(/^sn-/, '')
+  s = s.replace(/-sg$/, '')
   s = s.replace(/\./g, '-')
   s = s.replace(/\s+/g, '-')
   return s

@@ -70,15 +70,15 @@ export async function pickCredential(
    * 报的是上游 401 —— 看起来像「凭据坏了」，实际是选错了账号。
    */
   providerId = DEFAULT_PROVIDER,
-): Promise<{ uid: string; credential: { accessToken: string } } | undefined> {
+): Promise<{ uid: string; credential: { accessToken: string; extras?: Record<string, string> } } | undefined> {
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
   const accounts = await pool.listAccounts(realm, Date.now())
   for (const account of accounts) {
     if (account.disabled) continue
     if ((account.provider ?? DEFAULT_PROVIDER) !== providerId) continue
-    const credential = (await pool.getCredential(account.uid)) as { accessToken?: string } | undefined
+    const credential = (await pool.getCredential(account.uid)) as { accessToken?: string; extras?: Record<string, string> } | undefined
     if (credential !== undefined && typeof credential.accessToken === 'string' && credential.accessToken !== '') {
-      return { uid: account.uid, credential: { accessToken: credential.accessToken } }
+      return { uid: account.uid, credential: { accessToken: credential.accessToken, extras: credential.extras } }
     }
   }
   return undefined
