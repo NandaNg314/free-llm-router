@@ -575,8 +575,12 @@ export function AccountsTable({
             */}
             <TH>状态</TH>
             <TH className="text-right">积分</TH>
-            {!compact && <TH className="hidden text-right lg:table-cell">成功 / 失败</TH>}
-            <TH className="hidden sm:table-cell">最近成功</TH>
+            {!compact && <TH className="hidden text-right lg:table-cell">成功 / 失败</TH>}            {/*
+              `compact` = 供应商抽屉。抽屉最窄只有半屏（1280px 屏上 640px），
+              「最近成功」是可牺牲的一列 —— 抽屉里用户关心的是「哪些号还能用」，
+              不是「上次什么时候成功」。窄屏下隐藏它，让操作列不用横向滚动。
+            */}
+            <TH className={compact ? 'hidden 2xl:table-cell' : 'hidden sm:table-cell'}>最近成功</TH>
             <TH className="w-10" />
           </tr>
         </THead>
@@ -618,7 +622,9 @@ export function AccountsTable({
                   */}
                   <div className="flex items-center gap-2">
                     <div
-                      className="text-muted-foreground max-w-[150px] truncate font-mono text-[11.5px] sm:max-w-[220px]"
+                      className={`text-muted-foreground truncate font-mono text-[11.5px] ${
+                        compact ? 'max-w-[150px] sm:max-w-[180px]' : 'max-w-[150px] sm:max-w-[220px]'
+                      }`}
                       title={a.uid}
                     >
                       {a.uid}
@@ -744,7 +750,7 @@ export function AccountsTable({
                   现在靠表格外层 `overflow-x-auto` 兜住（见 Table 组件），
                   同时这一列在手机上不参与布局。
                 */}
-                <TD className="text-muted-foreground hidden whitespace-nowrap sm:table-cell">{fmtRelative(a.lastSuccess)}</TD>
+                <TD className={`text-muted-foreground hidden whitespace-nowrap ${compact ? '2xl:table-cell' : 'sm:table-cell'}`}>{fmtRelative(a.lastSuccess)}</TD>
                 <TD>
                   <Menu>
                     <MenuTrigger asChild>
