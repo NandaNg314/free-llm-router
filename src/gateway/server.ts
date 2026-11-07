@@ -700,15 +700,29 @@ async function pickCandidate(
   /** 请求级指定账号（`X-FLR-Account`）。 */
   pinned?: string,
   expiringOnly?: boolean,
+  /** 严格临期模式（`expiringonly/` 前缀）：用完就停，绝不烧永久积分。 */
+  expiringStrict?: boolean,
 ): Promise<Candidate | PinBlocked | undefined> {
   const result = await pool.pick({
     realm, provider, model, exclude, now,
     ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
     ...(pinned !== undefined && pinned !== '' ? { pinned } : {}),
     ...(expiringOnly === true ? { expiringOnly: true } : {}),
+    ...(expiringStrict === true ? { expiringStrict: true } : {}),
   })
   if (result !== undefined && result.pinnedUnavailable === true) {
     return { pinBlocked: true, picked: result }
+  }
+  // ── 严格临期模式：临期额度用完 ⇒ 明确报错，**绝不回落到永久积分** ──
+  //
+  // ⚠️ 这是用户显式选择 `expiringonly/` 前缀的必然结果，必须说清楚原因：
+  // 若静默返回 undefined，上层会报「没有可用账号」，用户会误以为是服务故障或账号掉线。
+  if (result !== undefined && (result as { expiringCreditsExhausted?: true }).expiringCreditsExhausted === true) {
+    const skipped = (result as { lockedSkipped?: number }).lockedSkipped ?? 0
+    throw new Error(
+      `已停止派发：${skipped} 个账号都没有即将过期的积分了（严格临期模式）。`
+        + '永久积分不会被消耗 —— 如需继续请改用 `expiring/` 或普通模型名。',
+    )
   }
   // ── 永久积分锁：把「锁了」翻译成**用户可见的明确错误** ──
   //
@@ -961,9 +975,27 @@ export async function handleChatCompletions(
    * ⇒ 处理顺序必须是：**先剥 `expiring/` → 再判 `aggregate/` → 再 `splitModelName`**。
    * 剥完后 `effectiveModel` 参与后续所有路由判据（别名、供应商、模型名）。
    */
+  /**
+   * ── 两种临期前缀（语义**不同**，见 `PickRequest` 的说明）──
+   *
+   * | 前缀 | 语义 | 临期烧完后 |
+   * |---|---|---|
+   * | `expiring/`      | **优先**烧临期 | 继续烧永久积分（不打断工作） |
+   * | `expiringonly/`  | **只**烧临期   | 报错停止，绝不碰永久积分 |
+   *
+   * ⚠️ `expiringonly/` 必须**先**判：否则 `expiring/` 会把
+   * `expiringonly/xxx` 当成模型名 `only/xxx`（多剥了一个前缀导致路由错乱）。
+   */
+  const EXPIRING_STRICT_PREFIX = 'expiringonly/'
   const EXPIRING_PREFIX = 'expiring/'
-  const isExpiringOnly = rawLower.startsWith(EXPIRING_PREFIX)
-  const effectiveModel = isExpiringOnly ? rawModel.slice(EXPIRING_PREFIX.length).trim() : rawModel
+  const isExpiringStrict = rawLower.startsWith(EXPIRING_STRICT_PREFIX)
+  const isExpiringOnly = !isExpiringStrict && rawLower.startsWith(EXPIRING_PREFIX)
+  const strippedModel = isExpiringStrict
+    ? rawModel.slice(EXPIRING_STRICT_PREFIX.length).trim()
+    : isExpiringOnly
+      ? rawModel.slice(EXPIRING_PREFIX.length).trim()
+      : rawModel
+  const effectiveModel = strippedModel
   const effectiveLower = effectiveModel.toLowerCase()
 
   // 🔴 **裸名别名必须先判**（同步自上游 `598eaa0`）——
@@ -991,6 +1023,7 @@ export async function handleChatCompletions(
       wantsStream: (rawBody as Record<string, unknown>).stream === true,
       rawBody, request, env, realm, ctx, sessionKey,
       expiringOnly: isExpiringOnly,
+      expiringStrict: isExpiringStrict,
     })
   }
 
@@ -1000,6 +1033,7 @@ export async function handleChatCompletions(
       wantsStream: (rawBody as Record<string, unknown>).stream === true,
       rawBody, request, env, realm, ctx, sessionKey,
       expiringOnly: isExpiringOnly,
+      expiringStrict: isExpiringStrict,
     })
   }
 
@@ -1141,7 +1175,7 @@ export async function handleChatCompletions(
   }
 
   if (providerId !== DEFAULT_PROVIDER) {
-    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey, expiringOnly: isExpiringOnly })
+    return await handleProviderChat({ providerId, model, wantsStream, rawBody, request, env, realm, ctx, tried: [], sessionKey, expiringOnly: isExpiringOnly, expiringStrict: isExpiringStrict })
   }
 
   // ⚠️ **必须把请求体里的 model 改写成去前缀的裸名**（实测踩到的真实缺陷，
@@ -1379,6 +1413,7 @@ export async function handleChatCompletions(
       buddyPreferred === undefined ? '' : buddyPreferred,
       pinnedHeader,
       isExpiringOnly,
+      isExpiringStrict,
     )
     // ── 只用指定账号但它不可用：直接报它的原因（不换号、不跨渠道容灾）──
     if (candidate !== undefined && 'pinBlocked' in candidate) {
@@ -2434,7 +2469,8 @@ export async function handleProviderChat(input: {
    */
   failoverDepth?: number
   expiringOnly?: boolean
-}): Promise<GatewayResult> {  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey, expiringOnly } = input
+  expiringStrict?: boolean
+}): Promise<GatewayResult> {  const { providerId, model, wantsStream, rawBody, request, env, realm, ctx, sessionKey, expiringOnly, expiringStrict } = input
   const failoverDepth = input.failoverDepth ?? 0
 
   const provider = findProvider(providerId)
@@ -2631,6 +2667,7 @@ export async function handleProviderChat(input: {
       ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
       ...(pinnedHeader !== '' ? { pinned: pinnedHeader } : {}),
       ...(expiringOnly === true ? { expiringOnly: true } : {}),
+      ...(expiringStrict === true ? { expiringStrict: true } : {}),
     })
     // ── 只用指定账号但它不可用：显式报原因，**不换号、不跨渠道容灾** ──
     if (picked !== undefined && picked.pinnedUnavailable === true) {
@@ -2639,6 +2676,16 @@ export async function handleProviderChat(input: {
         status: lastError?.status ?? 503,
         message: describePinBlocked(picked, pinnedHeader !== '', lastError?.message),
         kind: lastError?.kind ?? 'pinned_account_unavailable',
+      }
+      break
+    }
+    // ── 严格临期模式：临期额度用完 ⇒ 显式报错，绝不回落烧永久 ──
+    if (picked !== undefined && (picked as { expiringCreditsExhausted?: true }).expiringCreditsExhausted === true) {
+      const skipped = (picked as { lockedSkipped?: number }).lockedSkipped ?? 0
+      lastError = {
+        status: 402,
+        message: `已停止派发：${skipped} 个账号都没有即将过期的积分了（严格临期模式）。`
+          + '永久积分不会被消耗 —— 如需继续请改用 `expiring/` 或普通模型名。',
       }
       break
     }
@@ -4073,6 +4120,7 @@ async function handleAggregateChat(input: {
   ctx?: ExecutionContext
   sessionKey: string
   expiringOnly?: boolean
+  expiringStrict?: boolean
 }): Promise<GatewayResult> {
   const { model, rawBody, request, env, realm, ctx, sessionKey, expiringOnly } = input
 
@@ -4216,6 +4264,7 @@ async function handleAggregateChat(input: {
         //（否则单个候选失败会先容灾一轮，与聚合的轮转叠加，白白放大请求）。
         failoverDepth: 1,
         expiringOnly: input.expiringOnly,
+        expiringStrict: input.expiringStrict,
       })
     } catch (error) {
       lastError = {

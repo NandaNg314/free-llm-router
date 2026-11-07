@@ -332,8 +332,33 @@ export interface PickRequest {
    *
    * ⇒ 现在它**只影响选号排序**（临期额度即将到期的账号排前面），
    * 绝不把池子滤空。真正的「不许烧永久积分」由永久积分锁负责。
+   *
+   * ## 想要「严格只用临期」请用 {@link expiringStrict}
    */
   expiringOnly?: boolean
+  /**
+   * **严格只用临期额度**（`expiringonly/` 前缀）——用完就停，绝不烧永久积分。
+   *
+   * ## 与 {@link expiringOnly} 的区别
+   *
+   * | 前缀 | 无临期额度的账号 | 所有临期额度烧完时 |
+   * |---|---|---|
+   * | `expiring/` | **仍然可选**（排后面） | 继续烧永久积分 |
+   * | `expiringonly/` | **直接排除** | **报错停止**，不碰永久积分 |
+   *
+   * ## 为什么这次可以做硬过滤（而 `expiringOnly` 做不到）
+   *
+   * `expiringOnly` 当初炸掉，是因为用户**以为**它只是「优先」，结果被静默拒绝，
+   * 表现为「账号明明有钱却不能用」。语义与用户预期不符才是事故根源。
+   *
+   * 严格模式是**用户显式要求**的语义：「用完就停」。此时「拒绝」是**正确行为**，
+   * 而不是缺陷 —— 只要错误信息说清楚「临期额度已用完」，用户就知道该充钱或换前缀。
+   *
+   * ⚠️ 快照延迟仍是事实（`creditsExpiring` 整点刷新）。故严格模式下的判据
+   * 要求**双重证据**：`creditsExpiring > 0` **且** `creditsEarliestExpiry > now`，
+   * 任一不满足即视为「没有临期额度」。宁可早停，不可误烧永久积分。
+   */
+  expiringStrict?: boolean
 }
 
 /** 选号结果。 */
@@ -351,8 +376,13 @@ export interface PickResult {
   /** 因锁被滤掉的候选数（仅供错误信息展示）。 */
   lockedSkipped?: number
   /**
-   * @deprecated 已废弃：临期专享只做排序偏好，不再产生「额度耗尽」空池。
-   * 保留字段仅为兼容旧调用方的类型检查。
+   * **严格临期模式**（`expiringonly/`）把全部候选滤空时为 `true`。
+   *
+   * ⚠️ 与 `lockedByPermanent` 一样是**用户显式要求**的结果，必须给出可读错误：
+   * 「临期积分已用完，已停止派发以保护永久积分」——
+   * 不能静默回落成「没有可用账号」，那会让用户误以为服务故障。
+   *
+   * ⚠️ 注意：`expiring/`（非严格）**永远不产生**这个值。
    */
   expiringCreditsExhausted?: true
   /** 「只用指定账号」但它不可用（见 {@link PinnedUnavailable}）。 */
@@ -715,6 +745,7 @@ export class AccountPoolDO extends DurableObject<Env> {
     const permLocks = await this.getPermanentLocks()
     let permLockSkipped = 0
     let expiringOnlySkipped = 0
+    let expiringStrictSkipped = 0
     // ⚠️ 在读账号**之前**取（`getSafetyConfig` 有缓存，代价可忽略），
     // 避免循环里每条账号都 await 一次。
     //
@@ -797,6 +828,28 @@ export class AccountPoolDO extends DurableObject<Env> {
         if (!hasExpiring) expiringOnlySkipped += 1
       }
 
+      // ── 严格临期模式：**硬过滤**（`expiringonly/` 前缀）──
+      //
+      // 与上面的「软降级」是**两种不同语义**，由用户选择的**前缀**决定：
+      //   `expiring/`     ⇒ 优先烧临期，烧完继续烧永久（不打断工作）
+      //   `expiringonly/` ⇒ 只烧临期，烧完就停（绝不碰永久积分）
+      //
+      // ⚠️ 这里必须 `continue`（硬过滤），这正是用户显式要求的语义。
+      //    `expiringOnly` 当初硬过滤会炸，是因为用户以为它只是「优先」；
+      //    严格模式不存在这个歧义 —— 名字就叫 only。
+      //
+      // 判据要求**双重证据**（见 `PickRequest.expiringStrict` 的说明）：
+      // 既要 `creditsExpiring > 0`，又要 `creditsEarliestExpiry > now`。
+      // 宁可早停，不可误烧永久积分。
+      if (request.expiringStrict === true) {
+        const hasExpiring = state.creditsExpiring > 0 && state.creditsEarliestExpiry > now
+        if (!hasExpiring) {
+          expiringStrictSkipped += 1
+          if (isPin) pinReason = '该账号已无即将过期的积分（严格临期模式）'
+          continue
+        }
+      }
+
       // ── 永久积分锁过滤 ──
       //
       // 判定「只剩永久额度」用**快照三元组**（AccountState 已有，无需再打上游）：
@@ -839,9 +892,16 @@ export class AccountPoolDO extends DurableObject<Env> {
     }
 
     if (candidates.length === 0) {
-      // ⚠️ `expiringOnly` **不再产生独立的空池分支**：它只影响排序（软降级），
+      // ⚠️ `expiringOnly` **不产生独立的空池分支**：它只影响排序（软降级），
       // 不会把候选滤空 —— 见「临期专享保护」那段的事故说明。
-      // 唯一的「硬拦截」仍然只有永久积分锁（用户显式打开的开关）。
+      //
+      // ⚠️ 但 `expiringStrict`（`expiringonly/` 前缀）**必须**报明确的空池原因：
+      // 用户显式选了「用完就停」，此时静默返回 undefined 会让上层报
+      // 「没有可用账号」，与真实原因（临期额度用完）完全不同。
+      if (request.expiringStrict === true && expiringStrictSkipped > 0) {
+        return { expiringCreditsExhausted: true, lockedSkipped: expiringStrictSkipped } as PickResult
+      }
+      // 唯一的「硬拦截」另一来源是永久积分锁（用户显式打开的开关）。
       if (permLockSkipped > 0) {
         return { lockedByPermanent: true, lockedSkipped: permLockSkipped } as PickResult
       }
@@ -923,7 +983,8 @@ export class AccountPoolDO extends DurableObject<Env> {
       //
       // ⚠️ `expiringOnly`（`expiring/` 前缀）**强制走临期优先排序**（即使全局策略是 roundrobin），
       // 但仍**不排除**无临期额度的账号 —— 见上面「软降级」那段说明。
-      const useExpiryRanking = strategy === 'expiry' || request.expiringOnly === true
+      const useExpiryRanking =
+        strategy === 'expiry' || request.expiringOnly === true || request.expiringStrict === true
       const hasExpiring = (s: AccountState): boolean =>
         s.creditsExpiring > 0 && s.creditsEarliestExpiry > now
       const expiryOf = (s: AccountState): number =>

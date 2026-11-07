@@ -50,6 +50,16 @@
  * `deepseek-v4-flash` 是**两个不同的模型**，合并会让用户选到一个他并不知道的版本。
  * ⚠️ `-official` 同理不剥。
  * ⚠️ 点是**替换**不是删除：`v4.1` → `v4-1`，不能变成 `v41`（那会与 `v41` 撞车）。
+ *
+ * ## 🔴 `-sg` **不能剥**（2026-11-07 用户实测纠正）
+ *
+ * 我曾把 `-sg`（新加坡节点后缀）也剥掉，让 `deepseek-v4.1-flash-sg` 归一到
+ * `deepseek-v4-1-flash`。**这是错的**：
+ * - 国际版真实可用的只有 `deepseek-v4.1-flash-sg`；
+ * - 而 `workbuddy/deepseek-v4.1-flash`（不带 `-sg`）**已被上游关闭**；
+ * - 剥掉后缀后，请求会以不带 `-sg` 的名字发上游 ⇒ 反而打到那个已关闭的模型上。
+ *
+ * ⇒ 二者是两个**不同的上游模型**，必须视为不同键。
  */
 export function normalizeModelKey(raw: string): string {
   if (typeof raw !== 'string') return ''
@@ -58,7 +68,6 @@ export function normalizeModelKey(raw: string): string {
   if (slash >= 0) s = s.slice(slash + 1)
   s = s.replace(/:free$/, '')
   s = s.replace(/^sn-/, '')
-  s = s.replace(/-sg$/, '')
   s = s.replace(/\./g, '-')
   s = s.replace(/\s+/g, '-')
   return s

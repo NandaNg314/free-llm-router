@@ -482,8 +482,8 @@ export function AccountsTable({
           <tr>
             <TH>账号</TH>
             {providerName && <TH className="hidden md:table-cell">供应商</TH>}
-            <TH>状态</TH>
-            <TH className="text-right">积分</TH>
+            <TH className="min-w-[152px]">状态</TH>
+            <TH className="min-w-[112px] text-right">积分</TH>
             {!compact && <TH className="hidden text-right lg:table-cell">成功 / 失败</TH>}
             <TH className="hidden sm:table-cell">最近成功</TH>
             <TH className="w-10" />
@@ -536,28 +536,29 @@ export function AccountsTable({
                     </div>
                   </TD>
                 )}
-                <TD>
+                <TD className="whitespace-nowrap">
                   <Badge tone={meta.tone} dot>
                     {meta.label}
                   </Badge>
                   {/*
-                    模型级冷却明细（2026-11-07 新增）。
+                    模型级冷却明细。
 
-                    ## 为什么必须逐条列出来
-                    面板原来只显示「模型限流，恢复（还剩 1 小时 54 分）」——
-                    而那个倒计时是**所有模型冷却里最远的那个**。用户看到「整个账号被限流 2 小时」，
-                    实际可能只是某个自己根本不用的模型（如 `gpt-6-astra`）挂着冷却，
-                    而正在用的 `kimi-k3.1-pro` 只差 12 分钟。信息合并后完全误导。
+                    ## 排版纪律（2026-11-07 修 UI 挤压）
+                    第一版用了 `flex max-w-52` + `truncate`，在窄屏把
+                    「kimi-k3.1-pro」截成「kimi…」、倒计时被挤到下一行折成
+                    「1 小时 18 / 分」—— 完全看不清。
 
-                    ⇒ 逐模型列出「模型名 + 剩余时间」，用户一眼能看出该等哪个、能换哪个。
-                    ⚠️ 只列**未过期**的条目（过期的剪枝由后端 `pruneExpired` 负责，前端不重复判断）。
+                    ⇒ 改成**单行制表**：模型名给定宽度 `w-[104px]`（足够放下
+                    `kimi-k3.1-pro` 这类最长 id），倒计时用 `w-[58px] right-0`
+                    右对齐、`whitespace-nowrap` 绝不折行。整块 `whitespace-nowrap`
+                    保证父级不会把两段拆开。
                   */}
                   {(() => {
                     const now = Date.now()
                     const active = (a.modelCooldowns ?? []).filter((m) => m.until > now)
                     if (active.length === 0) {
                       return hint ? (
-                        <div className="text-muted-foreground mt-1 max-w-44 truncate text-[11.5px]" title={hint}>
+                        <div className="text-muted-foreground mt-1 max-w-52 whitespace-nowrap text-[11.5px]" title={hint}>
                           {hint}
                         </div>
                       ) : null
@@ -567,16 +568,18 @@ export function AccountsTable({
                         {active.slice(0, 3).map((m) => (
                           <li
                             key={m.model}
-                            className="flex max-w-52 items-center gap-1 text-[11px] leading-tight text-amber-600 dark:text-amber-500"
+                            className="flex items-center gap-2 text-[11px] leading-tight text-amber-600 dark:text-amber-500"
                             title={`${m.model} 冷却至 ${new Date(m.until).toLocaleString()}`}
                           >
-                            <span className="truncate font-mono">{m.model}</span>
-                            <span className="text-muted-foreground shrink-0 tabular">{fmtRemaining(m.until, now)}</span>
+                            <span className="w-[104px] shrink-0 truncate font-mono">{m.model}</span>
+                            <span className="text-muted-foreground w-[62px] shrink-0 whitespace-nowrap text-right tabular">
+                              {fmtRemaining(m.until, now)}
+                            </span>
                           </li>
                         ))}
                         {active.length > 3 && (
                           <li
-                            className="text-muted-foreground text-[11px] leading-tight"
+                            className="text-muted-foreground text-[11px] leading-tight whitespace-nowrap"
                             title={active.slice(3).map((m) => `${m.model}（${fmtRemaining(m.until, now)}）`).join('\n')}
                           >
                             +{active.length - 3} 个模型…
@@ -589,25 +592,27 @@ export function AccountsTable({
                     // ⚠️ 加了「还剩 X」倒计时后这条提示会变长（如「上游封号，11/22 12:30恢复（还剩 7 分钟）」），
                     // 原来的 `max-w-32` 会把倒计时整段截掉 ⇒ 等于没加。故放宽一档并补 `title`，
                     // 极窄屏仍能悬停看到全文。
-                    <div className="text-muted-foreground mt-1 max-w-44 truncate text-[11.5px]" title={hint}>
+                    <div className="text-muted-foreground mt-1 max-w-52 whitespace-nowrap text-[11.5px]" title={hint}>
                       {hint}
                     </div>
                   )}
                 </TD>
-                <TD className="tabular text-right">
-                  <div className="font-medium text-foreground">{fmtInt(a.credits)}</div>
+                <TD className="tabular text-right whitespace-nowrap">
+                  <div className="font-medium text-foreground tabular-nums">{fmtInt(a.credits)}</div>
                   {(a.creditsExpiring ?? 0) > 0 ? (
                     <div
-                      className="mt-0.5 flex items-center justify-end gap-1 text-[11px] font-normal text-amber-500"
+                      className="mt-0.5 flex items-center justify-end gap-1 text-[11px] font-normal whitespace-nowrap text-amber-500"
                       title={a.creditsEarliestExpiry ? `最早到期时刻：${new Date(a.creditsEarliestExpiry).toLocaleString()}` : ''}
                     >
-                      <span>临期 {fmtInt(a.creditsExpiring ?? 0)}</span>
+                      <span className="tabular-nums">临期 {fmtInt(a.creditsExpiring ?? 0)}</span>
                       {a.creditsEarliestExpiry && a.creditsEarliestExpiry > Date.now() && (
-                        <span className="text-[10px] text-muted-foreground">({fmtRelative(a.creditsEarliestExpiry)}到期)</span>
+                        <span className="text-[10px] whitespace-nowrap text-muted-foreground">
+                          · {fmtRelative(a.creditsEarliestExpiry)}到期
+                        </span>
                       )}
                     </div>
                   ) : (
-                    <div className="mt-0.5 text-[10.5px] font-normal text-muted-foreground">纯永久</div>
+                    <div className="mt-0.5 text-[10.5px] font-normal whitespace-nowrap text-muted-foreground">纯永久</div>
                   )}
                 </TD>
                 {!compact && (
