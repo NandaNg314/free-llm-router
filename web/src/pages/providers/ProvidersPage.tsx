@@ -51,7 +51,7 @@ import {
   useSetPin,
   useToggleAccount,
 } from '@/lib/queries'
-import { accountStatus, recoveryText, STATUS_META, type AccountStatus } from '@/lib/status'
+import { accountStatus, fmtRemaining, recoveryText, STATUS_META, type AccountStatus } from '@/lib/status'
 import type { Account, PinMode, Provider, Realm } from '@/lib/types'
 import { cn, fmtInt, fmtRelative } from '@/lib/utils'
 import { AddAccountDialog } from './AddAccountDialog'
@@ -540,7 +540,52 @@ export function AccountsTable({
                   <Badge tone={meta.tone} dot>
                     {meta.label}
                   </Badge>
-                  {hint && (
+                  {/*
+                    模型级冷却明细（2026-11-07 新增）。
+
+                    ## 为什么必须逐条列出来
+                    面板原来只显示「模型限流，恢复（还剩 1 小时 54 分）」——
+                    而那个倒计时是**所有模型冷却里最远的那个**。用户看到「整个账号被限流 2 小时」，
+                    实际可能只是某个自己根本不用的模型（如 `gpt-6-astra`）挂着冷却，
+                    而正在用的 `kimi-k3.1-pro` 只差 12 分钟。信息合并后完全误导。
+
+                    ⇒ 逐模型列出「模型名 + 剩余时间」，用户一眼能看出该等哪个、能换哪个。
+                    ⚠️ 只列**未过期**的条目（过期的剪枝由后端 `pruneExpired` 负责，前端不重复判断）。
+                  */}
+                  {(() => {
+                    const now = Date.now()
+                    const active = (a.modelCooldowns ?? []).filter((m) => m.until > now)
+                    if (active.length === 0) {
+                      return hint ? (
+                        <div className="text-muted-foreground mt-1 max-w-44 truncate text-[11.5px]" title={hint}>
+                          {hint}
+                        </div>
+                      ) : null
+                    }
+                    return (
+                      <ul className="mt-1 space-y-0.5">
+                        {active.slice(0, 3).map((m) => (
+                          <li
+                            key={m.model}
+                            className="flex max-w-52 items-center gap-1 text-[11px] leading-tight text-amber-600 dark:text-amber-500"
+                            title={`${m.model} 冷却至 ${new Date(m.until).toLocaleString()}`}
+                          >
+                            <span className="truncate font-mono">{m.model}</span>
+                            <span className="text-muted-foreground shrink-0 tabular">{fmtRemaining(m.until, now)}</span>
+                          </li>
+                        ))}
+                        {active.length > 3 && (
+                          <li
+                            className="text-muted-foreground text-[11px] leading-tight"
+                            title={active.slice(3).map((m) => `${m.model}（${fmtRemaining(m.until, now)}）`).join('\n')}
+                          >
+                            +{active.length - 3} 个模型…
+                          </li>
+                        )}
+                      </ul>
+                    )
+                  })()}
+                  {hint && (a.modelCooldowns ?? []).filter((m) => m.until > Date.now()).length === 0 && (
                     // ⚠️ 加了「还剩 X」倒计时后这条提示会变长（如「上游封号，11/22 12:30恢复（还剩 7 分钟）」），
                     // 原来的 `max-w-32` 会把倒计时整段截掉 ⇒ 等于没加。故放宽一档并补 `title`，
                     // 极窄屏仍能悬停看到全文。
