@@ -26,7 +26,7 @@
  * 只有需要调试时才允许环境变量覆盖。
  */
 import type { Env } from '../env.js'
-import { callUpstream, classify, UpstreamError } from './client.js'
+import { callUpstream, classify, isChallengePage, UpstreamError } from './client.js'
 import { desktopHeaders } from './headers.js'
 
 /** 国际版 web 域（**固定**，不跟随 `UPSTREAM_WEB_BASE`）。 */
@@ -301,13 +301,122 @@ export const DEFAULT_WEB_FETCH_PROMPT =
   'Extract the main content of this page as clean Markdown. Keep headings, lists, code blocks and key facts. Remove navigation, ads and boilerplate.'
 
 /**
+ * 检索查询的分词与相关性重排（Rerank / 语义去噪）。
+ *
+ * ## 要解决的问题（实测反馈）
+ * 搜 `C2000` 时结果里混进了同名的「德州仪器 TI C2000 芯片」与
+ * 「神州数码鲲鹏服务器」—— 上游全文检索只做字面匹配，**不理解语境**。
+ *
+ * ## 做法（轻量、无模型、可解释）
+ * 1. **token 化**：中英文混排按「英文/数字串」「中文字符 bigram」双路切；
+ * 2. **加权打分**：
+ *    - 标题命中 `+3`、摘要命中 `+1`；
+ *    - 全词组（原始 query）整串命中 `+6`（强信号）；
+ *    - 稀有 token（IDF 高）权重更大 —— 用「该 token 在结果集中出现的次数」近似 IDF；
+ * 3. **去噪**：明显不相关的（得分 <= 0）排到最后；
+ * 4. **稳定**：得分相同保持上游原序（`stableScore` 兜底），避免结果每次抖动。
+ */
+
+/** 中文常见虚词/连接词：不参与打分（否则「的」「了」会稀释所有结果）。 */
+const STOP_CHARS = new Set(['的', '了', '是', '在', '和', '与', '及', '或', '有', '这', '那', '我', '你', '他', '它'])
+
+/** 英文停用词。 */
+const STOP_WORDS = new Set([
+  'the', 'a', 'an', 'of', 'to', 'in', 'on', 'for', 'and', 'or', 'is', 'are', 'be', 'with', 'by', 'at', 'from', 'as',
+])
+
+/** 切词：英文/数字串整段 + 中文连续片段按 bigram 切。 */
+export function tokenize(text: string): string[] {
+  const tokens: string[] = []
+  const lower = text.toLowerCase()
+  // 英文 / 数字 / 型号串（允许连字符、点、下划线，如 c2000 / node-seek / v4.1）
+  for (const m of lower.matchAll(/[a-z0-9][a-z0-9._-]*[a-z0-9]|[a-z0-9]/g)) {
+    const tok = m[0]
+    if (tok.length < 2 || STOP_WORDS.has(tok)) continue
+    tokens.push(tok)
+  }
+  // 中文片段 → bigram（单字不切，避免噪声）
+  for (const m of lower.matchAll(/[\u4e00-\u9fff]+/g)) {
+    const seg = m[0]
+    if (seg.length === 1) {
+      if (!STOP_CHARS.has(seg)) tokens.push(seg)
+      continue
+    }
+    for (let i = 0; i < seg.length - 1; i += 1) {
+      const bigram = seg.slice(i, i + 2)
+      if (STOP_CHARS.has(bigram.charAt(0)) && STOP_CHARS.has(bigram.charAt(1))) continue
+      tokens.push(bigram)
+    }
+  }
+  return tokens
+}
+
+/** 计算一组 token 的「逆文档频率」权重（出现越少越重要）。 */
+function idfWeights(docs: readonly string[]): Map<string, number> {
+  const df = new Map<string, number>()
+  for (const doc of docs) {
+    for (const token of new Set(tokenize(doc))) {
+      df.set(token, (df.get(token) ?? 0) + 1)
+    }
+  }
+  const total = Math.max(docs.length, 1)
+  const weights = new Map<string, number>()
+  for (const [token, count] of df) {
+    // 平滑 IDF：1 + ln(N / df)，出现于全部文档的 token 权重 ≈ 1
+    weights.set(token, 1 + Math.log(total / count))
+  }
+  return weights
+}
+
+/** 相关性重排：高分在前，低分/零分保留（不硬删，只降权）以免误杀。 */
+export function rankByRelevance<T extends { title: string; url: string; snippet: string }>(
+  query: string,
+  results: readonly T[],
+): T[] {
+  if (results.length <= 1) return [...results]
+  const queryTokens = [...new Set(tokenize(query))]
+  if (queryTokens.length === 0) return [...results]
+
+  const docs = results.map((r) => `${r.title} ${r.snippet} ${r.url}`)
+  const weights = idfWeights(docs)
+  const querySet = new Set(queryTokens)
+  const phrase = query.trim().toLowerCase()
+
+  const scored = results.map((result, index) => {
+    const titleTokens = new Set(tokenize(result.title))
+    const bodyTokens = new Set(tokenize(`${result.snippet} ${result.url}`))
+    let score = 0
+    for (const token of querySet) {
+      const weight = weights.get(token) ?? 1
+      if (titleTokens.has(token)) score += 3 * weight
+      else if (bodyTokens.has(token)) score += 1 * weight
+    }
+    // 整串命中是强信号（如型号 "c2000" 原样出现在标题）
+    const haystack = `${result.title} ${result.snippet} ${result.url}`.toLowerCase()
+    if (phrase !== '' && haystack.includes(phrase)) score += 6
+    // 域名/标题里带 URL 主机名匹配也加分
+    try {
+      const host = new URL(result.url).hostname.toLowerCase()
+      for (const token of querySet) if (host.includes(token)) score += 2
+    } catch {
+      /* 非法 URL 忽略 */
+    }
+    return { result, index, score }
+  })
+
+  scored.sort((a, b) => (b.score - a.score) || (a.index - b.index))
+  return scored.map((s) => s.result)
+}
+
+/**
  * 联网检索（`POST /agenttool/v1/search`）。
- * 支持国内版（带 IDE 桌面头）与国际版，结果适配 DSH Search API 形状。
+ * 支持国内版（带 IDE 桌面头）与国际版，结果适配 DSH Search API 形状，
+ * 并做一层**相关性重排**（压制同名不同物的噪声结果）。
  */
 export async function webSearch(
   ctx: { uid: string; accessToken: string; realm?: string; enterpriseId?: string },
   env: Env,
-  input: { query: string; maxResults?: number; count?: number },
+  input: { query: string; maxResults?: number; count?: number; rerank?: boolean },
 ): Promise<SearchResult> {
   const countRaw = input.count ?? input.maxResults
   const maxResults = typeof countRaw === 'number' && countRaw > 0
@@ -341,9 +450,11 @@ export async function webSearch(
       })
     }
   }
+  // 默认开启重排；`rerank: false` 可关掉（调试 / 需要上游原序时）
+  const ranked = input.rerank === false ? results : rankByRelevance(input.query, results)
   return {
     query: typeof data.query === 'string' ? data.query : input.query,
-    results,
+    results: ranked,
     total: typeof data.total_results === 'number' ? data.total_results : undefined,
   }
 }
@@ -357,33 +468,247 @@ export async function webFetch(
   env: Env,
   input: { url: string; prompt?: string },
 ): Promise<FetchResult> {
-  const { data } = await mediaCall<{
-    url?: unknown
-    title?: unknown
-    content?: unknown
-  }>(ctx, env, '/agenttool/v1/webfetch', {
-    url: input.url,
-    format: 'markdown',
-    prompt: input.prompt || DEFAULT_WEB_FETCH_PROMPT,
-    timeout: 30,
-    max_length: 100000,
-  }, 30_000)
+  let rawContent = ''
+  let title = ''
+  let url = input.url
 
-  const content = typeof data.content === 'string' ? data.content : ''
-  if (!content) {
+  try {
+    const { data } = await mediaCall<{
+      url?: unknown
+      title?: unknown
+      content?: unknown
+    }>(ctx, env, '/agenttool/v1/webfetch', {
+      url: input.url,
+      format: 'markdown',
+      prompt: input.prompt || DEFAULT_WEB_FETCH_PROMPT,
+      timeout: 30,
+      max_length: 100000,
+    }, 30_000)
+
+    rawContent = typeof data.content === 'string' ? data.content : ''
+    title = typeof data.title === 'string' ? data.title : ''
+    url = typeof data.url === 'string' ? data.url : input.url
+
+    // 有有效正文且不是盾页：直接返回
+    if (rawContent && !isChallengePage(200, rawContent)) {
+      return { url, title, content: rawContent }
+    }
+    console.warn(`[webfetch] 上游 webfetch 疑似被盾拦截或正文为空（${input.url}），回退直连抓取`)
+  } catch (upstreamError) {
+    /**
+     * 🔴 **上游 webfetch 本身失败也要回退直连**（2026-11-07 实测）。
+     *
+     * 真实故障（AWS Sydney 节点：`3.25.148.48`）：
+     * `edgebrowser: API error: domain rejected by via routing policy`
+     * —— 上游的抓取代理有域名白名单，**不在白名单的站点直接拒绝**，
+     * 连页面都没抓过一次。这不是「盾」，也不是「账号问题」，
+     * 但用户看到的就是「抓取失败」。
+     *
+     * 而这类站点**我们的直连往往能拿到**（服务器出口 IP 干净、UA 正常）。
+     * ⇒ 上游失败一律尝试直连，只有直连也失败才报错。
+     *
+     * ⚠️ 仍然**不伪造内容**：直连失败时抛出直连的真实原因。
+     */
+    console.warn(
+      `[webfetch] 上游 webfetch 调用失败（${input.url}），回退直连抓取：`,
+      upstreamError instanceof Error ? upstreamError.message : String(upstreamError),
+    )
+    try {
+      return await directFetch(input.url)
+    } catch (directError) {
+      const upstreamMsg = upstreamError instanceof Error ? upstreamError.message : String(upstreamError)
+      const directMsg = directError instanceof Error ? directError.message : String(directError)
+      throw new UpstreamError({
+        kind: 'unknown',
+        httpStatus: 502,
+        message: `抓取失败：上游接口与直连抓取均不可用`,
+        detail: `上游：${upstreamMsg.slice(0, 300)}；直连：${directMsg.slice(0, 300)}`,
+      })
+    }
+  }
+
+  // 上游成功但没有正文 / 是盾页：回退直连抓取
+  try {
+    return await directFetch(input.url)
+  } catch (directError) {
+    // 直连也失败：如实报错，附带上游原文片段以便排查
+    if (rawContent) {
+      throw new UpstreamError({
+        kind: 'unknown',
+        httpStatus: 502,
+        message: '目标站点有反爬保护（Cloudflare 盾 / 人机验证），上游与直连抓取均被拦截',
+        detail: `直连错误：${directError instanceof Error ? directError.message : String(directError)}；上游正文：${rawContent.slice(0, 300)}`,
+      })
+    }
+    throw directError
+  }
+}
+
+/**
+ * 将 HTML 转为干净 Markdown（轻量、无依赖）。
+ *
+ * 目标不是完美还原（那需要 DOM 解析器，体积与 CPU 都不适合 Worker），
+ * 而是「抽掉脚本/样式/导航噪声，留下正文条款」—— 对模型足够可读。
+ */
+export function htmlToMarkdown(html: string, baseUrl = ''): { title: string; markdown: string } {
+  // 提取标题
+  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)
+  const title = titleMatch?.[1]?.replace(/\s+/g, ' ').trim() ?? ''
+
+  let body = html
+  // 去掉脚本、样式、内嵌 SVG、注释等噪声块
+  body = body
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<(script|style|noscript|svg|iframe|template|head)\b[^>]*>[\s\S]*?<\/\1>/gi, '')
+    .replace(/<(nav|footer|aside|header)\b[^>]*>[\s\S]*?<\/\1>/gi, '')
+
+  // 把块级标签转换成换行/前缀
+  body = body
+    .replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_m, lvl, text) => `\n\n${'#'.repeat(Number(lvl))} ${text.trim()}\n\n`)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<li[^>]*>/gi, '\n- ')
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<\/t[dh]>/gi, ' | ')
+    .replace(/<\/div>/gi, '\n')
+
+  // 链接：保留文本与绝对地址
+  body = body.replace(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (_m, href, text) => {
+    const label = stripTags(text).trim()
+    if (label === '') return ''
+    try {
+      const abs = baseUrl ? new URL(href, baseUrl).toString() : href
+      return `[${label}](${abs})`
+    } catch {
+      return `[${label}](${href})`
+    }
+  })
+
+  // 处理图片：只保留 alt，避免产生无意义 URL
+  body = body.replace(/<img\b[^>]*alt=["']([^"']*)["'][^>]*>/gi, ' $1 ').replace(/<img\b[^>]*>/gi, '')
+
+  const text = stripTags(body)
+  const markdown = decodeEntities(text)
+    .split('\n')
+    .map((line) => line.replace(/[ \t\u00a0]+/g, ' ').trim())
+    .filter((line, idx, arr) => line !== '' || (arr[idx - 1] ?? '') !== '')
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  return { title, markdown }
+}
+
+/** 去掉所有 HTML 标签（保留文本）。 */
+function stripTags(html: string): string {
+  return html.replace(/<[^>]+>/g, ' ')
+}
+
+/** 解码常见 HTML 实体（够用即可，不做完整实体表）。 */
+function decodeEntities(text: string): string {
+  const named: Record<string, string> = {
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+    ldquo: '“', rdquo: '”', lsquo: '‘', rsquo: '’', hellip: '…', mdash: '—', ndash: '–',
+  }
+  return text.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (whole, ent: string) => {
+    if (ent.startsWith('#x') || ent.startsWith('#X')) {
+      const code = Number.parseInt(ent.slice(2), 16)
+      return Number.isFinite(code) ? String.fromCodePoint(code) : whole
+    }
+    if (ent.startsWith('#')) {
+      const code = Number.parseInt(ent.slice(1), 10)
+      return Number.isFinite(code) ? String.fromCodePoint(code) : whole
+    }
+    return named[ent.toLowerCase()] ?? whole
+  })
+}
+
+/**
+ * 直连抓取 + HTML 转 Markdown（**反爬回退路径**）。
+ *
+ * ## 为什么需要它
+ * 上游 `/agenttool/v1/webfetch` 在目标站点挂有 Cloudflare 5 秒盾 / 人机验证时，
+ * 会拿到一页「Just a moment...」或直接失败（实测 NodeSeek 等站点）。
+ * 此时回退到**我们自己**发一次带完整浏览器 UA 的直连请求：
+ * - 部分站点只校验 UA / Accept 头，直连即可拿到正常 HTML；
+ * - 仍被盾拦截时如实报错（不伪造内容）。
+ *
+ * ⚠️ 刻意**不引入 Headless 浏览器**：Workers/Node 运行时都不支持完整 Chromium，
+ * 强塞只会让镜像膨胀几百 MB 且内存爆掉。这里只做「UA + 头 + HTML 清洗」。
+ */
+export async function directFetch(url: string): Promise<FetchResult> {
+  /**
+   * ⚠️ **请求头必须「像浏览器但不过度伪装」**（2026-11-07 实测踩到）。
+   *
+   * ## 实测故障（AWS Sydney，直连 NodeSeek 返回 403；同机 `curl -A <UA>` 是 200）
+   *
+   * 第一版发了一整套 `Sec-Fetch-*` + `Sec-*` + `Accept-Encoding: br` 的「完整浏览器指纹」，
+   * 结果 **403**。原因是**指纹必须自洽**：
+   * - 声明 `br`（Brotli）却由 Node 的 undici 解码 —— 部分 CF 规则会因此判为非浏览器；
+   * - `Sec-Fetch-Site: none` + 缺 `sec-ch-ua` ⇒ 就是「伪造了一半的 Chrome」，反而更可疑。
+   *
+   * ⇒ 收敛成 **curl / 普通 HTTP 客户端** 的形态：UA + Accept + Accept-Language 三件套。
+   * 实测同机 curl 用这套是 **200**。**少即是多**：宁可不像浏览器，也不要「半像」。
+   */
+  const res = await fetch(url, {
+    method: 'GET',
+    redirect: 'follow',
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        + '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    },
+    signal: AbortSignal.timeout(25_000),
+  })
+
+  const contentType = res.headers.get('content-type') ?? ''
+  // 非 HTML：可能是纯文本 / JSON / markdown，原样返回
+  if (!/text\/html|application\/xhtml/i.test(contentType)) {
+    const text = await res.text()
+    return { url, title: '', content: text.slice(0, 200_000) }
+  }
+
+  const html = (await res.text()).slice(0, 2_000_000)
+  /**
+   * ⚠️ **先判盾、再看状态码**（2026-11-07 实测）。
+   *
+   * Cloudflare 的 JS 挑战页常以 **HTTP 403** 返回，正文是 `Just a moment...`。
+   * 若先按「非 2xx ⇒ 直接 throw 上游错误」处理，用户只会看到
+   * 「目标站点返回 HTTP 403」，**完全看不出是盾**，也就不会知道该换个站点或换网络。
+   * 故这里把盾页单独识别并给出可执行的建议。
+   */
+  if (isChallengePage(res.status, html)) {
     throw new UpstreamError({
       kind: 'unknown',
-      httpStatus: 502,
-      message: '上游未返回可用的页面正文',
-      detail: '上游 webfetch 响应缺少有效 content',
+      httpStatus: res.status,
+      message: '目标站点有 Cloudflare 人机验证（JS 挑战 / 5 秒盾）。'
+        + '这需要真实浏览器执行 JS 才能通过，网关侧的纯 HTTP 抓取无法绕过；'
+        + '请换用该站点的镜像、RSS、API，或直接从浏览器复制正文。',
+      detail: `url=${url} status=${res.status}`,
     })
   }
 
-  return {
-    url: typeof data.url === 'string' ? data.url : input.url,
-    title: typeof data.title === 'string' ? data.title : '',
-    content,
+  if (!res.ok) {
+    throw new UpstreamError({
+      kind: 'unknown',
+      httpStatus: res.status,
+      message: `直连抓取失败：目标站点返回 HTTP ${res.status}`,
+      detail: `url=${url}`,
+    })
   }
+
+  const { title, markdown } = htmlToMarkdown(html, res.url || url)
+  if (markdown === '') {
+    throw new UpstreamError({
+      kind: 'unknown',
+      httpStatus: 502,
+      message: '直连抓取成功，但页面正文为空（可能是纯前端渲染站点）',
+      detail: `url=${url}`,
+    })
+  }
+  return { url: res.url || url, title, content: markdown.slice(0, 200_000) }
 }
 
 // ─────────────────────── 视频（可灵） ───────────────────────

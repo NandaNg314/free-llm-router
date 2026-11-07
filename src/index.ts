@@ -4699,7 +4699,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // ── 联网检索（官方 agenttool 透传，按 DSH 与 OpenAI 兼容格式） ──
   //
   // ⚠️ 适配 DSH Search API 与扩展端点。
-  // 兼容入参：query, count, max_results, need_content, ori_question
+  // 兼容入参：query, count, max_results, need_content, ori_question, rerank
   if (path === '/v1/search' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
     const query = typeof body.query === 'string' ? body.query.trim() : ''
@@ -4707,6 +4707,8 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
     const countRaw = body.count ?? body.max_results
     const maxResults = typeof countRaw === 'number' && countRaw > 0 ? Math.min(countRaw, 20) : 5
+    // 相关性重排：默认开启（压制同名不同物的噪声），`rerank: false` 可关闭
+    const rerank = typeof body.rerank === 'boolean' ? body.rerank : true
 
     const preferredRealm = (await resolveMediaRealm(env, url)) as 'cn' | 'global'
     const realmCandidates: Array<{ realm: 'cn' | 'global'; providerId: string }> =
@@ -4734,7 +4736,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
             enterpriseId,
           },
           env,
-          { query, count: maxResults },
+          { query, count: maxResults, rerank },
         )
         return json({ results: r.results })
       } catch (error) {

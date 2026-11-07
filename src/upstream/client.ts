@@ -389,6 +389,54 @@ export function parseEnvelope(text: string): Envelope | undefined {
 }
 
 /**
+ * 识别「疑似人机验证页 / Cloudflare 盾 / WAF 拦截页」（反爬对抗）。
+ *
+ * 当目标网站挂有 Cloudflare（5 秒盾）、阿里云 WAF、腾讯云 EdgeOne 或
+ * 其他反爬系统时，上游 `/agenttool/v1/webfetch` 可能返回：
+ * - 状态码异常但带一页 HTML；
+ * - 状态码 200 但正文是「Just a moment...」/「Checking your browser」/「cf-browser-verification」；
+ * - 正文是极短的验证提示或空内容。
+ *
+ * 判据刻意「宽进」：只要能判定是盾就不用它（继续回退直连），
+ * 避免把带盾页返回给模型污染上下文。
+ */
+export function isChallengePage(httpStatus: number, bodyText: string): boolean {
+  const lower = bodyText.slice(0, 8000).toLowerCase()
+
+  /**
+   * ## 判据顺序（先强特征、后状态码）
+   *
+   * 1. **强特征优先**：命中 CF 盾/验证页的专有标记 ⇒ 一定是盾（哪怕状态码 200）。
+   * 2. **状态码**：403/429/503 且**没有**业务信封 ⇒ 大概率是盾，但**需要辅证**：
+   *    这些状态码也可能是正常站点的权限错误页。故要求「正文很短」或「是 HTML/纯文本错误页」
+   *    且不含中文业务文字 —— 宁可漏判（走直连回退）也不误杀正常页面。
+   */
+  const strongSignals = [
+    'cf-browser-verification',
+    'just a moment...',
+    'checking your browser',
+    'attention required! | cloudflare',
+    'enable javascript and cookies to continue',
+    '__cf_chl_',
+    '_cf_chl_',
+    'cf_chl_opt',
+    'ddos-guard',
+    'acw_sc__v2',
+    '正在检查您的浏览器',
+    '请稍候，正在检查',
+  ]
+  if (strongSignals.some((s) => lower.includes(s))) return true
+
+  if (httpStatus === 403 || httpStatus === 429 || httpStatus === 503) {
+    if (parseEnvelope(bodyText) !== undefined) return false
+    // 含中日韩字符的文本更可能是我们自己的业务文案 / 正常页面，不当盾处理
+    if (/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(bodyText)) return false
+    return bodyText.trim().length < 4000
+  }
+  return false
+}
+
+/**
  * WAF 判据：**HTTP 403 且响应体无业务信封**。
  *
  * ⚠️ 逐字照抄 Go 的 `IsWafBlocked`（`client.go:337-340`）。

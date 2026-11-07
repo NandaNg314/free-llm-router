@@ -623,13 +623,32 @@ test('🔴 两条 chat 路径都必须有延迟记账（本项目「只修一半
   // ⇒ 改为**结构断言**：每一处 `noteSuccess`（= 一次成功）之后都必须紧跟
   //   一次 `settleBlame`。这样「新增一条成功路径但忘了结算」会立刻被抓到，
   //   而不是被别处的调用凑够数量掩盖。
+  //
+  // ⚠️ 2026-11-07 补：`noteSuccess` 现在有两个职责 ——
+  //   1. 清熔断/降权（必须配 `settleBlame`）；
+  //   2. **扣减本地额度快照**（`credit` 参数，纯记账，与 blame 无关）。
+  // 第二职责在 `onFinish` 里也会调用一次（那时流已结束，blame 早就在 `onFirstChunk` 结算过），
+  // 这类调用**不需要**再配 `settleBlame`。故只对 `onFirstChunk` 上下文里的
+  // `noteSuccess` 做结构断言，避免把「额度扣减」误判成「忘记结算」。
+  //
+  // 判据：`noteSuccess` 之前最近的 `onFirstChunk:` / `onFinish:` 决定它属于哪一类。
+  const firstChunkIdx = [...src.matchAll(/onFirstChunk:/g)].map((m) => m.index ?? -1)
+  const finishIdx = [...src.matchAll(/onFinish:/g)].map((m) => m.index ?? -1)
+  /** 判断某个偏移是否位于 `onFirstChunk` 回调体内（取最近的那个标记名称）。 */
+  const inFirstChunk = (i: number): boolean => {
+    const lastFirst = Math.max(-1, ...firstChunkIdx.filter((j) => j < i))
+    const lastFinish = Math.max(-1, ...finishIdx.filter((j) => j < i))
+    return lastFirst > lastFinish
+  }
   const noteIdx = [...src.matchAll(/noteSuccess\(/g)].map((m) => m.index ?? -1)
   const settleIdx = [...src.matchAll(/settleBlame\(pool, blame, Date\.now\(\)\)/g)].map((m) => m.index ?? -1)
   // ⚠️ 窗口取 1200 字符（不是 400）：本仓库习惯在 `noteSuccess` 与 `settleBlame`
   // 之间写大段说明注释，实测最长间距 754 字符。窗口太小会**误报**成缺失。
   // 窗口的意义只是「同一处成功回调内」，不需要精确到字节。
   const SETTLE_WINDOW = 1200
-  const orphans = noteIdx.filter((i) => !settleIdx.some((j) => j > i && j - i < SETTLE_WINDOW))
+  const orphans = noteIdx.filter(
+    (i) => inFirstChunk(i) && !settleIdx.some((j) => j > i && j - i < SETTLE_WINDOW),
+  )
   assert.equal(
     orphans.length,
     0,
@@ -646,7 +665,9 @@ test('🔴 两条 chat 路径都必须有延迟记账（本项目「只修一半
   // 与 ③ 同一类断言（结构而非计数）：新增一条成功路径却忘了绑定会被立刻抓到。
   // ⚠️ 必须用 `pool\.bindSession`，否则会把 `unbindSession` 也算进来（假通过）。
   const bindIdx = [...src.matchAll(/pool\.bindSession\(sessionKey/g)].map((m) => m.index ?? -1)
-  const bindOrphans = noteIdx.filter((i) => !bindIdx.some((j) => j > i && j - i < 1500))
+  const bindOrphans = noteIdx.filter(
+    (i) => inFirstChunk(i) && !bindIdx.some((j) => j > i && j - i < 1500),
+  )
   assert.equal(
     bindOrphans.length,
     0,

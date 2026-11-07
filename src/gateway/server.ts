@@ -710,9 +710,6 @@ async function pickCandidate(
   if (result !== undefined && result.pinnedUnavailable === true) {
     return { pinBlocked: true, picked: result }
   }
-  if (result !== undefined && (result as { expiringCreditsExhausted?: true }).expiringCreditsExhausted === true) {
-    throw new Error('当前所有可用账号的快过期积分均已耗尽。已自动停止派发以保护您的永久积分。')
-  }
   // ── 永久积分锁：把「锁了」翻译成**用户可见的明确错误** ──
   //
   // ⚠️ 这条分支是 §7.2「失败必须显式」的落地：若静默返回 undefined，
@@ -945,7 +942,29 @@ export async function handleChatCompletions(
   // 前缀大小写不敏感（与 `splitModelName` 一致）：`Aggregate/auto` 若漏到默认供应商，
   // 小写化后会以 `aggregate/auto` 打上游 ⇒ 11102 ⇒ 被记成模型冷却。
   const rawLower = rawModel.toLowerCase()
-  const isExpiringOnly = rawLower.startsWith('expiring/')
+
+  /**
+   * 🔴 **`expiring/` 前缀必须在路由之前剥掉**（2026-11-07 实测缺陷）。
+   *
+   * ## 真实故障（线上 traceId=246c9152）
+   * 客户端写 `expiring/kimi-k3.1-pro`，日志里是：
+   * ```
+   * [punish] kind=model model=expiring/kimi-k3.1-pro
+   *          reason=model_unavailable: model [expiring/kimi-k3.1-pro] service info not found
+   * ```
+   * ⇒ `splitModelName` 把 `expiring` 当成**未知供应商前缀**，回落到默认供应商，
+   * 并把**整串**当模型名发给上游 ⇒ 11102 ⇒ 被记成 **6 小时模型级冷却**。
+   *
+   * 这与 `aggregate/` 当初踩的坑**完全同型**：一个我方前缀写错，
+   * 把整个模型拉黑 6 小时，之后所有请求都选不到号。
+   *
+   * ⇒ 处理顺序必须是：**先剥 `expiring/` → 再判 `aggregate/` → 再 `splitModelName`**。
+   * 剥完后 `effectiveModel` 参与后续所有路由判据（别名、供应商、模型名）。
+   */
+  const EXPIRING_PREFIX = 'expiring/'
+  const isExpiringOnly = rawLower.startsWith(EXPIRING_PREFIX)
+  const effectiveModel = isExpiringOnly ? rawModel.slice(EXPIRING_PREFIX.length).trim() : rawModel
+  const effectiveLower = effectiveModel.toLowerCase()
 
   // 🔴 **裸名别名必须先判**（同步自上游 `598eaa0`）——
   // 顺序不可改：命中后 `providerId` 会被设成 `aggregate`，而它**不在注册表里**
@@ -960,17 +979,18 @@ export async function handleChatCompletions(
   // ⚠️ 只在**裸名**（不含 `/`）时生效：显式写 `buddy/xxx` 的用户意图明确，不该被改写。
   // ⚠️ 查不到别名就保持原行为（回落默认供应商并如实报错），
   //   不让「随便写写也能通」成为预期。
-  const bareAlias = rawModel.includes('/') ? undefined : aggregateAliasForBareModel(rawModel)
+  const bareAlias = effectiveModel.includes('/') ? undefined : aggregateAliasForBareModel(effectiveModel)
 
-  if (rawLower === AGGREGATE_PROVIDER_ID || rawLower.startsWith(AGG_PREFIX)) {
+  if (effectiveLower === AGGREGATE_PROVIDER_ID || effectiveLower.startsWith(AGG_PREFIX)) {
     return await handleAggregateChat({
-      model: rawModel.slice(AGG_PREFIX.length),
+      model: effectiveModel.slice(AGG_PREFIX.length),
       // ⚠️ 就地算 `wantsStream`（不用外层那个 `const`）——
       // 本分支在它**之前**执行（必须早于 `splitModelName`），
       // 引用未初始化的 `const` 会抛 TDZ 错误。判据与外层**逐字一致**：
       // OpenAI 规范里 `stream` 缺省是 `false`（非流式）。
       wantsStream: (rawBody as Record<string, unknown>).stream === true,
       rawBody, request, env, realm, ctx, sessionKey,
+      expiringOnly: isExpiringOnly,
     })
   }
 
@@ -979,12 +999,14 @@ export async function handleChatCompletions(
       model: bareAlias,
       wantsStream: (rawBody as Record<string, unknown>).stream === true,
       rawBody, request, env, realm, ctx, sessionKey,
+      expiringOnly: isExpiringOnly,
     })
   }
 
   // ⚠️ 多供应商路由：`provider/model` 前缀决定去哪家。
   // 无前缀时回落到默认供应商（保持既有用户兼容 —— 他们已经在用裸模型名）。
-  const routed = splitModelName(rawModel, providerIds(), DEFAULT_PROVIDER)
+  // ⚠️ 传 `effectiveModel`（已剥 `expiring/`），否则 `expiring` 会被当成未知供应商。
+  const routed = splitModelName(effectiveModel, providerIds(), DEFAULT_PROVIDER)
 
   const providerId = routed.provider
   /**
@@ -1134,6 +1156,11 @@ export async function handleChatCompletions(
   // 冷却而选不到号，对外表现为「没有可用账号」，与真实原因毫无关系。
   //
   // 故这是「一个前缀写错 → 整个模型被拉黑 6 小时」的放大器，必须在这里切断。
+  //
+  // ⚠️ 判据必须是 **`model !== rawModel`**（而不是 `providerId !== DEFAULT_PROVIDER`）：
+  // `expiring/` 前缀剥掉后 provider 仍是默认供应商，但 `model` 已经从
+  // `expiring/kimi-k3.1-pro` 变成 `kimi-k3.1-pro` —— 那时**必须**改写请求体，
+  // 否则上游照样收到带 `expiring/` 的模型名（2026-11-07 线上事故：traceId=246c9152）。
   const upstreamBody =
     model !== rawModel && rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)
       ? { ...(rawBody as Record<string, unknown>), model }
@@ -1866,12 +1893,21 @@ export async function handleChatCompletions(
             ctx.waitUntil(pool.bindSession(sessionKey, candidate.uid, Date.now()).catch(logPoolError('bindSession')))
           }
         },
-        onFinish: (usage) => {
+        onFinish: (usage, credit) => {
           // 记账用量（面板的「用量」视图靠它）
           //
           // ⚠️ 这里**不能**静默吞错误：第一版写成 `.catch(logPoolError('noteSuccess'))`，
           // 结果线上「对话成功但用量恒为 0」，且没有任何日志可查
           // （正是本项目一直在警告的「静默失败」形态）。
+          //
+          // ⚠️ `credit` 必须一并交给 `noteSuccess`（2026-11-07 补）：
+          // 它会**就地扣减** `credits` / `creditsExpiring`，让面板的临期额度不必等
+          // 整点 cron 才刷新 —— 否则「临期额度已烧完但仍显示有额度」会误导排序。
+          const t = pool
+            .noteSuccess(candidate.uid, Date.now(), usage, model, credit)
+            .catch(logPoolError('noteSuccess'))
+          if (ctx !== undefined) ctx.waitUntil(t)
+          else void t
           const record = {
             at: Date.now(),
             uid: candidate.uid,
@@ -1979,8 +2015,8 @@ function streamResponse(
   hooks: {
     onFirstChunk: () => void
     onError: (message: string) => void
-    /** 流结束时回调，带上从流里解析到的 usage（用于面板用量统计）。 */
-    onFinish?: (usage: { input: number; output: number } | undefined) => void
+    /** 流结束时回调，带上从流里解析到的 usage（用于面板用量统计与积分扣减）。 */
+    onFinish?: (usage: { input: number; output: number } | undefined, credit?: number) => void
     /**
      * ⚠️ **诊断用**：客户端是否已断开（`request.signal.aborted`）。
      *
@@ -2028,6 +2064,8 @@ function streamResponse(
       const streamStartedAt = Date.now()
       // 从流里抓 usage（末帧带 include_usage=true 时会有）
       let usage: { input: number; output: number } | undefined
+      /** 本次消耗的积分（上游 `usage.credit`；未知时 `undefined`，**不得当成 0**）。 */
+      let usageCredit: number | undefined
 
       try {
         for (;;) {
@@ -2070,10 +2108,26 @@ function streamResponse(
               // 只在字面量含 usage 时才解析（省 CPU）
               if (mayHaveUsage(frame.data)) {
                 try {
-                  const parsed = JSON.parse(frame.data) as { usage?: { prompt_tokens?: number; completion_tokens?: number } }
+                  const parsed = JSON.parse(frame.data) as {
+                    usage?: { prompt_tokens?: number; completion_tokens?: number; credit?: number }
+                  }
                   const u = parsed.usage
                   if (u !== undefined && typeof u.prompt_tokens === 'number') {
                     usage = { input: u.prompt_tokens, output: u.completion_tokens ?? 0 }
+                    /**
+                     * ⚠️ **`usage.credit` 必须一并带出**（2026-11-07 补）。
+                     *
+                     * 之前只取 token，`credit` 被丢掉 ⇒ `noteSuccess` 的
+                     * `costCredits` 永远是 `undefined` ⇒ **本地积分快照永不扣减**，
+                     * 只能等整点 cron 刷新。后果是「临期额度明明烧完了，
+                     * 面板还显示有 2000+」，进而影响临期优先的排序判断。
+                     *
+                     * 上游在流末尾的 usage 帧里带 `credit`（实测 `0.11` 这类小数）。
+                     * 无该字段就保持 `undefined`（**不编造 0** —— 0 表示免费，语义不同）。
+                     */
+                    if (typeof u.credit === 'number' && Number.isFinite(u.credit)) {
+                      usageCredit = u.credit
+                    }
                   }
                 } catch {
                   // usage 解析失败不影响转发
@@ -2115,7 +2169,7 @@ function streamResponse(
           `[stream] end reason=${sawDone ? 'done' : 'upstream-eof'} frames=${frameSeq}` +
             ` bytes=${sawChunk ? 'has-content' : 'empty'} ms=${Date.now() - streamStartedAt}`,
         )
-        hooks.onFinish?.(usage)
+        hooks.onFinish?.(usage, usageCredit)
       } catch (error) {
         const msg = `流传输中断：${error instanceof Error ? error.message : String(error)}`
         // ⚠️ 关键诊断：**这里是「客户端断开」与「上游中断」的分界**。
@@ -2588,13 +2642,6 @@ export async function handleProviderChat(input: {
       }
       break
     }
-    if (picked !== undefined && (picked as { expiringCreditsExhausted?: true }).expiringCreditsExhausted === true) {
-      lastError = {
-        status: 402,
-        message: '当前所有可用账号的快过期积分均已耗尽。已自动停止派发以保护您的永久积分。',
-      }
-      break
-    }
     // ── 永久积分锁：同第一消费点，锁定必须显式报错（不许静默 break）──
     if (picked !== undefined && (picked as { lockedByPermanent?: true }).lockedByPermanent === true) {
       const skipped = (picked as { lockedSkipped?: number }).lockedSkipped ?? 0
@@ -2755,9 +2802,15 @@ export async function handleProviderChat(input: {
                     ctx,
                   )
                 },
-                onFinish: (usage) => {
+                onFinish: (usage, credit) => {
                   // 🔴 子密钥 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
                   settleSubkeyUsage(ctx, env, usage?.input ?? 0, usage?.output ?? 0, `${providerId}/${model}`)
+                  // ⚠️ `credit` 一并扣减本地额度快照（见 buddy 路径的说明）。
+                  const settled = pool
+                    .noteSuccess(picked.uid, Date.now(), usage, model, credit)
+                    .catch(logPoolError('noteSuccess'))
+                  if (ctx !== undefined) ctx.waitUntil(settled)
+                  else void settled
                   const t = pool
                     .recordUsage({
                       at: Date.now(), uid: picked.uid, model: `${providerId}/${model}`,
@@ -3069,9 +3122,15 @@ export async function handleProviderChat(input: {
                     ctx,
                   )
                 },
-                onFinish: (usage) => {
+                onFinish: (usage, credit) => {
                   // 🔴 子密钥 token 配额（2026-10-21 审查补）：主密钥路径无条目、零开销
                   settleSubkeyUsage(ctx, env, usage?.input ?? 0, usage?.output ?? 0, `${providerId}/${model}`)
+                  // ⚠️ `credit` 一并扣减本地额度快照（见 buddy 路径的说明）。
+                  const settled = pool
+                    .noteSuccess(picked.uid, Date.now(), usage, model, credit)
+                    .catch(logPoolError('noteSuccess'))
+                  if (ctx !== undefined) ctx.waitUntil(settled)
+                  else void settled
                   const t = pool
                     .recordUsage({
                       at: Date.now(), uid: picked.uid, model: `${providerId}/${model}`,
@@ -3441,7 +3500,13 @@ export async function handleProviderChat(input: {
             ctx,
           )
         },
-        onFinish: (usage) => {
+        onFinish: (usage, credit) => {
+          // ⚠️ `credit` 一并扣减本地额度快照（见 buddy 路径的说明）。
+          const settled = pool
+            .noteSuccess(picked.uid, Date.now(), usage, model, credit)
+            .catch(logPoolError('noteSuccess'))
+          if (ctx !== undefined) ctx.waitUntil(settled)
+          else void settled
           const record = {
             at: Date.now(),
             uid: picked.uid,

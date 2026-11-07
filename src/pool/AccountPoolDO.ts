@@ -322,8 +322,16 @@ export interface PickRequest {
   exclude: string[]
   now: number
   /**
-   * 是否仅限消耗快过期积分（专属安全保护模式）。
-   * 为 true 时，没有即将过期积分的账号将被直接过滤排除；全池耗尽时返回 expiringCreditsExhausted。
+   * 是否「临期优先」（`expiring/` 前缀）。
+   *
+   * ## ⚠️ 语义是**排序偏好**，不是硬性过滤（2026-11-07 修正）
+   *
+   * 第一版把它实现成「没有快过期积分的账号直接排除」，线上立刻炸：
+   * 账号池里明明有临期额度，却报「快过期积分均已耗尽」。
+   * 根因是 `creditsExpiring` 是**整点刷新的快照**，与实际消耗之间有窗口期。
+   *
+   * ⇒ 现在它**只影响选号排序**（临期额度即将到期的账号排前面），
+   * 绝不把池子滤空。真正的「不许烧永久积分」由永久积分锁负责。
    */
   expiringOnly?: boolean
 }
@@ -342,7 +350,10 @@ export interface PickResult {
   lockedByPermanent?: true
   /** 因锁被滤掉的候选数（仅供错误信息展示）。 */
   lockedSkipped?: number
-  /** 是否因仅消耗临期积分模式把全部候选滤空（保护永久积分）。 */
+  /**
+   * @deprecated 已废弃：临期专享只做排序偏好，不再产生「额度耗尽」空池。
+   * 保留字段仅为兼容旧调用方的类型检查。
+   */
   expiringCreditsExhausted?: true
   /** 「只用指定账号」但它不可用（见 {@link PinnedUnavailable}）。 */
   pinnedUnavailable?: true
@@ -760,14 +771,30 @@ export class AccountPoolDO extends DurableObject<Env> {
         continue
       }
 
-      // ── 临期专享保护过滤 ──
+      // ── 临期专享保护：**只影响排序，不做硬性过滤** ──
+      //
+      // ## 🔴 为什么原来是硬过滤、后来必须改成软降级（2026-11-07 线上事故）
+      //
+      // 第一版把「没有临期额度的账号」**直接 continue 掉**。上线后表现为：
+      // ```
+      // Error: 当前所有可用账号的快过期积分均已耗尽。已自动停止派发以保护您的永久积分。
+      // ```
+      // 而账号池里明明还挂着 2109 / 2613 / 1446 的 `creditsExpiring`。
+      //
+      // 根因是**两个快照语义叠加**：
+      // 1. `creditsExpiring` 是**上次刷新余额时的快照**（整点 cron 才更新）；
+      // 2. 临期额度可能**已经烧光但快照还没回写** ⇒ 硬过滤把整池判成「无临期额度」。
+      //
+      // ⇒ 硬过滤的正确性依赖「快照永远新鲜」，而那个前提在本项目**不成立**。
+      // ⇒ 改成**软降级**：临期账号在排序里优先（`expiry` 策略已实现），
+      //   但**绝不因为这一条把池子清空** —— 宁可少省一点，也不能整条链路不可用。
+      //
+      // ⚠️ 真正「不许烧永久积分」的诉求由**永久积分锁**（下面那段）负责，
+      // 那是用户显式打开的开关，语义明确、判据稳定。
+      // 本处只记录「有多少账号没有临期额度」，供日志/诊断使用。
       if (request.expiringOnly === true) {
         const hasExpiring = state.creditsExpiring > 0 && state.creditsEarliestExpiry > now
-        if (!hasExpiring) {
-          expiringOnlySkipped += 1
-          if (isPin) pinReason = '该账号已无即将过期的积分（临期保护模式生效）'
-          continue
-        }
+        if (!hasExpiring) expiringOnlySkipped += 1
       }
 
       // ── 永久积分锁过滤 ──
@@ -812,9 +839,9 @@ export class AccountPoolDO extends DurableObject<Env> {
     }
 
     if (candidates.length === 0) {
-      if (request.expiringOnly === true && expiringOnlySkipped > 0) {
-        return { expiringCreditsExhausted: true, lockedSkipped: expiringOnlySkipped } as PickResult
-      }
+      // ⚠️ `expiringOnly` **不再产生独立的空池分支**：它只影响排序（软降级），
+      // 不会把候选滤空 —— 见「临期专享保护」那段的事故说明。
+      // 唯一的「硬拦截」仍然只有永久积分锁（用户显式打开的开关）。
       if (permLockSkipped > 0) {
         return { lockedByPermanent: true, lockedSkipped: permLockSkipped } as PickResult
       }
@@ -893,10 +920,14 @@ export class AccountPoolDO extends DurableObject<Env> {
       // 一个账号的临期额度消耗完（creditsExpiring <= 0），自动掉入第二梯队，让位给其他有临期额度的号；
       // 没有快过期积分的账号视为最晚（Number.POSITIVE_INFINITY），彼此之间按最久未用轮换。
       // `roundrobin`：只按最久未用轮换。
+      //
+      // ⚠️ `expiringOnly`（`expiring/` 前缀）**强制走临期优先排序**（即使全局策略是 roundrobin），
+      // 但仍**不排除**无临期额度的账号 —— 见上面「软降级」那段说明。
+      const useExpiryRanking = strategy === 'expiry' || request.expiringOnly === true
       const hasExpiring = (s: AccountState): boolean =>
         s.creditsExpiring > 0 && s.creditsEarliestExpiry > now
       const expiryOf = (s: AccountState): number =>
-        strategy === 'expiry' && hasExpiring(s) ? s.creditsEarliestExpiry : Number.POSITIVE_INFINITY
+        useExpiryRanking && hasExpiring(s) ? s.creditsEarliestExpiry : Number.POSITIVE_INFINITY
       const sorted = [...pool].sort((a, b) => {
         const ea = expiryOf(a)
         const eb = expiryOf(b)

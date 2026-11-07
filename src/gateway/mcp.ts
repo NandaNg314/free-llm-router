@@ -85,6 +85,10 @@ const TOOLS = [
           minimum: 1,
           maximum: 20,
         },
+        rerank: {
+          type: 'boolean',
+          description: '是否按相关性重排（默认 true）。搜型号/专有名词时可压制同名不同物的噪声结果。',
+        },
       },
       required: ['query'],
     },
@@ -165,9 +169,10 @@ async function callTool(name: string, args: Record<string, unknown>, env: Env): 
     const c = await credentials(env)
     if (!c.ok) return text(c.reason, true)
     try {
-      const r = await webSearch({ uid: c.uid, accessToken: c.token }, env, {
+      const r = await webSearch({ uid: c.uid, accessToken: c.token, realm: 'global' }, env, {
         query,
         ...(typeof args.max_results === 'number' ? { maxResults: args.max_results } : {}),
+        ...(typeof args.rerank === 'boolean' ? { rerank: args.rerank } : {}),
       })
       if (r.results.length === 0) return text(`没有找到「${query}」的结果。`)
       const body = r.results
@@ -185,7 +190,7 @@ async function callTool(name: string, args: Record<string, unknown>, env: Env): 
     const c = await credentials(env)
     if (!c.ok) return text(c.reason, true)
     try {
-      const r = await webFetch({ uid: c.uid, accessToken: c.token }, env, { url })
+      const r = await webFetch({ uid: c.uid, accessToken: c.token, realm: 'global' }, env, { url })
       const head = r.title === '' ? `# ${r.url}` : `# ${r.title}\n\n来源：${r.url}`
       return text(`${head}\n\n${r.content}`)
     } catch (error) {

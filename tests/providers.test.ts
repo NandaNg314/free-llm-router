@@ -2504,15 +2504,18 @@ test('🔴 DeepSeek Flash 变体必须归并（raccoon 版本号 / qoder 代号�
 test('🔴 裸名别名必须在 splitModelName 之前判定（否则报「未知供应商 aggregate」）', () => {
   // 同步自上游 `598eaa0`。客户端写官方拼写 `DeepSeek-V4.1-Flash`（大写 + 点）时，
   // 裸名被原样送给 buddy ⇒ 上游 11102 ⇒ 被记成 6 小时模型级冷却。
+  //
+  // ⚠️ 2026-11-07 起别名判据改用 `effectiveModel`（先剥 `expiring/`）——
+  // 语义不变，只是「裸名」的判定对象从原始串换成了剥过前缀的串。
   const server = readFileSync('src/gateway/server.ts', 'utf8')
-  const alias = server.indexOf('aggregateAliasForBareModel(rawModel)')
-  const split = server.indexOf('const routed = splitModelName(rawModel')
+  const alias = server.indexOf('aggregateAliasForBareModel(effectiveModel)')
+  const split = server.indexOf('const routed = splitModelName(effectiveModel')
   assert.ok(alias > 0, '⚠️ 裸名别名必须真的接线（本地曾定义了却零调用者）')
   assert.ok(split > 0, '应仍走 splitModelName')
   assert.ok(alias < split,
     '⚠️ 别名必须先于 splitModelName（aggregate 不在注册表里，晚判会报「未知供应商」）')
   // ⚠️ 只在裸名时生效：显式前缀是用户的明确意图
-  assert.ok(/rawModel\.includes\('\/'\) \? undefined : aggregateAliasForBareModel/.test(server),
+  assert.ok(/effectiveModel\.includes\('\/'\) \? undefined : aggregateAliasForBareModel/.test(server),
     '⚠️ 显式写 provider/xxx 时不得被改写成聚合')
 })
 
