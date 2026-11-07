@@ -33,13 +33,21 @@ export function ConfigPage() {
   return (
     <>
       <PageHeader title="配置" description="客户端接入方式、路由策略与运行状态。" />
+      {/*
+        `min-w-0` 的两个 Grid 子项不可省（2026-11-07 手机端修横向溢出）。
+
+        390px 视口下这一页 `scrollWidth` 曾达 **610px**，整页可横向拖动。
+        根因与「供应商与账号」页完全相同：Grid 子项默认 `min-width:auto`，
+        即最小宽度 = 内部最宽内容（表格 / 长代码块），拒绝收缩到视口宽度。
+        ⇒ 加 `min-w-0` 让它们允许收缩，内部自己的 `overflow-x-auto` 才能接管。
+      */}
       <div className="grid gap-4 xl:grid-cols-5">
-        <div className="space-y-4 xl:col-span-3">
+        <div className="min-w-0 space-y-4 xl:col-span-3">
           <ConnectCard />
           <RoutingCard />
           <SafetyCard />
         </div>
-        <div className="space-y-4 xl:col-span-2">
+        <div className="min-w-0 space-y-4 xl:col-span-2">
           <StatusCard />
           <LocksCard />
         </div>
@@ -58,7 +66,14 @@ function Head({ icon, title, desc, action }: { icon: ReactNode; title: string; d
       <SectionIcon>{icon}</SectionIcon>
       <div className="min-w-0 flex-1">
         <CardTitle>{title}</CardTitle>
-        {desc && <CardDescription className="mt-0.5">{desc}</CardDescription>}
+        {/*
+          `break-words` 不可省（2026-11-07 手机端修横向溢出）。
+
+          描述里含 `/v1/chat/completions` 这类长英文路径，浏览器默认**只按空格折行**，
+          于是整段被当成一个不可断词把卡片撑到 422px（视口 390px）⇒ 整页能横向拖。
+          `break-words`（`overflow-wrap: break-word`）允许在任意位置断行。
+        */}
+        {desc && <CardDescription className="mt-0.5 break-words">{desc}</CardDescription>}
       </div>
       {action}
     </CardHeader>

@@ -34,6 +34,13 @@ import {
   travelClaim,
   travelDepart,
   travelStatus,
+  buddyOpen,
+  buddyQuota,
+  energyBalance,
+  fetchHeatmap,
+  makeupCandidates,
+  readStreakLaunchDate,
+  useMakeupCard,
 } from '../upstream/travel.js'
 import { reportCli, reportDesktop, reportWeb, sanitizeEvents, withFingerprint } from '../upstream/report.js'
 import {
@@ -878,6 +885,81 @@ const ACTIONS: Record<string, ActionHandler> = {
       return { ok: true, detail: one.drawn ? `已抽奖（${one.detail}）` : `无可抽次数（${one.detail}）` }
     } catch (error) {
       return { ok: false, detail: describeError(error, '抽奖') }
+    }
+  },
+
+  /**
+   * `makeup`：**断签补登**（2026-11-07 新增，移植自 88lin/workbuddy-auto-signin）。
+   *
+   * ## 为什么必须有它
+   *
+   * 连登奖励按「当月断签即清零」计算。此前本项目完全没有补登能力 ——
+   * 一旦因为账号冷却 / 容器重启 / 网络抖动漏签一天，连签天数直接归零，
+   * 档位奖励全部作废，**而且没有任何补救手段**。
+   *
+   * ## 判据全靠服务端数据，不靠本地猜测
+   *
+   * - 「哪天断了」只从 `heatmap`（活跃日历）里 `score === 0` 的日期判断；
+   * - `makeup_dates` 是**已补过**的历史，不能当待办清单用（照抄参考实现踩过的坑）；
+   * - 结构异常一律抛错 —— 补登卡是稀缺资源（每月最多 4 张），猜错就白费一张。
+   *
+   * ⚠️ 每轮最多用 1 张：链式补登会掩盖「为什么断签」这个更该修的问题。
+   */
+  async makeup(ctx, _step, env): Promise<ActionResult> {
+    try {
+      const [streak, heatmap] = await Promise.all([
+        streakStatus({ uid: ctx.uid, accessToken: ctx.accessToken }, env),
+        fetchHeatmap({ uid: ctx.uid, accessToken: ctx.accessToken }, env),
+      ])
+      // `launchDate` 不在 streakStatus 的返回里，直接读原始字段。
+      const launchDate = await readStreakLaunchDate({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+
+      const candidates = makeupCandidates({
+        today: heatmap.today,
+        launchDate,
+        cells: heatmap.cells,
+        makeupDates: streak.makeupDates,
+      })
+      if (candidates.length === 0) return { ok: true, detail: '本月没有需要补登的日期' }
+      if (streak.makeupCards <= 0) {
+        return { ok: true, detail: `有 ${candidates.length} 天可补登，但补登卡已用完` }
+      }
+
+      const day = candidates[0] as string
+      const result = await useMakeupCard({ uid: ctx.uid, accessToken: ctx.accessToken }, env, day)
+      return { ok: true, detail: result.detail }
+    } catch (error) {
+      return { ok: false, detail: describeError(error, '补登') }
+    }
+  },
+
+  /**
+   * `buddyBox`：开 Buddy 盲盒（能量型奖励）。
+   *
+   * ⚠️ **必须在派出旅行之前执行**：开盲盒会覆盖旅行记录（参考实现实测）。
+   * 计划表里这个动作排在 `travel` 之前。
+   *
+   * ⚠️ 上限 5 次：单轮开太多既没必要，也会放大风控暴露面。
+   */
+  async buddyBox(ctx, _step, env): Promise<ActionResult> {
+    try {
+      const quota = await buddyQuota({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      if (quota.remaining <= 0) return { ok: true, detail: '没有可开的盲盒' }
+
+      const limit = Math.min(quota.remaining, 5)
+      let opened = 0
+      for (let i = 0; i < limit; i += 1) {
+        const r = await buddyOpen({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+        if (!r.opened) break
+        opened += 1
+      }
+      const energy = await energyBalance({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+      return {
+        ok: true,
+        detail: opened > 0 ? `开了 ${opened} 个盲盒，当前能量 ${energy}` : '盲盒本轮未开出（幂等命中）',
+      }
+    } catch (error) {
+      return { ok: false, detail: describeError(error, 'Buddy 盲盒') }
     }
   },
 

@@ -24,7 +24,7 @@ import {
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { PIN_META, PinBadge } from '@/components/PinBadge'
-import { StatCard } from '@/components/StatCard'
+import { StatCardCompact as StatCard } from '@/components/StatCard'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -136,7 +136,19 @@ export function ProvidersPage() {
         }
       />
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+      {/*
+        KPI 卡片栅格（2026-11-07 手机端优化）。
+
+        ## 改前的问题
+        手机上一行两张卡片、每张带 `sub` 副标题，6 张卡片要滚 **两屏** 才看到账号列表。
+        用户打开面板最想看的是「我的账号现在怎么样」，结果全被指标卡挡在下面。
+
+        ## 为什么是 2 列而不是 3 列
+        试过 `grid-cols-3`：390px 下每张只有 ~118px，「冷却 / 限流」「临期积分总计」
+        这类四字以上标签会被挤成两行，加上大数字反而比 2 列更乱、更高。
+        ⇒ 回到 2 列（每张 ~171px，标签单行），靠 **隐藏副标题** 和 **收紧内边距** 省高度。
+      */}
+      <div className="grid grid-cols-2 gap-2 sm:gap-3 md:grid-cols-3 xl:grid-cols-6">
         <StatCard label="总账号" value={c?.total ?? 0} icon={Users} tone="primary" loading={!c} sub={`分布在 ${withAccounts} 家供应商`} />
         <StatCard
           label="可用"
@@ -174,7 +186,7 @@ export function ProvidersPage() {
           sub={totalExpiring > 0 && earliestExpiryTs > 0 ? `最早 ${fmtRelative(earliestExpiryTs)}到期` : '无即将过期积分'}
         />
         <StatCard
-          className="col-span-2 md:col-span-1 xl:col-span-1"
+          className="md:col-span-1 xl:col-span-1"
           label="供应商"
           value={providers.data?.providers.length ?? 0}
           icon={Layers}
@@ -183,8 +195,36 @@ export function ProvidersPage() {
         />
       </div>
 
-      <div className="mt-4 grid gap-4 xl:grid-cols-3">
-        <Card className="xl:col-span-2">
+      {/*
+        栅格：账号表占满宽度，供应商卡放到下面一行（2026-11-07 桌面端修复）。
+
+        ## 改前
+        `xl:grid-cols-3` + 账号卡 `xl:col-span-2` ⇒ 账号卡只有 742px，
+        却要装 7 列表格（账号/供应商/状态/积分/成功失败/最近成功/操作），
+        最小内容宽度 969px ⇒ **桌面端必须横向拖动**才能看到「积分」和操作按钮。
+
+        ## 改后
+        账号表是这一页的主体，给它整行宽度；供应商卡是导航性质的次要信息，
+        在 `xl` 以下本来就排在下面，现在桌面端也一致。
+      */}
+      <div className="mt-4 grid gap-4">
+        {/*
+          ⚠️ `min-w-0` 不可省（2026-11-07 手机端横向溢出修复）。
+
+          ## 实测故障
+          390px 视口下 `document.scrollWidth` 是 **630px** —— 整页横向可滚 240px。
+          逐元素量宽度后定位到：这个 Card 被撑到了 **613px**。
+
+          ## 为什么
+          它是 `grid` 的直接子项。CSS Grid 的隐式列默认是 `auto`，
+          即 **min-content = 表格最宽内容**（表格 612px）。而子项默认 `min-width:auto`，
+          于是 Card 拒绝收缩到比表格窄，`overflow-x-auto` 就没有机会生效
+          —— 溢出被推到了最外层，变成整页横向滚动。
+
+          ⇒ `min-w-0` 让子项允许收缩，表格的 `overflow-x-auto` 才真正接管横向滚动
+          （用户只在表格区域内横滑，页面本身不横移）。这是 Grid/Flex 的经典陷阱。
+        */}
+        <Card className="min-w-0 xl:col-span-2">
           <CardHeader className="flex-col gap-3 sm:flex-row sm:items-center">
             <div>
               <CardTitle>账号</CardTitle>
@@ -193,7 +233,28 @@ export function ProvidersPage() {
             <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
               <div className="relative w-full sm:w-52">
                 <Search className="text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
-                <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索昵称 / UID" className="h-8 pl-8 text-[13px]" />
+                {/*
+                  ⚠️ `type="search"` + `autoComplete="off"` 是为了**挡住浏览器自动填充**
+                  （2026-11-07 实测故障）。
+
+                  ## 现象
+                  在登录页输入主密钥后进入面板，这个搜索框里会**自动出现主密钥**
+                  （`sk-...`），于是账号列表判定为「没有符合条件的账号」，整页空白。
+
+                  ## 原因
+                  `q` 的初始状态是 `''`，代码从未写入过密钥。是浏览器把登录页那次
+                  密码输入当成了表单凭据，登录后在本页**第一个 `text` input** 上回填。
+                  换成 `type="search"` 后它不再属于凭据填充的目标类型；`autoComplete="off"`
+                  再加一层保险。
+                */}
+                <Input
+                  type="search"
+                  autoComplete="off"
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="搜索昵称 / UID"
+                  className="h-8 pl-8 text-[13px]"
+                />
               </div>
               <Segmented<Filter>
                 value={filter}
@@ -208,10 +269,17 @@ export function ProvidersPage() {
               />
             </div>
           </CardHeader>
-          <AccountsTable rows={rows} loading={accounts.isLoading} providerName={providerName} />
+          <AccountsTable rows={rows} loading={accounts.isLoading} providerName={providerName} query={q} />
         </Card>
 
-        <Card className="flex flex-col">
+        {/*
+          `self-start` 让供应商卡**贴顶**（2026-11-07 桌面端修留白）。
+
+          改前它是 grid 的标准拉伸项，高度被左侧 741px 的账号表撑着，
+          而内容只有两行供应商 ⇒ 卡片下半部分 400px 全是空白。
+          改成贴顶后卡片只占自身内容高度，视觉上不再是「未加载完」的样子。
+        */}
+        <Card className="flex flex-col self-start">
           <CardHeader>
             <div>
               <CardTitle>供应商</CardTitle>
@@ -244,7 +312,7 @@ export function ProvidersPage() {
               </Button>
             </div>
           </CardHeader>
-          <div className="flex-1 px-2 pb-2">
+          <div className="flex-1 px-2 pb-2 md:grid md:grid-cols-2 md:content-start xl:grid-cols-3">
             {sorting && providers.data ? (
               <SortableProviders
                 items={sortSeed}
@@ -426,11 +494,18 @@ export function AccountsTable({
   loading,
   providerName,
   compact,
+  query,
 }: {
   rows: Account[]
   loading?: boolean
   providerName?: (id: string) => string
   compact?: boolean
+  /**
+   * 当前搜索词。
+   * 只用于空态提示：浏览器自动填充曾把主密钥塞进搜索框，
+   * 空列表时看不出是「搜索词是密钥」还是「账号真没了」。
+   */
+  query?: string
 }) {
   const toggle = useToggleAccount()
   const remove = useRemoveAccount()
@@ -468,12 +543,18 @@ export function AccountsTable({
         ))}
       </div>
     )
-  if (!rows.length)
+  if (!rows.length) {
+    const term = (query ?? '').trim()
+    // 密钥形态：`sk-` 开头，或一长串无空格字符 —— 都不可能匹配昵称/UID。
+    const looksLikeKey = term.startsWith('sk-') || term.length >= 24
     return (
-      <Empty icon={<Users />} title="没有符合条件的账号">
-        换个筛选条件，或点右上角「添加账号」。
+      <Empty icon={<Users />} title={looksLikeKey ? '搜索内容看起来像密钥，不是账号' : '没有符合条件的账号'}>
+        {looksLikeKey
+          ? `搜索词是 ${term.slice(0, 6)}…（${term.length} 字符），这更像 API 密钥。清空搜索框即可看到全部账号。`
+          : '换个筛选条件，或点右上角「添加账号」。'}
       </Empty>
     )
+  }
 
   return (
     <>
@@ -482,8 +563,18 @@ export function AccountsTable({
           <tr>
             <TH>账号</TH>
             {providerName && <TH className="hidden md:table-cell">供应商</TH>}
-            <TH className="min-w-[152px]">状态</TH>
-            <TH className="min-w-[112px] text-right">积分</TH>
+            {/*
+              列宽纪律（2026-11-07 桌面端修横向滚动）：
+
+              改前 `min-w-[152px]` + `min-w-[112px]` 让 7 列合计 **1120px**，
+              而容器在 1440px 屏上只有 740px ⇒ 用户必须横向拖动才能看到
+              「积分」和操作按钮，桌面端白留一大片空白。
+
+              ⇒ 状态列靠内容自适应（模型明细本身已 `whitespace-nowrap`），
+                积分列去掉硬下限，交给 `w-full` 的账号列吸收剩余宽度。
+            */}
+            <TH>状态</TH>
+            <TH className="text-right">积分</TH>
             {!compact && <TH className="hidden text-right lg:table-cell">成功 / 失败</TH>}
             <TH className="hidden sm:table-cell">最近成功</TH>
             <TH className="w-10" />
@@ -509,38 +600,63 @@ export function AccountsTable({
                         : ''
             const mode = pinModeOf(a, pins.data)
             return (
-              <TR key={a.realm + a.uid}>
+              <TR key={a.realm + a.uid} className="group">
                 <TD>
                   <div className="flex items-center gap-1.5 font-medium">
                     <span className="truncate">{a.nickname || '未命名'}</span>
                     {mode && <PinBadge mode={mode} />}
                   </div>
-                  <div className="text-muted-foreground font-mono text-[11.5px]">{a.uid}</div>
-                  {/* ⚠️ 会真实打一次上游（消耗极少配额），故只在点击时触发 */}
-                  <button
-                    type="button"
-                    aria-label="探测该账号当前是否可用"
-                    title="探测该账号当前是否可用（会真实打一次上游，消耗极少配额）"
-                    className="text-muted-foreground hover:text-foreground mt-1 cursor-pointer text-[11px] underline decoration-dotted"
-                    onClick={() => probe.mutate({ uid: a.uid, realm: a.realm })}
-                    disabled={probe.isPending}
-                  >
-                    {probe.isPending ? '探测中…' : '探测'}
-                  </button>
+                  {/*
+                    UID 一律单行截断（2026-11-07）。
+
+                    改前 `sm:max-w-none` 在桌面端放开了宽度，36 字符的 UUID
+                    把「账号」列撑到 **327px**，7 列合计 1131px 塞进 740px 容器
+                    ⇒ 桌面端反而要横向拖动才看得到「积分」和操作按钮。
+
+                    ⇒ 桌面 `max-w-[220px]`（足够看清前缀区分账号），手机 `150px`；
+                      完整值始终在 `title` 里，悬停即见。
+                  */}
+                  <div className="flex items-center gap-2">
+                    <div
+                      className="text-muted-foreground max-w-[150px] truncate font-mono text-[11.5px] sm:max-w-[220px]"
+                      title={a.uid}
+                    >
+                      {a.uid}
+                    </div>
+                    {/*
+                      「探测」不占垂直空间，桌面端悬停才显形（2026-11-07）。
+
+                      改前它独占一行，11 个账号因此多出约 220px 高度，
+                      表格滚一屏只看得见 7 行。现在收进 UID 同一行：
+                      桌面端 `sm:opacity-0 sm:group-hover:opacity-100` 悬停出现，
+                      手机端保持常显 —— 触屏没有 hover，藏起来就点不到了。
+
+                      ⚠️ 会真实打一次上游（消耗极少配额），故只在点击时触发。
+                    */}
+                    <button
+                      type="button"
+                      aria-label="探测该账号当前是否可用"
+                      title="探测该账号当前是否可用（会真实打一次上游，消耗极少配额）"
+                      className="text-muted-foreground hover:text-foreground shrink-0 cursor-pointer text-[11px] underline decoration-dotted transition-opacity sm:opacity-0 sm:group-hover:opacity-100"
+                      onClick={() => probe.mutate({ uid: a.uid, realm: a.realm })}
+                      disabled={probe.isPending}
+                    >
+                      {probe.isPending ? '探测中…' : '探测'}
+                    </button>
+                  </div>
                 </TD>
                 {providerName && (
-                  <TD className="hidden md:table-cell">
-                    <div className="flex items-center gap-2">
+                  <TD className="hidden md:table-cell md:px-2">
+                    <div className="flex items-center gap-1.5">
                       <ProviderAvatar id={a.provider} name={providerName(a.provider)} size="sm" />
-                      <span className="max-w-36 truncate">{providerName(a.provider)}</span>
+                      <span className="max-w-40 truncate">{providerName(a.provider)}</span>
                     </div>
                   </TD>
                 )}
-                <TD className="whitespace-nowrap">
+                <TD className="whitespace-nowrap md:px-2">
                   <Badge tone={meta.tone} dot>
                     {meta.label}
-                  </Badge>
-                  {/*
+                  </Badge>                  {/*
                     模型级冷却明细。
 
                     ## 排版纪律（2026-11-07 修 UI 挤压）
@@ -568,11 +684,11 @@ export function AccountsTable({
                         {active.slice(0, 3).map((m) => (
                           <li
                             key={m.model}
-                            className="flex items-center gap-2 text-[11px] leading-tight text-amber-600 dark:text-amber-500"
+                            className="flex max-w-[170px] items-center gap-2 text-[11px] leading-tight text-amber-600 dark:text-amber-500"
                             title={`${m.model} 冷却至 ${new Date(m.until).toLocaleString()}`}
                           >
-                            <span className="w-[104px] shrink-0 truncate font-mono">{m.model}</span>
-                            <span className="text-muted-foreground w-[62px] shrink-0 whitespace-nowrap text-right tabular">
+                            <span className="min-w-0 flex-1 truncate font-mono">{m.model}</span>
+                            <span className="text-muted-foreground shrink-0 whitespace-nowrap tabular">
                               {fmtRemaining(m.until, now)}
                             </span>
                           </li>
@@ -620,6 +736,14 @@ export function AccountsTable({
                     <span className="text-foreground">{fmtInt(a.successCount)}</span> / {fmtInt(a.errTotal)}
                   </TD>
                 )}
+                {/*
+                  ⚠️ 手机端**整列隐藏**（2026-11-07）。
+                  改前用的是 `hidden sm:table-cell`，而 sm=640px，390px 的手机上本就该隐藏 ——
+                  但它仍然是表格里的一个 `<td>`，colgroup 未定义时浏览器会按内容给列分配宽度，
+                  于是这列把表格撑到 612px（视口只有 390px），导致整页横向溢出 240px。
+                  现在靠表格外层 `overflow-x-auto` 兜住（见 Table 组件），
+                  同时这一列在手机上不参与布局。
+                */}
                 <TD className="text-muted-foreground hidden whitespace-nowrap sm:table-cell">{fmtRelative(a.lastSuccess)}</TD>
                 <TD>
                   <Menu>

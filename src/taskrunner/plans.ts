@@ -77,6 +77,15 @@ export const REAL_CHAT_ACTIONS: ReadonlyArray<{ code: string; action: string }> 
  * ⚠️ 全部**幂等**：重复执行不会重复领奖（上游对已领取回业务码）。
  */
 const DAILY_ACTIVITY_ACTIONS: ReadonlyArray<{ code: string; action: string }> = [
+  // ⚠️ **顺序有语义，不能随便调**：
+  //
+  // 1. `makeup` 必须最先：它会把连登链接回去，后面的 `redeemStreak`
+  //    才能看到「已解锁」的高档位（否则断签导致档位全是 locked）。
+  // 2. `buddyBox` 必须在 `travel` **之前**：开盲盒会覆盖旅行记录
+  //    （参考实现 88lin/workbuddy-auto-signin 实测结论）。
+  // 3. `travel` 自己保证「先领后派」。
+  { code: 'makeup', action: 'makeup' },
+  { code: 'buddy_box', action: 'buddyBox' },
   // 先领上一次的旅行奖励，再出发为下一次准备（动作内部保证顺序）
   { code: 'travel', action: 'travel' },
   // 连登档位兑换（逐档、单档失败不中断）

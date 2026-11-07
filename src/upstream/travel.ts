@@ -39,6 +39,10 @@ export interface StreakStatus {
   redeemableTiers: string[]
   /** 可抽奖次数。 */
   lotteryChances: number
+  /** 可用**补登卡**数量（0 = 没有补救能力）。 */
+  makeupCards: number
+  /** 已补登过的日期（`YYYY-MM-DD`）—— 是历史，**不是**待办清单。 */
+  makeupDates: string[]
 }
 
 /** 用固定 +8 偏移算「今天」（`YYYY-MM-DD`）。 */
@@ -230,12 +234,40 @@ export async function streakStatus(
     }
   }
 
+  // 补登卡余额与已补登日期（2026-11-07 新增：断签补救需要它们）
+  const cards = (d.makeup_cards ?? {}) as Record<string, unknown>
+  const makeupCards = typeof cards.balance === 'number' ? Math.max(0, Math.trunc(cards.balance)) : 0
+  const makeupDates: string[] = []
+  if (Array.isArray(streak.makeup_dates)) {
+    for (const v of streak.makeup_dates) {
+      if (typeof v === 'string') makeupDates.push(v)
+    }
+  }
+
   return {
     days: typeof streak.days === 'number' ? streak.days : 0,
     monthTotalDays: typeof streak.month_total_days === 'number' ? streak.month_total_days : 0,
     redeemableTiers,
     lotteryChances: typeof d.lottery_chances === 'number' ? d.lottery_chances : 0,
+    makeupCards,
+    makeupDates,
   }
+}
+
+/**
+ * 只取连登接口里的 `launch_date`（活动上线日）。
+ *
+ * ⚠️ 单独一个函数而不是塞进 `streakStatus`：补登判据需要它，
+ * 但其它调用方（兑换/抽奖）用不上，塞进去会让那个结构越来越胖。
+ */
+export async function readStreakLaunchDate(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+): Promise<string> {
+  const r = await growthCall(ctx, env, 'GET', '/activity/growth/streak')
+  if (!r.ok) return ''
+  const d = (r.data ?? {}) as Record<string, unknown>
+  return typeof d.launch_date === 'string' ? d.launch_date : ''
 }
 
 /** 兑换连登档位。幂等：已兑换/未解锁由上游拒绝，不视为失败。 */
@@ -311,4 +343,190 @@ export async function drawAllLottery(
     drawn += 1
   }
   return { drawn, details }
+}
+
+// ─────────────────────── 补登卡（断签补救） ───────────────────────
+//
+// ## 这个功能为什么重要（2026-11-07 从 88lin/workbuddy-auto-signin 移植）
+//
+// 本项目此前**完全没有**补登能力。而连登奖励按「当月断签即清零」计算：
+// 一旦因为账号冷却 / 容器重启 / 网络抖动漏了一天，用户只能眼睁睁看着
+// 连签天数归零、档位奖励全部作废。
+//
+// 上游其实提供了补登卡（`makeup-cards`）：每月最多 4 张，
+// 可以把**当月**已断的日期补上，让连登链重新连续。
+//
+// ## 为什么必须靠 `heatmap` 而不是 `makeup_dates`
+//
+// - `makeup_dates` 是**已经补过的**历史，不是待办清单；
+// - 判断「哪天断签」只能看活跃日历（`heatmap`）里 `score === 0` 的日期。
+//
+// ⚠️ 参考实现的纪律值得照抄：**结构异常时整段停止**，
+// 不靠猜测去消耗补登卡（卡是稀缺资源，猜错就白费一张）。
+
+/** 活跃日历单个日期的数据。 */
+export interface HeatmapCell {
+  date: string
+  score: number
+}
+
+/** 读活跃日历（含服务端当天日期，避免本机时区把跨日算错）。 */
+export async function fetchHeatmap(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+): Promise<{ today: string; cells: HeatmapCell[] }> {
+  const r = await growthCall(ctx, env, 'GET', '/activity/growth/heatmap')
+  if (!r.ok) {
+    throw new UpstreamError({
+      kind: 'unknown',
+      httpStatus: r.httpStatus,
+      code: r.code,
+      message: `活跃日历查询失败：${r.msg || r.raw.slice(0, 120)}`,
+      detail: r.raw.slice(0, 400),
+    })
+  }
+  const d = (r.data ?? {}) as Record<string, unknown>
+  const todayObj = (d.today ?? {}) as Record<string, unknown>
+  const today = typeof todayObj.date === 'string' ? todayObj.date : ''
+  const cells: HeatmapCell[] = []
+  if (Array.isArray(d.cells)) {
+    for (const raw of d.cells) {
+      if (raw === null || typeof raw !== 'object') continue
+      const c = raw as Record<string, unknown>
+      if (typeof c.date !== 'string') continue
+      const score = typeof c.score === 'number' && Number.isFinite(c.score) ? c.score : 0
+      cells.push({ date: c.date, score })
+    }
+  }
+  return { today, cells }
+}
+
+/**
+ * 计算**可补登**的日期（纯函数，便于单测）。
+ *
+ * 规则（对齐官方成长中心，逐条来自参考实现的实测结论）：
+ * 1. **当月** —— 补登卡只能补本月；
+ * 2. **今天之前** —— 今天还没过完，不能补；
+ * 3. **活动上线之后** —— `launch_date` 之前的日期本来就不存在；
+ * 4. **`score === 0`** —— 有活跃记录的日期不算断签；
+ * 5. **不在 `makeup_dates` 里** —— 已补过的不重复补。
+ *
+ * ⚠️ 结构异常（日期格式不对 / score 非数 / 日历缺 today）
+ * 一律**抛错而不是跳过** —— 宁可这轮不补，也不能白烧一张卡。
+ */
+export function makeupCandidates(input: {
+  today: string
+  launchDate: string
+  cells: readonly HeatmapCell[]
+  makeupDates: readonly string[]
+}): string[] {
+  const isDate = (v: string): boolean => /^\d{4}-\d{2}-\d{2}$/.test(v)
+  if (!isDate(input.today)) throw new Error('活跃日历缺少服务端日期')
+  const today = input.today
+  const monthStart = `${today.slice(0, 7)}-01`
+  const launch = isDate(input.launchDate) ? input.launchDate : monthStart
+  const start = [monthStart, launch].sort()[1] as string
+
+  const done = new Set(input.makeupDates.filter(isDate))
+  const scores = new Map<string, number>()
+  for (const cell of input.cells) {
+    if (!isDate(cell.date)) throw new Error('活跃日历日期格式无效')
+    if (!Number.isFinite(cell.score) || cell.score < 0) throw new Error('活跃日历分数无效')
+    const prev = scores.get(cell.date)
+    if (prev !== undefined && prev !== cell.score) throw new Error('活跃日历同一日期记录冲突')
+    scores.set(cell.date, cell.score)
+  }
+
+  return [...scores.entries()]
+    .filter(([day, score]) => day >= start && day < today && score === 0 && !done.has(day))
+    .map(([day]) => day)
+    .sort()
+    .reverse() // 最近的断点优先：尽早把连登链接回去
+}
+
+/** 用一张补登卡补某个日期。 */
+export async function useMakeupCard(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+  day: string,
+): Promise<{ used: boolean; detail: string }> {
+  const r = await growthCall(
+    ctx,
+    env,
+    'POST',
+    '/activity/growth/makeup-cards/use',
+    JSON.stringify({ date: day, client_token: clientToken() }),
+  )
+  if (r.ok) return { used: true, detail: `已补登 ${day}` }
+  if (/no.*card|card.*empty|没有|已用完|used/i.test(r.msg) || r.code === 10001) {
+    return { used: false, detail: `补登 ${day} 未成功（无可用补登卡）` }
+  }
+  throw new UpstreamError({
+    kind: 'unknown',
+    httpStatus: r.httpStatus,
+    code: r.code,
+    message: `补登 ${day} 失败：${r.msg || r.raw.slice(0, 120)}`,
+    detail: r.raw.slice(0, 400),
+  })
+}
+
+// ─────────────────────── Buddy 盲盒 / 能量 ───────────────────────
+//
+// ## 为什么值得做（2026-11-07 移植）
+//
+// 盲盒开出来是**能量**，能量可以再开 Buddy 盲盒。本项目此前没有这条链路，
+// 等于每天白白攒着额度不用。额度用不掉不会累积到明天。
+
+/** 盲盒配额（还有几次可开）。 */
+export async function buddyQuota(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+): Promise<{ remaining: number; raw: string }> {
+  const r = await growthCall(ctx, env, 'GET', '/activity/growth/buddy/quota')
+  if (!r.ok) return { remaining: 0, raw: r.raw.slice(0, 200) }
+  const d = (r.data ?? {}) as Record<string, unknown>
+  const n = typeof d.remaining === 'number' ? d.remaining : typeof d.quota === 'number' ? d.quota : 0
+  return { remaining: Math.max(0, Math.trunc(n)), raw: r.raw.slice(0, 200) }
+}
+
+/**
+ * 开一次 Buddy 盲盒。
+ *
+ * ⚠️ **会覆盖旅行记录**（参考实现实测结论）⇒ 调用方必须保证
+ * 旅行状态是 `idle`，**派出旅行要放在开盲盒之后**。
+ */
+export async function buddyOpen(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+): Promise<{ opened: boolean; detail: string }> {
+  const r = await growthCall(
+    ctx,
+    env,
+    'POST',
+    '/activity/growth/buddy/open',
+    JSON.stringify({ client_token: clientToken() }),
+  )
+  if (r.ok) return { opened: true, detail: '已开盲盒' }
+  if (/quota|limit|次数|已用完|没有/i.test(r.msg) || r.code === 10001) {
+    return { opened: false, detail: '无可用盲盒次数（幂等命中）' }
+  }
+  throw new UpstreamError({
+    kind: 'unknown',
+    httpStatus: r.httpStatus,
+    code: r.code,
+    message: `开盲盒失败：${r.msg || r.raw.slice(0, 120)}`,
+    detail: r.raw.slice(0, 400),
+  })
+}
+
+/** 读能量余额。 */
+export async function energyBalance(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+): Promise<number> {
+  const r = await growthCall(ctx, env, 'GET', '/activity/growth/energy')
+  if (!r.ok) return 0
+  const d = (r.data ?? {}) as Record<string, unknown>
+  const v = typeof d.energy === 'number' ? d.energy : typeof d.balance === 'number' ? d.balance : 0
+  return Math.max(0, Math.trunc(v))
 }

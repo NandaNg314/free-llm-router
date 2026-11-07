@@ -48,3 +48,18 @@ export function StatCard({
     </Card>
   )
 }
+
+/**
+ * 手机上隐藏副标题的 `StatCard` 外壳。
+ *
+ * ## 为什么需要它（2026-11-07 手机端）
+ * 「供应商与账号」页顶部有 6 张 KPI 卡，每张的副标题在 390px 下都被 `truncate`
+ * 截成「分布在 2 家…」「最早 5 天后…」——信息量几乎为零，却每张多占 16px 高度，
+ * 6 张就是 ~100px，直接把账号列表推到首屏之外。
+ *
+ * ⇒ 用 `[&_.truncate]:hidden sm:[&_.truncate]:visible` 精确命中 StatCard 内部的
+ *   副标题（它是唯一带 `truncate` 的元素），不改组件本身的 API、不影响其他页面。
+ */
+export function StatCardCompact(props: Parameters<typeof StatCard>[0]) {
+  return <StatCard {...props} className={cn('[&_.truncate]:hidden sm:[&_.truncate]:block', props.className)} />
+}

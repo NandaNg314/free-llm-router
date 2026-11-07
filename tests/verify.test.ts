@@ -210,9 +210,19 @@ test('成长计划：零消耗动作数与动作表一致', () => {
   // 但**只有已接受的任务才计分**。本引擎此前从不 accept
   //（`acceptTasks` 实现了却零调用）⇒ 未接受的任务上报了也不点亮。
   const activitySteps = steps.filter((s) =>
-    ['travel', 'redeemStreak', 'lottery'].includes(s.action),
+    ['makeup', 'buddyBox', 'travel', 'redeemStreak', 'lottery'].includes(s.action),
   )
-  assert.equal(activitySteps.length, 3, '三个活动动作都必须在计划里')
+  assert.equal(activitySteps.length, 5, '五个活动动作都必须在计划里')
+  // ⚠️ 顺序有语义（2026-11-07 新增两项）：
+  // - `makeup` 必须最先：补登把连登链接回去，后面的兑换才看得到高档位；
+  // - `buddyBox` 必须在 `travel` 之前：开盲盒会覆盖旅行记录。
+  const makeupIdx = steps.findIndex((s) => s.action === 'makeup')
+  const boxIdx = steps.findIndex((s) => s.action === 'buddyBox')
+  const travelIdx = steps.findIndex((s) => s.action === 'travel')
+  assert.ok(makeupIdx > 0 && makeupIdx < steps.findIndex((s) => s.action === 'redeemStreak'),
+    '⚠️ 补登必须早于连登兑换（否则兑换看不到已解锁档位）')
+  assert.ok(boxIdx > 0 && boxIdx < travelIdx,
+    '⚠️ 开盲盒必须早于派出旅行（开盲盒会覆盖旅行记录）')
   // ⚠️ acceptPending 必须在**第一个成长动作之前**（先接受再上报，否则白跑）
   const acceptIdx = steps.findIndex((s) => s.action === 'acceptPending')
   assert.ok(acceptIdx > 0, '⚠️ 计划里必须有 acceptPending（否则未接受的任务不计分）')
@@ -222,7 +232,7 @@ test('成长计划：零消耗动作数与动作表一致', () => {
   // 领奖完成后必须查一次最新余额并回写账号池，否则面板上的积分数字永不刷新。
   const balanceIdx = steps.findIndex((s) => s.action === 'balance')
   assert.ok(balanceIdx > 0, '⚠️ 计划末尾必须有 balance 步骤（否则跑完任务不刷新积分）')
-  assert.equal(steps.length, actions.length * 2 + 3 + 3 + 1)
+  assert.equal(steps.length, actions.length * 2 + 3 + 5 + 1)
 })
 
 test('⚠️ 活动类动作**不得**带 verifyAndClaim（它们没有 task code）', () => {

@@ -92,8 +92,9 @@ export function UsagePage() {
         <StatCard className="col-span-2 md:col-span-1" label="平均耗时" value={fmtMs(u?.avgMs ?? 0)} icon={Clock} loading={!u} sub="首包到结束" />
       </div>
 
+      {/* `min-w-0`：Grid 子项默认 min-width:auto，内部宽内容（图表/表格）会把整页顶出视口。 */}
       <div className="mt-4 grid gap-4 xl:grid-cols-3">
-        <Card className="xl:col-span-2">
+        <Card className="min-w-0 xl:col-span-2">
           <CardHeader>
             <div>
               <CardTitle>请求趋势</CardTitle>
@@ -164,6 +165,7 @@ export function UsagePage() {
 
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
         <RankCard
+          className="min-w-0"
           title="按模型"
           rows={u?.byModel.map((r) => ({ ...r, key: r.model, name: r.model })) ?? []}
           total={u?.total ?? 0}
@@ -231,15 +233,24 @@ function RankCard({
   total,
   loading,
   mono,
+  className,
 }: {
   title: string
   rows: (UsageRow & { key: string; name: string; sub?: string })[]
   total: number
   loading?: boolean
   mono?: boolean
+  className?: string
 }) {
   return (
-    <Card>
+    /*
+      `overflow-hidden` 让卡片自己成为溢出边界的最后一道墙（2026-11-07）。
+
+      手机上这张卡 `width=390` 但 `right=406` —— 表格的 min-content（610px）
+      虽然被外层 `overflow-x-auto` 接住，卡片却仍按表格宽度撑开了 16px。
+      加上 `overflow-hidden` 后卡片严格等于栅格列宽，横向滚动只发生在表格内部。
+    */
+    <Card className={`overflow-hidden ${className ?? ''}`}>
       <CardHeader>
         <div>
           <CardTitle>{title}</CardTitle>
