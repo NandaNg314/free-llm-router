@@ -82,7 +82,13 @@ function logPoolError(op: string): (error: unknown) => void {
 export function recordLog(
   pool: DurableObjectStub<AccountPoolDO>,
   entry: {
-    type?: 'api' | 'task' | 'auth' | 'error'
+    /**
+     * `mcp` = MCP 工具调用（搜索 / 抓网页 / 生图）。
+     *
+     * 与 `api` 分开：这三项不是 LLM 调用，`model` 字段记的是工具名，
+     * 面板按 type 过滤时能单独筛出来。
+     */
+    type?: 'api' | 'task' | 'auth' | 'error' | 'mcp'
     model: string
     provider: string
     uid: string

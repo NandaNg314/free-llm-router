@@ -11,7 +11,7 @@ import { useClearLogs, useLogs } from '@/lib/queries'
 import { cn } from '@/lib/utils'
 import { fmtDateTime, fmtInt, fmtMs } from '@/lib/utils'
 
-type F = 'all' | 'api' | 'error' | 'task'
+type F = 'all' | 'api' | 'error' | 'task' | 'mcp'
 
 export function LogsPage() {
   const logs = useLogs()
@@ -38,6 +38,7 @@ export function LogsPage() {
               options={[
                 { value: 'all', label: '全部' },
                 { value: 'api', label: '请求' },
+                { value: 'mcp', label: 'MCP' },
                 { value: 'error', label: '错误' },
                 { value: 'task', label: '任务' },
               ]}
@@ -81,7 +82,11 @@ export function LogsPage() {
                   <TD className="tabular text-muted-foreground hidden text-right sm:table-cell">{l.tokens ? fmtInt(l.tokens.total) : '—'}</TD>
                   <TD className="tabular text-right whitespace-nowrap">{fmtMs(l.durationMs ?? 0)}</TD>
                   <TD className="text-muted-foreground hidden max-w-64 truncate lg:table-cell" title={l.error}>
-                    {l.error ?? (l.stream ? '流式' : '非流式')}
+                    {/*
+                      MCP 记录没有 stream 概念，显示工具类型更有信息量。
+                      对话请求仍显示「流式 / 非流式」。
+                    */}
+                    {l.error ?? (l.type === 'mcp' ? '工具调用' : l.stream ? '流式' : '非流式')}
                   </TD>
                 </TR>
               ))}

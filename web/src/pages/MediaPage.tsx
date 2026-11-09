@@ -36,6 +36,29 @@ const SIZES = ['1024x1024', '1024x768', '768x1024'] as const
 const ASPECTS = ['16:9', '9:16', '1:1'] as const
 const SECONDS = [4, 5, 8, 10] as const
 
+/**
+ * 生图可选模型。
+ *
+ * ⚠️ 只列**实测可用**的。`/v1/models` 里虽然还有 `hunyuan-image-alpha`，
+ * 但上游会回 `route config not found`（2026-11-09 实测），列进 UI 只会让人点了报错。
+ * 等上游真接上再补。
+ */
+const IMAGE_MODELS = [
+  { value: '', label: '默认（hy-image-3.5）' },
+  { value: 'hy-image-3.5', label: '混元 hy-image-3.5' },
+] as const
+
+/**
+ * 视频可选模型（两个都实测可用）。
+ *
+ * 空值 = 不传 model，由上游按自己的默认选。
+ */
+const VIDEO_MODELS = [
+  { value: '', label: '默认' },
+  { value: 'kling-video-v3', label: '可灵 v3' },
+  { value: 'minimax-video-h3', label: '海螺 H3' },
+] as const
+
 export function MediaPage() {
   const [tab, setTab] = useState<Tab>('image')
 
@@ -61,7 +84,7 @@ export function MediaPage() {
       <div className="border-primary/25 bg-primary/[0.05] mb-4 flex items-start gap-2.5 rounded-lg border px-4 py-3 text-[13px] leading-relaxed">
         <AlertTriangle className="text-primary mt-0.5 size-4 shrink-0" />
         <span>
-          这三项能力<b>只有国际版账号</b>可用（国内账号实测返回 401）。
+          这四项能力<b>只有国际版账号</b>可用（国内账号实测返回 401，是腾讯网关层直接拒的）。
           没有国际版账号时请先到「供应商与账号」登录一个，否则会提示
           <code className="bg-black/[0.06] dark:bg-white/[0.08] mx-1 rounded px-1 py-0.5 font-mono text-[11.5px]">unsupported_realm</code>。
         </span>
@@ -240,20 +263,23 @@ function ImageTab() {
   const edit = useEditImage()
   const [prompt, setPrompt] = useState('')
   const [size, setSize] = useState<string>(SIZES[0])
+  const [model, setModel] = useState<string>('')
   const [source, setSource] = useState('')
   const [mode, setMode] = useState<'text' | 'img2img'>('text')
 
   const busy = gen.isPending || edit.isPending
   const run = () => {
     if (prompt.trim() === '') return
+    // model 为空串时不传，由上游用自己的默认模型
+    const m = model === '' ? {} : { model }
     if (mode === 'img2img') {
       if (source === '') {
         toast.error('请先选择一张参考图')
         return
       }
-      edit.mutate({ prompt: prompt.trim(), image: [source], size })
+      edit.mutate({ prompt: prompt.trim(), image: [source], size, ...m })
     } else {
-      gen.mutate({ prompt: prompt.trim(), size })
+      gen.mutate({ prompt: prompt.trim(), size, ...m })
     }
   }
 
@@ -304,6 +330,8 @@ function ImageTab() {
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <span className="text-muted-foreground text-xs">尺寸</span>
           <Segmented value={size} onChange={setSize} options={SIZES.map((s) => ({ value: s, label: s }))} />
+          <span className="text-muted-foreground ml-2 text-xs">模型</span>
+          <Segmented value={model} onChange={setModel} options={IMAGE_MODELS.map((m) => ({ value: m.value, label: m.label }))} />
           <div className="ml-auto flex items-center gap-2">
             {busy && <Badge tone="warning">生成中，约 10–15 秒</Badge>}
             <Button onClick={run} disabled={busy || prompt.trim() === ''}>
@@ -356,6 +384,7 @@ function VideoTab() {
   const [prompt, setPrompt] = useState('')
   const [seconds, setSeconds] = useState<number>(4)
   const [aspect, setAspect] = useState<string>(ASPECTS[0])
+  const [model, setModel] = useState<string>('')
   const [source, setSource] = useState('')
   const [task, setTask] = useState<VideoTask | null>(null)
   const [polling, setPolling] = useState(false)
@@ -395,6 +424,7 @@ function VideoTab() {
       prompt: prompt.trim(),
       seconds,
       aspect_ratio: aspect,
+      ...(model === '' ? {} : { model }),
       ...(source === '' ? {} : { image: source }),
     })
     toast.success('已提交，正在生成', { description: '通常 60–120 秒' })
@@ -431,6 +461,8 @@ function VideoTab() {
           <Segmented value={String(seconds)} onChange={(v) => setSeconds(Number(v))} options={SECONDS.map((s) => ({ value: String(s), label: `${s}s` }))} />
           <span className="text-muted-foreground ml-1 text-xs">比例</span>
           <Segmented value={aspect} onChange={setAspect} options={ASPECTS.map((a) => ({ value: a, label: a }))} />
+          <span className="text-muted-foreground ml-1 text-xs">模型</span>
+          <Segmented value={model} onChange={setModel} options={VIDEO_MODELS.map((m) => ({ value: m.value, label: m.label }))} />
           <div className="ml-auto flex items-center gap-2">
             {polling && <Badge tone="warning">生成中，约 1–2 分钟</Badge>}
             <Button onClick={() => void run()} disabled={submit.isPending || polling || prompt.trim() === ''}>

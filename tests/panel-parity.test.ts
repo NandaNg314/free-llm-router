@@ -172,9 +172,9 @@ function sourceFile(rel: string): string {
  */
 const WHITELIST: { text: string; kind: '伪差异' | '暂不补'; why: string }[] = [
   {
-    // 同样是相邻文本节点被合并：源码里它们被 <b> / <code> 元素切开
+    // 相邻文本节点被合并：源码里它们被 <b> / <code> 元素切开
     text:
-      '可用（国内账号实测返回 401）。 没有国际版账号时请先到「供应商与账号」登录一个，否则会提示',
+      '可用（国内账号实测返回 401，是腾讯网关层直接拒的）。 没有国际版账号时请先到「供应商与账号」登录一个，否则会提示',
     kind: '伪差异',
     why:
       '不是功能差异：`MediaPage.tsx` 在同一句话里嵌了 <b>只有国际版账号</b> 与 <code>unsupported_realm</code>，' +

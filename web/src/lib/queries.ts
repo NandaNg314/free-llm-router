@@ -337,7 +337,7 @@ export interface GeneratedImage {
 }
 
 export function useGenerateImage() {
-  return useMutation<{ created: number; data: GeneratedImage[]; usage?: { credit?: number } }, Error, { prompt: string; size?: string }>({
+  return useMutation<{ created: number; data: GeneratedImage[]; usage?: { credit?: number } }, Error, { prompt: string; size?: string; model?: string }>({
     mutationFn: (v) =>
       api('/v1/images/generations', {
         json: v,
@@ -384,7 +384,7 @@ export function useEditImage() {
   return useMutation<
     { created: number; data: GeneratedImage[]; usage?: { credit?: number } },
     Error,
-    { prompt: string; image: string[]; size?: string }
+    { prompt: string; image: string[]; size?: string; model?: string }
   >({
     mutationFn: (v) => api('/v1/images/edits', { json: v, timeoutMs: 180_000 }),
     onError: (e) => toast.error('生成失败', { description: e.message }),
@@ -404,7 +404,7 @@ export interface VideoTask {
 }
 
 export function useSubmitVideo() {
-  return useMutation<{ id: string; status: string; hint?: string }, Error, { prompt: string; seconds?: number; aspect_ratio?: string; image?: string }>({
+  return useMutation<{ id: string; status: string; hint?: string }, Error, { prompt: string; seconds?: number; aspect_ratio?: string; image?: string; model?: string }>({
     mutationFn: (v) => api('/v1/videos/generations', { json: v, timeoutMs: 120_000 }),
     onError: (e) => toast.error('提交失败', { description: e.message }),
   })

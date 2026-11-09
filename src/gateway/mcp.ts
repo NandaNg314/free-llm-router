@@ -36,6 +36,7 @@
 import type { Env } from '../env.js'
 import { generateImage, mediaCapable, webFetch, webSearch, INTl_IMAGE_MODEL } from '../upstream/media.js'
 import { pickCredential } from './models.js'
+import { recordLog } from './server.js'
 import { WORKBUDDY_INTL } from '../providers/buddy.js'
 
 /** MCP 协议版本（客户端发什么我们回什么，不认识就回最新的）。 */
@@ -134,15 +135,30 @@ function fail(id: unknown, code: number, message: string): Response {
   return Response.json({ jsonrpc: '2.0', id: id ?? null, error: { code, message } })
 }
 
-/** 取 realm 可用的国际版凭据；取不到时返回可读的错误文本（给模型看）。 */
+/**
+ * 取一个可用凭据。
+ *
+ * ## 🔴 只能用国际版（2026-11-05 实测，别再改了）
+ *
+ * 文件头那张表是**用池内真实账号**测出来的：
+ * 国内版（`copilot.tencent.com`）对 `agenttool/search`、`agenttool/webfetch`、
+ * `v2/images/generations` **全部返回 401**（APISIX 网关层直接拒），
+ * 这些能力只在国际版（`www.workbuddy.ai`）上开放。
+ *
+ * ⚠️ 我曾在 2026-11-09 试图加「回退国内版」：看到 `webToolCapable('cn')`
+ * 返回 true 就以为国内能搜 —— **那是误读**。该函数只判断「是否支持这条调用路径」，
+ * 不代表上游有这个权限。真跑下去就是拿国内账号去撞 401，
+ * 把一个能正常工作的搜索变成一个必然失败的搜索。
+ * ⇒ 宁可明确告诉用户「需要国际版账号」，也不要静默地换个注定失败的账号去试。
+ */
 async function credentials(env: Env): Promise<{ ok: true; uid: string; token: string } | { ok: false; reason: string }> {
-  const realm = 'global'
-  if (!mediaCapable(realm)) return { ok: false, reason: `${realm} 分片不支持这些能力` }
-  const c = await pickCredential(env, realm, WORKBUDDY_INTL.id)
+  const c = await pickCredential(env, 'global', WORKBUDDY_INTL.id)
   if (c === undefined) {
     return {
       ok: false,
-      reason: '这个网关没有可用的 WorkBuddy 国际版账号。请先在面板登录一个国际版账号再重试。',
+      reason: '这个网关没有可用的 WorkBuddy 国际版账号。'
+        + '生图、视频、联网检索、抓网页这四项能力都只有国际版支持（国内版实测 401），'
+        + '请先在面板「供应商与账号」登录一个国际版账号再重试。',
     }
   }
   return { ok: true, uid: c.uid, token: c.credential.accessToken }
@@ -269,7 +285,7 @@ async function handleOne(msg: RpcRequest, env: Env): Promise<Response | undefine
       protocolVersion: SUPPORTED_PROTOCOLS.includes(requested) ? requested : LATEST_PROTOCOL,
       capabilities: { tools: {} },
       // ⚠️ `version` 是本网关自己的版本，随 package.json 走（发布 Release 时会一起升）
-      serverInfo: { name: 'free-llm-router', version: '1.1.0' },
+      serverInfo: { name: 'free-llm-router', version: '1.1.1' },
       instructions:
         '本网关提供联网检索、网页抓取与文生图。'
         + '需要实时信息时优先用 web_search，不要凭记忆回答时效性问题。',
@@ -291,12 +307,56 @@ async function handleOne(msg: RpcRequest, env: Env): Promise<Response | undefine
     const name = typeof params.name === 'string' ? params.name : ''
     const args = (params.arguments ?? {}) as Record<string, unknown>
     if (name === '') return fail(id, RPC.invalidParams, '缺少工具名')
+
+    /**
+     * MCP 工具调用**必须进日志**（2026-11-09 补）。
+     *
+     * ## 之前为什么漏了
+     * `recordLog` 只在 `/v1/chat/completions` 等 OpenAI 兼容入口被调用，
+     * MCP 走的是 `/mcp` 这条独立链路，从来没接过日志 —— 于是面板「日志」Tab
+     * 里只有对话记录，**完全看不到 wb-router 的搜索 / 抓网页 / 生图调用**。
+     * 用户的原话是「wb router 调用什么模型我们也不知道」，根因在此。
+     *
+     * ## 记什么
+     * - `type: 'mcp'`：与对话请求区分开，面板可单独筛
+     * - `model`：工具名（web_search / web_fetch / generate_image）——
+     *   这三个不是 LLM 调用，没有模型概念，用工具名占位最能说明「调了什么」
+     * - `provider: 'wb-router'`
+     * - `durationMs` / `status` / `error`：耗时与成败
+     */
+    const startedAt = Date.now()
+    const logToolCall = async (status: number, errorText?: string): Promise<void> => {
+      try {
+        // 与 pickCredential 同一个 DO（realm=global，MCP 三项能力都走国际版）
+        const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+        recordLog(pool, {
+          type: 'mcp',
+          model: `mcp:${name}`,
+          provider: 'wb-router',
+          uid: 'mcp',
+          status,
+          durationMs: Date.now() - startedAt,
+          ...(errorText === undefined ? {} : { error: errorText.slice(0, 200) }),
+        })
+      } catch (e) {
+        // 日志失败不能影响工具本身返回
+        console.error('[mcp] 写日志失败：', e instanceof Error ? e.message : String(e))
+      }
+    }
+
     try {
-      return ok(id, await callTool(name, args, env))
+      const result = await callTool(name, args, env)
+      const failed = (result as { isError?: boolean }).isError === true
+      await logToolCall(failed ? 500 : 200, failed
+        ? ((result as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '工具返回错误')
+        : undefined)
+      return ok(id, result)
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
+      await logToolCall(500, msg)
       // 兜底：任何未预期异常都变成工具错误（不是协议错误），避免客户端整体断连
       return ok(id, {
-        content: [{ type: 'text', text: `工具执行异常：${error instanceof Error ? error.message : String(error)}` }],
+        content: [{ type: 'text', text: `工具执行异常：${msg}` }],
         isError: true,
       })
     }
