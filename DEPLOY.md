@@ -41,7 +41,7 @@ node -v   # 需要 v22.13 或更高
 ### 2. 构建
 
 ```bash
-git clone https://github.com/quancifang44556/free-llm-router.git && cd free-llm-router
+git clone https://github.com/NandaNg314/free-llm-router.git && cd free-llm-router
 npm install --legacy-peer-deps   # 必须带：wrangler 与 @cloudflare/workers-types 的 peer 版本冲突
 npm run build:node               # 产出 dist/server.mjs，已包含管理面板
 ```
@@ -260,7 +260,7 @@ Free 计划即可运行：Durable Objects 在 Free 计划下可用（SQLite 后�
 ### 1. 部署
 
 ```bash
-git clone https://github.com/quancifang44556/free-llm-router.git && cd free-llm-router
+git clone https://github.com/NandaNg314/free-llm-router.git && cd free-llm-router
 npm install --legacy-peer-deps
 
 npx wrangler login                       # 或 export CLOUDFLARE_API_TOKEN=<有 Workers 编辑权限的 token>

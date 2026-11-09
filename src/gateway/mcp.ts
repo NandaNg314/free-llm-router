@@ -268,7 +268,8 @@ async function handleOne(msg: RpcRequest, env: Env): Promise<Response | undefine
       //（回一个客户端不认识的版本会让它直接断连）
       protocolVersion: SUPPORTED_PROTOCOLS.includes(requested) ? requested : LATEST_PROTOCOL,
       capabilities: { tools: {} },
-      serverInfo: { name: 'free-llm-router', version: '1.0.0' },
+      // ⚠️ `version` 是本网关自己的版本，随 package.json 走（发布 Release 时会一起升）
+      serverInfo: { name: 'free-llm-router', version: '1.1.0' },
       instructions:
         '本网关提供联网检索、网页抓取与文生图。'
         + '需要实时信息时优先用 web_search，不要凭记忆回答时效性问题。',

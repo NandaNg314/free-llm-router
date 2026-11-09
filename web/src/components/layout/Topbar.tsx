@@ -45,12 +45,19 @@ export function Topbar({ item, onOpenNav }: { item: NavItem; onOpenNav: () => vo
             ))}
           </MenuContent>
         </Menu>
+        {/*
+          项目文档按钮指向**本仓库**（2026-11-09 修正）。
+
+          改前硬编码 `quancifang44556/free-llm-router` —— 那是上游原作者的仓库。
+          本项目已分叉并有大量自己的改动（补登卡、临期模式、面板重构等），
+          指向别人的 README 会让用户读到和实际功能对不上的文档。
+        */}
         <Button
           variant="ghost"
           size="icon-sm"
           aria-label="项目文档"
           title="项目文档"
-          onClick={() => window.open('https://github.com/quancifang44556/free-llm-router#readme', '_blank', 'noopener')}
+          onClick={() => window.open('https://github.com/NandaNg314/free-llm-router#readme', '_blank', 'noopener')}
         >
           <BookOpen />
         </Button>
