@@ -18,6 +18,7 @@ import path from 'node:path'
 
 import { request as httpRequest } from 'node:http'
 
+import { MAX_REQUEST_BYTES } from '../src/gateway/body.js'
 import { startServer } from '../src/server/index.js'
 
 const KEY = 'security-limits-key'
@@ -79,12 +80,13 @@ test('🔴 声明了超大 content-length 必须立刻 413（不能先读完再�
 
 test('🔴 不带 content-length（chunked）也必须被边读边截断', async () => {
   await withServer(async (base) => {
-    // 10 MiB 的纯字符串，用流式 body 发送 ⇒ 没有 content-length
+    // 超过 MAX_REQUEST_BYTES 的纯字符串，用流式 body 发送 ⇒ 没有 content-length
+    const totalChunks = Math.ceil((MAX_REQUEST_BYTES + 2 * 1024 * 1024) / (1024 * 1024))
     const chunk = new Uint8Array(1024 * 1024).fill(0x61)
     let sent = 0
     const stream = new ReadableStream<Uint8Array>({
       pull(controller) {
-        if (sent >= 10) {
+        if (sent >= totalChunks) {
           controller.close()
           return
         }

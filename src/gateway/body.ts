@@ -14,11 +14,23 @@
  *    边读边计数、超限立刻 `reader.cancel()` —— 不把超量字节搬进内存。
  */
 
-/** 默认上限：**8 MiB**。长上下文对话远小于此（1M token 的纯文本约 4 MB）。 */
-export const MAX_REQUEST_BYTES = 8 * 1024 * 1024
+/** 默认上限：**64 MiB**（放宽以支持超大 prompt、多图 Base64 与多模态请求，支持环境变量 MAX_REQUEST_BYTES 覆盖）。 */
+const envMaxBytes = typeof process !== 'undefined' && process.env?.MAX_REQUEST_BYTES
+  ? Number.parseInt(process.env.MAX_REQUEST_BYTES, 10)
+  : NaN
 
-/** `/admin/import` 单独放宽（要一次性导入多个账号的 auths/*.json）。 */
-export const MAX_IMPORT_BYTES = 32 * 1024 * 1024
+export const MAX_REQUEST_BYTES = Number.isFinite(envMaxBytes) && envMaxBytes > 0
+  ? envMaxBytes
+  : 64 * 1024 * 1024
+
+const envImportBytes = typeof process !== 'undefined' && process.env?.MAX_IMPORT_BYTES
+  ? Number.parseInt(process.env.MAX_IMPORT_BYTES, 10)
+  : NaN
+
+/** `/admin/import` 单独放宽（要一次性导入多个账号的 auths/*.json，默认 128 MiB）。 */
+export const MAX_IMPORT_BYTES = Number.isFinite(envImportBytes) && envImportBytes > 0
+  ? envImportBytes
+  : 128 * 1024 * 1024
 
 export class BodyTooLargeError extends Error {
   constructor(readonly limit: number, readonly observed: number) {
