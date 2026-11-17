@@ -36,6 +36,11 @@ const ZERO_COST_ACTIONS: ReadonlyArray<{ code: string; action: string }> = [
   { code: 'playbook_prompt', action: 'playbookPrompt' },
   { code: 'create_canvas', action: 'createCanvas' },
   { code: 'Hp_Appearance', action: 'hpAppearance' },
+  // 2026-11 国服新增零消耗「分享技能」（+50 积分 +5 能量，四步判据链见 actions.ts#skillShare）
+  { code: 'skill_share', action: 'skillShare' },
+  // 小程序顺序任务第 1、2 阶段（纯 HTTP 上报即可点亮，零模型配额消耗；未下发或未解锁时秒跳）
+  { code: 'Sequential_Tasks_1', action: 'sequentialTask1' },
+  { code: 'Sequential_Tasks_2', action: 'sequentialTask2' },
 ]
 
 /**
@@ -55,8 +60,8 @@ export const REAL_CHAT_ACTIONS: ReadonlyArray<{ code: string; action: string }> 
   { code: 'expert_use_douyinyin', action: 'expertUseDouyinyin' },
   { code: 'expert_use_shangjia_xuanchuan', action: 'expertUseShangjia' },
   { code: 'expert_use_bowangwang', action: 'expertUseBowangwang' },
-  // 无畏契约拼豆专家（+100，活动截止 2026-11-15；同样要真实对话）
-  { code: 'WorkBuddy_Valorant', action: 'valorantExpert' },
+  // 注：`WorkBuddy_Valorant`（无畏契约拼豆专家，+100）已于 2026-11-15 活动截止下线，
+  // 从默认执行队列移除以避免每轮白跑 2 步空跳；`actions.ts` 仍保留 `valorantExpert` 以防返场。
   { code: 'Expert_team_use_3', action: 'expertTeamUse3' },
   { code: 'skill_1', action: 'skill1' },
   { code: 'Expert_lighthouse', action: 'expertLighthouse' },

@@ -1253,17 +1253,16 @@ test('🔴 不是客户端的错就不要回 400（否则客户端以为是自�
   assert.equal(clientStatusFor(400, 'image_invalid'), 400, '图片无效是客户端该改的')
 })
 
-test('⚠️ 客户端版本号必须与仓库内实测依据一致（5.5.6）', () => {
-  // ⚠️ 原值 5.5.4 抄自 Go 侧默认值（旧值），而本仓库 `realtime.ts:222`
-  // 在**同一个端点**上写的是 5.5.6 —— 同一仓库两个版本号本身就不一致。
-  //
-  // 版本号是上游判定**渠道是否被认可**的输入之一（11128）。
+test('⚠️ 客户端版本号必须与仓库内 5.11.3 分发包依据一致，且同仓库同源无自相矛盾', () => {
+  // 国内桌面分发包升级至 5.11.3 / CLI 2.176.0（`2fa6876`），`realtime.ts` 引用同源 `DESKTOP_VERSION`。
   const src = readFileSync('src/upstream/headers.ts', 'utf8')
-  assert.ok(/export const CLIENT_VERSION = '5\.5\.6'/.test(src), 'CLIENT_VERSION 应为 5.5.6')
-  assert.ok(!/CLIENT_VERSION = '5\.5\.4'/.test(src), '不得残留旧的 5.5.4')
-  // 同仓库内保持一致
+  assert.ok(/export const CLIENT_VERSION = '5\.11\.3'/.test(src), 'CLIENT_VERSION 应为 5.11.3')
+  assert.ok(/export const CLI_VERSION = '2\.176\.0'/.test(src), 'CLI_VERSION 应为 2.176.0')
+  assert.ok(!/CLIENT_VERSION = '5\.5\.[46]'/.test(src), '不得残留旧的 5.5.4/5.5.6')
+  // 同仓库内保持同源引用，不硬编码旧版本
   const rt = readFileSync('src/upstream/realtime.ts', 'utf8')
-  assert.ok(rt.includes("'5.5.6'"), 'realtime 用的也是 5.5.6（保持一致）')
+  assert.ok(rt.includes('DESKTOP_VERSION'), 'realtime 必须引用同源 DESKTOP_VERSION')
+  assert.ok(!rt.includes("'5.5.6'"), 'realtime 不得残留硬编码的 5.5.6')
 })
 
 test('🔴 渠道拦截绝不能触发 IP 级判定（否则误报「出口 IP 被 WAF 拦截」）', () => {
@@ -1440,9 +1439,9 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
   //
   // | 项 | 国内版 CodeBuddy（`id:'buddy'`） | 国际版 WorkBuddy |
   // |---|---|---|
-  // | `userAgent` | **`CodeBuddyIDE/1.106.1`** | `WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0` |
+  // | `userAgent` | **`CodeBuddyIDE/1.106.1`** | `WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0` |
   // | `attributionName`（三个归属头共用） | **`CodeBuddy`** | `WorkBuddy` |
-  // | `clientVersion` | **`1.106.1`** | `5.8.4` |
+  // | `clientVersion` | **`1.106.1`** | `5.9.4` |
   // | `apiDomain` | `copilot.tencent.com` | `www.workbuddy.ai` |
   // | `productCode` | `codebuddy` | `SaaS`（改发 `X-Product`） |
   const dom = referenceChatHeaders({ uid: 'u', accessToken: 'tok', variant: 'buddy' })
@@ -1450,16 +1449,16 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
 
   // ⚠️ UA 是完全不同的格式（国内版不含 `WorkBuddy`）
   assert.equal(dom['User-Agent'], 'CodeBuddyIDE/1.106.1', '国内版 UA 必须是 IDE 形态')
-  // 国际服 2026-10-20 起改为「桌面端 5.8.4 + 会话头族」身份（BRIEF 实测 200）。
+  // 国际服对齐 5.9.4 国际分发包（CLI/2.165.0）+ 会话头族身份。
   // UA 中段是**小写** `workbuddy-ai`，不是旧的 `WorkBuddy AI` —— 旧值一律回 11-128。
   assert.equal(
-    intl['User-Agent'], 'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0',
-    '国际版 UA 必须逐字对齐 5.8.4 桌面端抓包（含小写 workbuddy-ai）',
+    intl['User-Agent'], 'WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0',
+    '国际版 UA 必须逐字对齐 5.9.4 桌面端分发包（含小写 workbuddy-ai 与 CLI/2.165.0）',
   )
   // ⚠️ UA 里的版本号必须与 X-IDE-Version 一致 —— 同一请求里两个版本号
   // 正是「渠道指纹」最容易露馅的地方。
-  assert.equal(intl['X-IDE-Version'], '5.8.4')
-  assert.ok(intl['User-Agent']?.includes('5.8.4'), 'UA 与 X-IDE-Version 必须同版本')
+  assert.equal(intl['X-IDE-Version'], '5.9.4')
+  assert.ok(intl['User-Agent']?.includes('5.9.4'), 'UA 与 X-IDE-Version 必须同版本')
 
   // ⚠️ 归属三头在国内版是 `CodeBuddy`
   assert.equal(dom['X-IDE-Name'], 'CodeBuddy', '国内版归属名是 CodeBuddy')
@@ -1469,7 +1468,7 @@ test('🔴 国内版与国际版的 chat 头必须是**两套不同取值**（�
 
   // ⚠️ 版本号不同
   assert.equal(dom['X-IDE-Version'], '1.106.1', '国内版版本是 1.106.1')
-  assert.equal(intl['X-IDE-Version'], '5.8.4', '国际版版本是 5.8.4')
+  assert.equal(intl['X-IDE-Version'], '5.9.4', '国际版版本是 5.9.4')
 
   // X-Domain 必须与端点一致
   assert.equal(dom['X-Domain'], 'copilot.tencent.com')

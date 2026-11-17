@@ -1,4 +1,4 @@
-import { CalendarClock, Copy, Eye, EyeOff, Gauge, Lock, Route, ShieldAlert, ShieldCheck, ShieldCog, Snowflake, Terminal } from 'lucide-react'
+import { CalendarClock, Copy, Eye, EyeOff, Gauge, Globe, Lock, Route, ShieldAlert, ShieldCheck, ShieldCog, Snowflake, Terminal } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { Badge } from '@/components/ui/badge'
@@ -14,10 +14,12 @@ import {
   type Strategy,
   useClearCooldowns,
   useClearWaf,
+  useCorsConfig,
   useCredentialCount,
   usePermanentLocks,
   useRoutingConfig,
   useSafetyConfig,
+  useSaveCorsConfig,
   useSaveRouting,
   useSaveSafety,
   useSetPermanentLock,
@@ -49,6 +51,7 @@ export function ConfigPage() {
         </div>
         <div className="min-w-0 space-y-4 xl:col-span-2">
           <StatusCard />
+          <CorsCard />
           <LocksCard />
         </div>
       </div>
@@ -82,19 +85,30 @@ function Head({ icon, title, desc, action }: { icon: ReactNode; title: string; d
 
 // ── 接入指南 ──
 
-type Snippet = 'curl' | 'python' | 'env' | 'dsh'
+type Snippet = 'curl' | 'claude' | 'python' | 'env' | 'dsh'
 
 function ConnectCard() {
   const [show, setShow] = useState(false)
   const [snippet, setSnippet] = useState<Snippet>('curl')
   const key = auth.get()
   const masked = key.length > 16 ? `${key.slice(0, 4)}${'•'.repeat(12)}${key.slice(-4)}` : '•'.repeat(Math.max(key.length, 8))
-  const base = `${location.origin}/v1`
+  const origin = location.origin
+  const base = `${origin}/v1`
   // 只有切到 DSH 片段才拉目录（/v1/models 要逐家问上游，配置页本身不需要它）
   const catalog = useModelCatalog(snippet === 'dsh')
   const code = useMemo(() => {
     const k = show ? key : 'YOUR_API_KEY'
     if (snippet === 'dsh') return dshSnippet(base, k, catalog.data?.models ?? [])
+    if (snippet === 'claude')
+      return `export ANTHROPIC_BASE_URL="${origin}"
+export ANTHROPIC_API_KEY="${k}"
+
+# 也可直调原生 Anthropic Messages API（兼容 x-api-key 与 Bearer）：
+curl ${base}/messages \\
+  -H "x-api-key: ${k}" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -H "content-type: application/json" \\
+  -d '{"model":"aggregate/auto","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'`
     if (snippet === 'curl')
       return `curl ${base}/chat/completions \\
   -H "Authorization: Bearer ${k}" \\
@@ -110,12 +124,18 @@ r = client.chat.completions.create(
 )
 print(r.choices[0].message.content)`
     return `OPENAI_BASE_URL=${base}
-OPENAI_API_KEY=${k}`
-  }, [snippet, show, key, base, catalog.data])
+OPENAI_API_KEY=${k}
+ANTHROPIC_BASE_URL=${origin}
+ANTHROPIC_API_KEY=${k}`
+  }, [snippet, show, key, base, origin, catalog.data])
 
   return (
     <Card>
-      <Head icon={<Terminal />} title="接入指南" desc="任何支持 OpenAI 接口的客户端都能直接用：/v1/models、/v1/chat/completions、/v1/responses。" />
+      <Head
+        icon={<Terminal />}
+        title="接入指南"
+        desc="兼容 OpenAI 与 Anthropic 双协议：/v1/models、/v1/chat/completions、/v1/responses、/v1/messages（含 count_tokens），并支持 /v1/images/*、/v1/videos/*、/v1/3d/* 与 /mcp。"
+      />
       <div className="space-y-3 px-5 pb-5">
         <Field label="Base URL" value={base} onCopy={() => copyText(base, '已复制 Base URL')} />
         <Field
@@ -131,19 +151,20 @@ OPENAI_API_KEY=${k}`
           hint="主密钥能登录控制台，给客户端用更推荐在「API Key」页签发子密钥。"
         />
         <div className="pt-1">
-          <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
             <Segmented<Snippet>
               value={snippet}
               onChange={setSnippet}
               className="h-8 [&_button]:h-6 [&_button]:text-xs"
               options={[
                 { value: 'curl', label: 'cURL' },
+                { value: 'claude', label: 'Claude' },
                 { value: 'python', label: 'Python' },
                 { value: 'env', label: '环境变量' },
                 { value: 'dsh', label: 'DSH' },
               ]}
             />
-            <Button variant="ghost" size="sm" onClick={() => copyText(code.replace('YOUR_API_KEY', key), '已复制（含真实密钥）')}>
+            <Button variant="ghost" size="sm" onClick={() => copyText(code.replaceAll('YOUR_API_KEY', key), '已复制（含真实密钥）')}>
               <Copy /> 复制
             </Button>
           </div>
@@ -157,12 +178,24 @@ OPENAI_API_KEY=${k}`
             </p>
           )}
         </div>
-        <ul className="text-muted-foreground space-y-1.5 pt-1 text-[12.5px] leading-relaxed">
+        <ul className="text-muted-foreground space-y-1.5 pt-1 text-[12.5px] leading-relaxed break-words">
           <li>
             <span className="text-foreground font-medium">模型怎么填：</span>
             <code className="font-mono">aggregate/auto</code> 自动挑可用的模型；
             <code className="font-mono">aggregate/&lt;模型&gt;</code> 在所有家里找同一个模型；
             <code className="font-mono">&lt;供应商&gt;/&lt;模型&gt;</code> 只走这一家。完整列表见「模型」页。
+          </li>
+          <li>
+            <span className="text-foreground font-medium">双协议鉴权：</span>
+            <span>数据面同时接受 Bearer 与 x-api-key 请求头（主密钥与子密钥均支持）。</span>
+          </li>
+          <li>
+            <span className="text-foreground font-medium">媒体与 3D 端点：</span>
+            <code className="font-mono">/v1/images/generations</code>、
+            <code className="font-mono">/v1/videos/generations</code>、
+            <code className="font-mono">/v1/3d/generations</code>、
+            <code className="font-mono">/v1/3d/tasks</code>、
+            <code className="font-mono">/mcp</code>。
           </li>
           <li>
             <span className="text-foreground font-medium">临时指定账号：</span>
@@ -312,6 +345,12 @@ function RoutingCard() {
               desc="定时检查快过期的登录凭据并自动刷新，避免账号突然掉线。"
               checked={form.autoRefreshCredential}
               onChange={(v) => set('autoRefreshCredential', v)}
+            />
+            <ToggleRow
+              title="流式截断自动续写与悬停救援"
+              desc="当长回答因上限截断（finish_reason=length）或 Agent 停在预告句未执行工具时，自动无缝续写并通过 SSE 心跳保活（也可设环境变量 AUTO_CONTINUATION=true）。"
+              checked={form.autoContinuation === true}
+              onChange={(v) => set('autoContinuation', v)}
             />
           </div>
         </div>
@@ -650,6 +689,83 @@ function Row({ icon, title, desc, action }: { icon: ReactNode; title: string; de
       </div>
       {action}
     </div>
+  )
+}
+
+// ── 数据面 CORS ──
+
+function CorsCard() {
+  const q = useCorsConfig()
+  const save = useSaveCorsConfig()
+  const [enabled, setEnabled] = useState(false)
+  const [originsText, setOriginsText] = useState('')
+
+  useEffect(() => {
+    if (q.data) {
+      setEnabled(q.data.enabled)
+      setOriginsText(q.data.origins.join(', '))
+    }
+  }, [q.data])
+
+  const baselineOrigins = q.data?.origins.join(', ') ?? ''
+  const dirty = !!q.data && (enabled !== q.data.enabled || originsText.trim() !== baselineOrigins.trim())
+
+  return (
+    <Card>
+      <Head
+        icon={<Globe />}
+        title="数据面跨域（CORS）"
+        desc="控制浏览器端应用直调 /v1/* 与 /mcp 的跨域白名单（也可设环境变量 CORS_ORIGINS）。管理接口 /admin/* 始终禁止跨域。"
+        action={
+          q.data && dirty ? (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={save.isPending}
+              onClick={() => save.mutate({ enabled, origins: originsText })}
+            >
+              {save.isPending ? '保存中…' : '保存'}
+            </Button>
+          ) : undefined
+        }
+      />
+      <div className="space-y-3 px-5 pb-5">
+        {!q.data ? (
+          <Skeleton className="h-20" />
+        ) : (
+          <>
+            <div className="flex items-center justify-between gap-3 rounded-lg border px-3.5 py-2.5">
+              <div className="min-w-0 flex-1">
+                <div className="text-[13px] font-medium">启用跨域放行</div>
+                <div className="text-muted-foreground text-xs">
+                  {q.data.source === 'runtime' ? '当前使用面板覆盖值' : '当前跟随环境变量 CORS_ORIGINS'}
+                </div>
+              </div>
+              <Switch label="启用跨域放行" checked={enabled} onCheckedChange={setEnabled} />
+            </div>
+            <div>
+              <div className="text-muted-foreground mb-1 text-xs">允许来源（逗号分隔，填 * 允许任意来源）</div>
+              <Input
+                value={originsText}
+                onChange={(e) => setOriginsText(e.target.value)}
+                placeholder="例如：https://app.example.com, http://localhost:3000 或 *"
+                className="font-mono text-[12.5px]"
+              />
+            </div>
+            {q.data.source === 'runtime' && (
+              <button
+                type="button"
+                className="text-muted-foreground hover:text-foreground cursor-pointer text-xs underline decoration-dotted"
+                disabled={save.isPending}
+                onClick={() => save.mutate({ resetToEnv: true })}
+              >
+                恢复跟随环境变量（{q.data.envOrigins.length ? q.data.envOrigins.join(', ') : '默认关闭'}）
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    </Card>
   )
 }
 

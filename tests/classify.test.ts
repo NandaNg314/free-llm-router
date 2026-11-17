@@ -17,7 +17,23 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { classify, isWafBlocked, mapErrorToPunishment, parseEnvelope, shouldPunish, shouldRotate, CHANNEL_BLOCKED_CODE } from '../src/upstream/client.ts'
+import {
+  classify,
+  isAccountRestriction,
+  isProviderOverloaded,
+  isRestricted,
+  isUpstreamQueueBusy,
+  isWafBlocked,
+  isWebConversationLimit,
+  mapErrorToPunishment,
+  parseEnvelope,
+  parseQueueRetryAfterSec,
+  shouldPunish,
+  shouldRotate,
+  upstreamBusyHint,
+  UpstreamError,
+  CHANNEL_BLOCKED_CODE,
+} from '../src/upstream/client.ts'
 import { refineModelScoped } from '../src/gateway/server.js'
 
 /** 真实抓到的 401 HTML（APISIX / openresty）。 */
@@ -351,4 +367,113 @@ test('🔴 shouldPunish/shouldRotate 必须与活判据同源（不得再漂）'
   }
   // 钉住那个曾经漂掉的具体结论
   assert.equal(shouldPunish('channel_blocked'), false, '渠道指纹被拒不得罚账号')
+})
+
+test('🔴 11129 与工具参数错误各种外壳均归 bad_request：绝不罚号、绝不换号、绝不喂熔断（615dc75）', () => {
+  const bodies = [
+    '{"code":11129,"msg":"invalid function call parameters"}',
+    'invalid function call parameters',
+    '{"extError":{"code":"invalid_function_parameters"}}',
+    'Unmarshal chat params failed with error: unexpected EOF',
+  ]
+  for (const body of bodies) {
+    for (const status of [400, 500, 502]) {
+      const r = classify(status, body)
+      assert.equal(r.kind, 'bad_request', `status=${status} body=${body}`)
+      assert.equal(shouldPunish(r.kind), false)
+      assert.equal(shouldRotate(r.kind), false)
+      assert.notEqual(mapErrorToPunishment(r.kind).dimension, 'breaker')
+    }
+  }
+})
+
+test('🔴 6020/6021（渠道排队）与 11134（供应商过载）：分类、等待秒数与文案严格区分（b957e32 / c06cd51）', () => {
+  const queueWaiting =
+    '{"code":6020,"msg":"queue.waiting.title","requestId":"rid-q","data":{"queue_position":3133,"queue_size":"999+","retry_after":40}}'
+  const queueFull = '{"code":6021,"msg":"queue.full.title"}'
+  const overloaded = '{"code":11134,"msg":"","retry_policy":{"retry":true,"retry_after":25}}'
+
+  for (const status of [200, 429, 503]) {
+    assert.equal(classify(status, queueWaiting).kind, 'rate_limited')
+    assert.equal(classify(status, queueFull).kind, 'rate_limited')
+    assert.equal(classify(status, overloaded).kind, 'rate_limited')
+  }
+
+  assert.equal(isUpstreamQueueBusy(queueWaiting), true)
+  assert.equal(isUpstreamQueueBusy(queueFull), true)
+  assert.equal(isUpstreamQueueBusy('{"code":10001,"requestId":"r-6020-x"}'), false, 'requestId 含 6020 不得误判')
+  assert.equal(isProviderOverloaded(overloaded), true)
+  assert.equal(isProviderOverloaded(queueWaiting), false)
+
+  assert.equal(parseQueueRetryAfterSec(queueWaiting), 40)
+  assert.equal(parseQueueRetryAfterSec(overloaded), 25)
+  assert.equal(parseQueueRetryAfterSec('{"code":6020,"data":{"retry_after":9999}}'), 600, '异常大值封顶 600 秒')
+  assert.equal(parseQueueRetryAfterSec(queueFull), undefined)
+
+  // 11134 提示必须说供应商过载与换模型，绝不能说 queue is full
+  const hint11134 = upstreamBusyHint(overloaded) ?? ''
+  assert.ok(hint11134.includes('overloaded'), hint11134)
+  assert.ok(!hint11134.includes('queue'), `11134 不得误导为队列满：${hint11134}`)
+  const c11134 = classify(500, overloaded)
+  assert.ok(c11134.msg.includes('overloaded') && !c11134.msg.includes('queue'), c11134.msg)
+
+  const hint6021 = upstreamBusyHint(queueFull) ?? ''
+  assert.ok(hint6021.includes('queue is full'), hint6021)
+})
+
+test('🔴 10105 活跃会话上限必须按结构化业务码判定，严禁子串误匹配（1e1ee4d）', () => {
+  assert.equal(isWebConversationLimit(429, '{"code":10105,"msg":"maximum number of active conversations"}'), true)
+  assert.equal(isWebConversationLimit(200, '{"code":10105,"msg":"limit"}'), true)
+  assert.equal(
+    isWebConversationLimit(new UpstreamError({ kind: 'rate_limited', httpStatus: 429, code: 10105, message: 'x', detail: '{}' })),
+    true,
+  )
+
+  // 反例：requestId、其他业务码文案、非 JSON 文本或空值绝不误判
+  assert.equal(isWebConversationLimit(500, '{"code":10001,"msg":"boom","requestId":"r-10105-x"}'), false)
+  assert.equal(isWebConversationLimit(429, '{"code":6004,"msg":"see 10105"}'), false)
+  assert.equal(isWebConversationLimit(502, 'bad gateway 10105'), false)
+  assert.equal(isWebConversationLimit(null), false)
+  assert.equal(isWebConversationLimit(undefined), false)
+})
+
+test('🔴 11140 细分判据：剔除泛化「已被限制」，区分限流/模型限制/账号风控连坐（c06cd51）', () => {
+  // 真正的账号风控文书：code 11140 + 账号专属措辞
+  const zhRestrict = '{"code":11140,"msg":"账号存在异常行为，已被限制使用"}'
+  const enRestrict = '{"code": 11140, "msg":"Your account is restricted due to Unusual Activity"}'
+  const strRestrict = '{"code":"11140","msg":"账号存在异常行为"}'
+  const sseFrameRestrict = 'data: {"error":{"code":11140,"message":"账号存在异常行为，已被限制使用"}}'
+  for (const b of [zhRestrict, enRestrict, strRestrict, sseFrameRestrict]) {
+    assert.equal(isRestricted(b), true, b)
+    assert.equal(isAccountRestriction(b), true, b)
+    assert.equal(classify(403, b).kind, 'request_illegal', b)
+  }
+
+  // request illegal 形态：isRestricted=false，但 isAccountRestriction=true（仅限 code 11140）
+  const reqIllegal = '{"code":11140,"msg":"request illegal"}'
+  assert.equal(isRestricted(reqIllegal), false)
+  assert.equal(isAccountRestriction(reqIllegal), true)
+  assert.equal(classify(403, reqIllegal).kind, 'request_illegal')
+
+  // 非 11140 的 request illegal 或风控文本：绝不算 11140 账号风控限制
+  assert.equal(isAccountRestriction('{"code":"11-128","msg":"request illegal"}'), false)
+  assert.equal(isAccountRestriction('{"code":10001,"msg":"request illegal"}'), false)
+  assert.equal(isAccountRestriction('{"msg":"request illegal"}'), false)
+  assert.equal(isRestricted('{"code":50400,"msg":"账号存在异常行为"}'), false)
+  assert.equal(isRestricted('账号存在异常行为，已被限制使用'), false)
+
+  // 同 code 11140 下的非账号封禁变体：不得误判成账号终态或区域连坐
+  const modelRestricted = '{"code":11140,"msg":"该模型已被限制使用，请稍后再试"}'
+  assert.equal(isRestricted(modelRestricted), false, '泛化「已被限制」不得把模型限制判成账号风控')
+  assert.equal(isAccountRestriction(modelRestricted), false)
+  assert.equal(classify(403, modelRestricted).kind, 'model_denied')
+
+  const providerRate = '{"code":11140,"msg":"The model provider is rate-limiting requests."}'
+  assert.equal(isRestricted(providerRate), false)
+  assert.equal(isAccountRestriction(providerRate), false)
+  assert.equal(classify(429, providerRate).kind, 'rate_limited')
+
+  const safetyBlocked = '{"code":11140,"msg":"content failed safety review"}'
+  assert.equal(isAccountRestriction(safetyBlocked), false)
+  assert.equal(classify(400, safetyBlocked).kind, 'bad_request')
 })

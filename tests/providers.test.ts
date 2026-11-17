@@ -2312,7 +2312,11 @@ test('Gemini 能力声明：login=false 必须给出可读原因，checkin=false
   assert.ok((geminiProvider.capabilities.checkinBlockedReason ?? '').length > 10)
   // ⚠️ 刻意不声明裸字符串判别式：Gemini 凭据只有 JSON 对象形态，
   // 声明一个宽松的裸串匹配只会把任意文本吞成必然失败的账号。
-  assert.equal(geminiProvider.bareStringPattern, undefined)
+  assert.ok(geminiProvider.bareStringPattern instanceof RegExp)
+  assert.equal(geminiProvider.bareStringPattern.test('AIzaSyD1234567890abcdefghijklmnop'), true)
+  assert.equal(geminiProvider.bareStringPattern.test('gemini:AIzaSyD1234567890abcdefghijklmnop'), true)
+  assert.equal(geminiProvider.bareStringPattern.test('ya29.bare-token'), false)
+  assert.equal(geminiProvider.bareStringPattern.test('str'), false)
 
   // ── 模型目录：裸名 + 四个档位变体（**必须带后缀**，它是上游准入钥匙）──
   const models = await listModels(
@@ -2635,4 +2639,381 @@ test('🔴 template_5 事件组必须带 chat 链（缺链上游不计分）', (
     .replace(/\/\/.*$/gm, '')
   assert.ok(!/wb2api-template-/.test(actions), '⚠️ 不得使用编造的模板 id')
   assert.ok(/\['1', '深度研究'\]/.test(actions), '⚠️ 必须用真实模板名')
+})
+
+test('Gemini 官方 API Key 通道：与 OAuth 双形态并存、拉取模型剥前缀、图片与工具流式/非流式及 400 坏 Key 换号', async () => {
+  const {
+    GEMINI_API_KEY_BASE_URL,
+    bodyIndicatesGeminiBadKey,
+    geminiProvider,
+    isGeminiApiKeyCredential,
+  } = await import('../src/providers/gemini.ts')
+  const { parseCredentialAnywhere } = await import('../src/providers/index.ts')
+  const { ProviderError } = await import('../src/providers/types.ts')
+
+  const rawKey = 'AIzaSyD1234567890abcdefghijklmnopQRSTUV'
+  // ① 裸字符串（含 gemini: 前缀与裸 AIzaSy...）自动识别为 gemini 官方 API Key 形态
+  const parsedPrefixed = parseCredentialAnywhere(`gemini:${rawKey}`)
+  assert.equal(parsedPrefixed.provider.id, 'gemini')
+  assert.equal(parsedPrefixed.credential.accessToken, rawKey)
+  assert.equal(isGeminiApiKeyCredential(parsedPrefixed.credential), true)
+
+  const parsedBare = parseCredentialAnywhere(rawKey)
+  assert.equal(parsedBare.provider.id, 'gemini')
+  assert.equal(parsedBare.credential.uid, parsedPrefixed.credential.uid, '同一枚 Key 的 uid 必须稳定一致')
+  assert.ok(!parsedBare.credential.uid.includes(rawKey), 'uid 不得泄漏明文 API Key')
+
+  // JSON 对象形态 { apiKey: "AIzaSy..." }
+  const parsedObj = parseCredentialAnywhere({ apiKey: rawKey, nickname: 'Studio-1' })
+  assert.equal(parsedObj.provider.id, 'gemini')
+  assert.equal(parsedObj.credential.nickname, 'Studio-1')
+  assert.equal(isGeminiApiKeyCredential(parsedObj.credential), true)
+
+  // OAuth Cloud Code 形态仍走原 OAuth 通道，绝不被误判成 API Key
+  const parsedOAuth = parseCredentialAnywhere({
+    access_token: 'ya29.a0AfH6SMBx',
+    cloudaicompanionProject: 'my-gcp-proj',
+  })
+  assert.equal(parsedOAuth.provider.id, 'gemini')
+  assert.equal(isGeminiApiKeyCredential(parsedOAuth.credential), false)
+
+  // ② Mock fetch 验证官方端点 listModels 与 chat（含图片与工具调用）
+  const origFetch = globalThis.fetch
+  const seenRequests: Array<{ url: string; auth: string | null; body?: Record<string, unknown> }> = []
+  try {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      const headers = new Headers(init?.headers)
+      const bodyStr = typeof init?.body === 'string' ? init.body : undefined
+      seenRequests.push({
+        url,
+        auth: headers.get('Authorization'),
+        ...(bodyStr !== undefined ? { body: JSON.parse(bodyStr) as Record<string, unknown> } : {}),
+      })
+
+      if (url === `${GEMINI_API_KEY_BASE_URL}/models`) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              { id: 'models/gemini-2.5-flash', display_name: 'Gemini 2.5 Flash' },
+              { id: 'models/gemini-2.5-pro', display_name: 'Gemini 2.5 Pro' },
+              { id: 'models/text-embedding-004', display_name: 'Embedding' },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+
+      if (url === `${GEMINI_API_KEY_BASE_URL}/chat/completions`) {
+        const reqObj = bodyStr ? (JSON.parse(bodyStr) as Record<string, unknown>) : {}
+        if (reqObj.model === 'bad-key-trigger') {
+          return new Response(
+            JSON.stringify({
+              error: { code: 400, message: 'API key not valid. Please pass a valid API key.', status: 'INVALID_ARGUMENT' },
+            }),
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        if (reqObj.model === 'bad-param-trigger') {
+          return new Response(
+            JSON.stringify({
+              error: { code: 400, message: 'Invalid JSON payload received.', status: 'INVALID_ARGUMENT' },
+            }),
+            { status: 400, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        if (reqObj.model === 'json-mode-trigger') {
+          return new Response(
+            JSON.stringify({
+              id: 'chatcmpl-gemini-json',
+              object: 'chat.completion',
+              model: 'models/gemini-2.5-flash',
+              choices: [
+                {
+                  index: 0,
+                  message: {
+                    role: 'assistant',
+                    content: '图里是一只猫',
+                    tool_calls: [
+                      {
+                        id: 'call_1',
+                        type: 'function',
+                        function: { name: 'tag_image', arguments: '{"animal":"cat"}' },
+                      },
+                    ],
+                  },
+                  finish_reason: 'tool_calls',
+                },
+              ],
+              usage: { prompt_tokens: 18, completion_tokens: 7, total_tokens: 25 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+
+        const sse = [
+          'data: {"id":"chatcmpl-g1","object":"chat.completion.chunk","model":"gemini-2.5-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"你好，官方通道"},"finish_reason":null}]}',
+          'data: {"id":"chatcmpl-g1","object":"chat.completion.chunk","model":"gemini-2.5-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}',
+          'data: [DONE]',
+          '',
+        ].join('\n\n')
+        return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      return new Response('not found', { status: 404 })
+    }) as typeof fetch
+
+    const models = await geminiProvider.listModels(parsedPrefixed.credential, AbortSignal.timeout(3000))
+    assert.deepEqual(
+      models.map((m) => m.id),
+      ['gemini-2.5-flash', 'gemini-2.5-pro'],
+      '必须剥除 models/ 前缀并过滤非对话 embedding 模型',
+    )
+    assert.equal(seenRequests[0]?.auth, `Bearer ${rawKey}`)
+
+    // 流式对话 + 图片输入 + 扁平工具归一
+    const chatRes = await geminiProvider.chat(parsedPrefixed.credential, {
+      model: 'models/gemini-2.5-flash',
+      body: {
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: '看图并调用工具' },
+              { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+            ],
+          },
+        ],
+        tools: [{ name: 'tag_image', description: '标注图片', parameters: { type: 'object' } }],
+      },
+      signal: AbortSignal.timeout(3000),
+    })
+    const sseText = await chatRes.text()
+    assert.match(sseText, /你好，官方通道/)
+    assert.ok(sseText.endsWith('data: [DONE]\n\n') || sseText.includes('data: [DONE]'))
+    const sentChat = seenRequests[1]?.body
+    assert.equal(sentChat?.['model'], 'gemini-2.5-flash')
+    assert.equal(sentChat?.['stream'], true)
+    assert.deepEqual(sentChat?.['tools'], [
+      { type: 'function', function: { name: 'tag_image', description: '标注图片', parameters: { type: 'object' } } },
+    ])
+
+    // 非流式 JSON 上游响应自动适配为统一 SSE（含 tool_calls 与 usage）
+    const jsonRes = await geminiProvider.chat(parsedPrefixed.credential, {
+      model: 'json-mode-trigger',
+      body: { messages: [{ role: 'user', content: 'test' }], stream: false },
+      signal: AbortSignal.timeout(3000),
+    })
+    const adaptedSse = await jsonRes.text()
+    assert.match(adaptedSse, /图里是一只猫/)
+    assert.match(adaptedSse, /"name":"tag_image"/)
+    assert.match(adaptedSse, /"total_tokens":25/)
+
+    // 400 坏 Key 可换号，400 参数错误不可换号
+    assert.equal(bodyIndicatesGeminiBadKey('API key not valid. Please pass a valid API key.'), true)
+    assert.equal(geminiProvider.shouldRotate?.(400, 'API_KEY_INVALID'), true)
+    assert.equal(geminiProvider.shouldRotate?.(400, 'Invalid JSON payload'), false)
+
+    await assert.rejects(
+      () =>
+        geminiProvider.chat(parsedPrefixed.credential, {
+          model: 'bad-key-trigger',
+          body: { messages: [{ role: 'user', content: 'hi' }] },
+          signal: AbortSignal.timeout(3000),
+        }),
+      (err: unknown) => err instanceof ProviderError && err.httpStatus === 400 && err.retryable === true,
+    )
+    await assert.rejects(
+      () =>
+        geminiProvider.chat(parsedPrefixed.credential, {
+          model: 'bad-param-trigger',
+          body: { messages: [{ role: 'user', content: 'hi' }] },
+          signal: AbortSignal.timeout(3000),
+        }),
+      (err: unknown) => err instanceof ProviderError && err.httpStatus === 400 && err.retryable === false,
+    )
+  } finally {
+    globalThis.fetch = origFetch
+  }
+})
+
+test('ModelScope（魔搭）供应商：注册在 PROVIDERS 末尾、双形态凭据导入、僵尸模型过滤、流式推理与规范名归并', async () => {
+  const {
+    MODELSCOPE_BALANCE_URL,
+    MODELSCOPE_BASE_URL,
+    modelscopeProvider,
+  } = await import('../src/providers/modelscope.ts')
+  const { DEFAULT_PROVIDER, PROVIDERS, getBuiltinModels, parseCredentialAnywhere } = await import(
+    '../src/providers/index.ts'
+  )
+  const { canonicalKeyFor } = await import('../src/providers/canonical-models.ts')
+
+  // ① 注册表纪律：第 0 项严禁被改动，ModelScope 置于尾部区间（保持 meoo.test.ts 末位断言兼容）
+  assert.equal(PROVIDERS[0]?.id, 'buddy')
+  assert.equal(DEFAULT_PROVIDER, 'buddy')
+  assert.equal(PROVIDERS[PROVIDERS.length - 2]?.id, 'modelscope')
+  assert.equal(PROVIDERS[PROVIDERS.length - 1]?.id, 'meoo')
+
+  // ② 凭据导入：支持裸 ms-... 与 { provider: "modelscope", accessToken: "..." }，且不抢普通 { accessToken, uid }
+  const msToken = 'ms-12345678-abcd-efgh-ijkl-9876543210ab'
+  const fromBare = parseCredentialAnywhere(msToken)
+  assert.equal(fromBare.provider.id, 'modelscope')
+  assert.equal(fromBare.credential.accessToken, msToken)
+  assert.ok(fromBare.credential.uid.startsWith('ms-'))
+  assert.ok(!fromBare.credential.uid.includes(msToken))
+
+  const fromObj = parseCredentialAnywhere({
+    provider: 'modelscope',
+    accessToken: 'custom-sdk-token-value',
+    nickname: '魔搭二号',
+  })
+  assert.equal(fromObj.provider.id, 'modelscope')
+  assert.equal(fromObj.credential.nickname, '魔搭二号')
+
+  const buddyFallback = parseCredentialAnywhere({ accessToken: 'eyJhbGciOiJIUzI1NiJ9.x.y', uid: 'wb-u1' })
+  assert.equal(buddyFallback.provider.id, 'buddy', '通用 { accessToken, uid } 绝不能被 modelscope 抢走')
+
+  // ③ 内置模型目录与规范名归并（让 aggregate/* 自动纳入魔搭）
+  const builtins = getBuiltinModels().filter((m) => m.provider === 'modelscope')
+  assert.ok(builtins.length >= 5)
+  assert.deepEqual(
+    canonicalKeyFor('modelscope', 'deepseek-ai/DeepSeek-V4.1-Flash-1017', 'DeepSeek-V4.1-Flash'),
+    { key: 'deepseek-v4-1-flash', via: 'patch' },
+  )
+  assert.deepEqual(
+    canonicalKeyFor('modelscope', 'deepseek-ai/DeepSeek-V4-Pro-0813', 'DeepSeek-V4-Pro'),
+    { key: 'deepseek-v4-pro', via: 'patch' },
+  )
+  assert.deepEqual(
+    canonicalKeyFor('modelscope', 'ZhipuAI/GLM-5.3-Flash', 'GLM-5.3-Flash'),
+    { key: 'glm-5-3-flash', via: 'id' },
+  )
+
+  // ④ Mock fetch 验证 /models（过滤已下线僵尸 ID）、/chat/completions（含 reasoning_content 与 tool_calls）及余额
+  const origFetch = globalThis.fetch
+  try {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      if (url === `${MODELSCOPE_BASE_URL}/models`) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              // 僵尸模型（必须被过滤）
+              { id: 'deepseek-ai/DeepSeek-V4.1-Flash' },
+              { id: 'deepseek-ai/DeepSeek-V4-Pro' },
+              // 在役模型
+              { id: 'deepseek-ai/DeepSeek-V4.1-Flash-1017' },
+              { id: 'ZhipuAI/GLM-5.3-Flash' },
+              { id: 'Qwen/Qwen3.5-VL-72B-Instruct' },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      if (url === `${MODELSCOPE_BASE_URL}/chat/completions`) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+        if (body['model'] === 'err-200-bad-param') {
+          return new Response(
+            JSON.stringify({
+              error: { message: 'Invalid tool parameters schema: expected object', type: 'invalid_request_error' },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        if (body['model'] === 'err-200-quota') {
+          return new Response(
+            JSON.stringify({
+              errors: { message: 'Request rate limit exceeded, daily quota_exceeded' },
+              code: 429,
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        if (body['model'] === 'err-200-bad-key') {
+          return new Response(
+            JSON.stringify({
+              success: false,
+              message: 'Invalid API key or token expired',
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        assert.equal(body['stream'], true)
+        assert.deepEqual(body['stream_options'], { include_usage: true })
+        const sse = [
+          'data: {"id":"chatcmpl-ms1","object":"chat.completion.chunk","model":"deepseek-ai/DeepSeek-V4.1-Flash-1017","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"先思考一步"},"finish_reason":null}]}',
+          'data: {"id":"chatcmpl-ms1","object":"chat.completion.chunk","model":"deepseek-ai/DeepSeek-V4.1-Flash-1017","choices":[{"index":0,"delta":{"content":"魔搭回复","tool_calls":[{"index":0,"id":"call_ms","type":"function","function":{"name":"lookup","arguments":"{\\"q\\":\\"ok\\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20}}',
+          'data: [DONE]',
+          '',
+        ].join('\n\n')
+        return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      if (url === MODELSCOPE_BALANCE_URL) {
+        return new Response(
+          JSON.stringify({ success: true, data: { total_balance: 188, expiring_balance: 20 } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      return new Response('not found', { status: 404 })
+    }) as typeof fetch
+
+    const models = await modelscopeProvider.listModels(fromBare.credential, AbortSignal.timeout(3000))
+    const ids = models.map((m) => m.id)
+    assert.deepEqual(ids, [
+      'deepseek-ai/DeepSeek-V4.1-Flash-1017',
+      'ZhipuAI/GLM-5.3-Flash',
+      'Qwen/Qwen3.5-VL-72B-Instruct',
+    ])
+    assert.equal(models.find((m) => m.id === 'Qwen/Qwen3.5-VL-72B-Instruct')?.supportsImage, true)
+
+    const chatRes = await modelscopeProvider.chat(fromBare.credential, {
+      model: 'deepseek-ai/DeepSeek-V4.1-Flash-1017',
+      body: {
+        messages: [{ role: 'user', content: '你好' }],
+        tools: [{ name: 'lookup', parameters: { type: 'object' } }],
+      },
+      signal: AbortSignal.timeout(3000),
+    })
+    const sseOut = await chatRes.text()
+    assert.match(sseOut, /先思考一步/)
+    assert.match(sseOut, /魔搭回复/)
+    assert.match(sseOut, /call_ms/)
+
+    const bal = await modelscopeProvider.balance!(fromBare.credential, AbortSignal.timeout(3000))
+    assert.equal(bal.total, 188)
+    assert.equal(bal.expiring, 20)
+
+    const { ProviderError } = await import('../src/providers/types.ts')
+    // HTTP 200 + JSON 错误信封：确定性参数/Schema 错误严禁标为 retryable=true（防止无意义全池轮转）
+    await assert.rejects(
+      () =>
+        modelscopeProvider.chat(fromBare.credential, {
+          model: 'err-200-bad-param',
+          body: { messages: [{ role: 'user', content: 'hi' }] },
+          signal: AbortSignal.timeout(3000),
+        }),
+      (err: unknown) => err instanceof ProviderError && err.httpStatus === 400 && err.retryable === false,
+    )
+    // HTTP 200 + JSON 限流/配额信封：允许换号轮转（retryable=true）
+    await assert.rejects(
+      () =>
+        modelscopeProvider.chat(fromBare.credential, {
+          model: 'err-200-quota',
+          body: { messages: [{ role: 'user', content: 'hi' }] },
+          signal: AbortSignal.timeout(3000),
+        }),
+      (err: unknown) => err instanceof ProviderError && err.httpStatus === 429 && err.retryable === true,
+    )
+    // HTTP 200 + JSON 坏 Key/过期信封（无显式数字状态码默认 400）：识别坏 Key 文案允许换号轮转
+    await assert.rejects(
+      () =>
+        modelscopeProvider.chat(fromBare.credential, {
+          model: 'err-200-bad-key',
+          body: { messages: [{ role: 'user', content: 'hi' }] },
+          signal: AbortSignal.timeout(3000),
+        }),
+      (err: unknown) => err instanceof ProviderError && err.httpStatus === 400 && err.retryable === true,
+    )
+  } finally {
+    globalThis.fetch = origFetch
+  }
 })

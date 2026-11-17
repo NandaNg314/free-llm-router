@@ -399,7 +399,15 @@ async function chat(credential: ProviderCredential, request: ChatRequest): Promi
       config.id === BUDDY_CN.id
         ? (env as Env)
         : ({ ...(env ?? {}), UPSTREAM_BILLING_BASE: bases.billing } as Env)
-    const b = await fetchBalance({ uid: credential.uid, accessToken: credential.accessToken }, effectiveEnv, Date.now())
+    const b = await fetchBalance(
+      {
+        uid: credential.uid,
+        accessToken: credential.accessToken,
+        realm: config.id === BUDDY_CN.id ? 'cn' : 'global',
+      },
+      effectiveEnv,
+      Date.now(),
+    )
     return {
       total: b.total,
       expiring: b.expiring,

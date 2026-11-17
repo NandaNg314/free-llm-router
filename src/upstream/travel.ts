@@ -29,6 +29,8 @@ export interface TravelStatus {
   dailyLimitReached: boolean
   /** 目的地（展示用）。 */
   destination: string
+  /** 本趟旅行记录 ID（`arrived` 状态下 `travel/claim` 需透传 `record_id`，对齐 `L0NE-6/WorkBuddy-Daily` `db08e48`）。 */
+  recordId?: string | number
 }
 
 /** 连登状态。 */
@@ -58,17 +60,23 @@ export function clientToken(): string {
 
 /** growth 域通用请求。 */
 async function growthCall(
-  ctx: { uid: string; accessToken: string },
+  ctx: { uid: string; accessToken: string; realm?: string },
   env: Env,
   method: 'GET' | 'POST',
   path: string,
   body?: string,
 ): Promise<{ ok: boolean; httpStatus: number; data: unknown; raw: string; code: number | undefined; msg: string }> {
   const bases = resolveUpstream(env)
+  const rLower = (ctx.realm ?? '').trim().toLowerCase()
+  const upstreamRealm = rLower === 'global' || rLower === 'intl' || rLower === 'workbuddy' ? 'global' : undefined
   const res = await callUpstream({
     method,
     url: `${bases.chat}${path}`,
-    headers: desktopHeaders({ uid: ctx.uid, accessToken: ctx.accessToken }),
+    headers: desktopHeaders({
+      uid: ctx.uid,
+      accessToken: ctx.accessToken,
+      ...(upstreamRealm === undefined ? {} : { realm: upstreamRealm }),
+    }),
     body,
   })
   const c = classify(res.httpStatus, res.raw)
@@ -98,10 +106,17 @@ export async function travelStatus(
     })
   }
   const d = (r.data ?? {}) as Record<string, unknown>
+  const rawRecord = d.record_id
+  const recordId =
+    (typeof rawRecord === 'string' && rawRecord !== '') ||
+    (typeof rawRecord === 'number' && Number.isFinite(rawRecord) && rawRecord !== 0)
+      ? rawRecord
+      : undefined
   return {
     state: typeof d.state === 'string' ? d.state : '',
     dailyLimitReached: d.daily_limit_reached === true,
     destination: typeof d.destination === 'string' ? d.destination : '',
+    ...(recordId === undefined ? {} : { recordId }),
   }
 }
 
@@ -140,16 +155,70 @@ export function isAlreadyDeparted(code: number | undefined, msg: string): boolea
   return /limit|already|traveling|in ?progress|上限|已在|进行中/i.test(msg)
 }
 
+/**
+ * 拉取猫猫旅行可用目的地配置（`GET /activity/growth/buddy/travel/config`）。
+ *
+ * ## 为什么要查配置而不是写死 `location_id: 1`（参考 `L0NE-6/WorkBuddy-Daily` `db08e48`）
+ *
+ * 上游旅行目的地的 `id` 可能是字符串（如 `"loc-1"`）或动态数值，写死数字 `1` 在部分活动期会回
+ * HTTP 400 `invalid request`。先读 `/travel/config` 拿真实 `locations[0].id`，失败再回退兜底载荷。
+ */
+export async function travelLocations(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+): Promise<Array<{ id: string | number; name: string }>> {
+  try {
+    const r = await growthCall(ctx, env, 'GET', '/activity/growth/buddy/travel/config')
+    if (!r.ok || r.data === null || typeof r.data !== 'object') return []
+    const d = r.data as Record<string, unknown>
+    const rawList = Array.isArray(d.locations)
+      ? d.locations
+      : Array.isArray(d.list)
+        ? d.list
+        : Array.isArray(r.data)
+          ? (r.data as unknown[])
+          : []
+    const out: Array<{ id: string | number; name: string }> = []
+    for (const item of rawList) {
+      if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
+      const loc = item as Record<string, unknown>
+      const rawId = loc.id ?? loc.location_id
+      if (
+        (typeof rawId === 'string' && rawId !== '') ||
+        (typeof rawId === 'number' && Number.isFinite(rawId))
+      ) {
+        out.push({
+          id: rawId,
+          name: typeof loc.name === 'string' ? loc.name : '',
+        })
+      }
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
 export async function travelDepart(
   ctx: { uid: string; accessToken: string },
   env: Env,
-  locationId = 1,
+  locationId?: string | number,
 ): Promise<{ departed: boolean; detail: string }> {
-  const payloads = [
-    JSON.stringify({ location_id: locationId }),
-    JSON.stringify({ locationId }),
-    '{}',
-  ]
+  let resolvedId: string | number | undefined = locationId
+  if (resolvedId === undefined) {
+    const locs = await travelLocations(ctx, env)
+    if (locs.length > 0 && locs[0] !== undefined) {
+      resolvedId = locs[0].id
+    }
+  }
+  const fallbackId = resolvedId ?? 1
+  const payloads = Array.from(
+    new Set([
+      JSON.stringify({ location_id: fallbackId }),
+      JSON.stringify({ locationId: fallbackId }),
+      '{}',
+    ]),
+  )
   let lastR: { ok: boolean; httpStatus: number; code: number | undefined; msg: string; raw: string } = {
     ok: false,
     httpStatus: 0,
@@ -164,6 +233,9 @@ export async function travelDepart(
     if (isAlreadyDeparted(r.code, r.msg)) {
       return { departed: false, detail: '今日已派出过（幂等命中）' }
     }
+    if (/no buddy|buddy not|未领养|没有伙伴/i.test(r.msg)) {
+      return { departed: false, detail: '尚未领养伙伴，跳过旅行' }
+    }
     lastR = r
   }
   throw new UpstreamError({
@@ -175,12 +247,18 @@ export async function travelDepart(
   })
 }
 
-/** 领旅行奖励（猫猫回来了才有）。 */
+/** 领旅行奖励（猫猫回来了才有；支持透传 `travel/status` 返回的 `record_id`，对齐 `db08e48`）。 */
 export async function travelClaim(
   ctx: { uid: string; accessToken: string },
   env: Env,
+  recordId?: string | number,
 ): Promise<{ claimed: boolean; detail: string }> {
-  const r = await growthCall(ctx, env, 'POST', '/activity/growth/buddy/travel/claim', '{}')
+  const hasRecordId = recordId !== undefined && recordId !== '' && recordId !== 0
+  const body = hasRecordId ? JSON.stringify({ record_id: recordId }) : '{}'
+  let r = await growthCall(ctx, env, 'POST', '/activity/growth/buddy/travel/claim', body)
+  if (!r.ok && hasRecordId && r.httpStatus === 400 && /invalid request/i.test(r.msg)) {
+    r = await growthCall(ctx, env, 'POST', '/activity/growth/buddy/travel/claim', '{}')
+  }
   if (r.ok) return { claimed: true, detail: '旅行奖励已领取' }
   // ⚠️ 判据要**宽**，且必须覆盖实测遇到的文案。
   //
@@ -477,7 +555,12 @@ export async function useMakeupCard(
 // 盲盒开出来是**能量**，能量可以再开 Buddy 盲盒。本项目此前没有这条链路，
 // 等于每天白白攒着额度不用。额度用不掉不会累积到明天。
 
-/** 盲盒配额（还有几次可开）。 */
+/**
+ * 盲盒配额（还有几次可开）。
+ *
+ * ⚠️ 上游 `/activity/growth/buddy/quota` 真实返回形如 `{"balance": 30, "affordable": 3}`
+ * （对齐 `L0NE-6/WorkBuddy-Daily` `db08e48`），故优先认 `affordable`，再兼容 `remaining` / `quota`。
+ */
 export async function buddyQuota(
   ctx: { uid: string; accessToken: string },
   env: Env,
@@ -485,7 +568,13 @@ export async function buddyQuota(
   const r = await growthCall(ctx, env, 'GET', '/activity/growth/buddy/quota')
   if (!r.ok) return { remaining: 0, raw: r.raw.slice(0, 200) }
   const d = (r.data ?? {}) as Record<string, unknown>
-  const n = typeof d.remaining === 'number' ? d.remaining : typeof d.quota === 'number' ? d.quota : 0
+  const n = typeof d.affordable === 'number'
+    ? d.affordable
+    : typeof d.remaining === 'number'
+      ? d.remaining
+      : typeof d.quota === 'number'
+        ? d.quota
+        : 0
   return { remaining: Math.max(0, Math.trunc(n)), raw: r.raw.slice(0, 200) }
 }
 

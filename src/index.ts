@@ -20,11 +20,18 @@
 
 import { TaskRunnerDO, type RunContext, type TaskStep } from './taskrunner/TaskRunnerDO.js'
 import { classify } from './upstream/client.js'
-import { diagnoseAccount, healthy } from './pool/state.js'
-import { AccountPoolDO } from './pool/AccountPoolDO.js'
+import { diagnoseAccount, extractPaidStatusFromSummary, healthy } from './pool/state.js'
+import { AccountPoolDO, type PersistedCorsConfig } from './pool/AccountPoolDO.js'
 import { planByName, type PlanName } from './taskrunner/plans.js'
 import { cstDay } from './upstream/travel.js'
-import { resolveUpstream, type Env } from './env.js'
+import {
+  normalizeCorsOrigin,
+  parseCorsOrigins,
+  resolveAutoContinuation,
+  resolveCorsOrigins,
+  resolveUpstream,
+  type Env,
+} from './env.js'
 import { cliChatHeaders } from './upstream/headers.js'
 import { isValidUid, LOGIN_STATE_TTL_MS, pollLogin, startLogin } from './upstream/auth.js'
 
@@ -71,10 +78,30 @@ import type { AccountState } from './pool/state.js'
 import type { ProviderModel } from './providers/types.js'
 import type { LoginCredential } from './upstream/auth.js'
 import { parseAuthDocument, parseAuthPayload } from './upstream/import.js'
+import { anthropicErrorJson, handleMessages, handleMessagesCountTokens } from './gateway/messages.js'
 import { handleResponses } from './gateway/responses.js'
-import { handleChatCompletions, refineModelScoped, resetMaxRotateCache } from './gateway/server.js'
+import {
+  handleChatCompletions,
+  isAutoContinuationEnabled,
+  refineModelScoped,
+  resetAutoContinuationCache,
+  resetMaxRotateCache,
+  setAutoContinuationOverride,
+} from './gateway/server.js'
 import { handleMcp } from './gateway/mcp.js'
-import { editImage, generateImage, getVideoTask, mediaCapable, submitVideo, webFetch, webSearch } from './upstream/media.js'
+import {
+  checkMediaSubkeyModel,
+  handleFetch,
+  handleImageEdits,
+  handleImageGenerations,
+  handleSearch,
+  handleThreeDGenerations,
+  handleThreeDJobGet,
+  handleThreeDTasks,
+  handleVideoGenerations,
+  handleVideoTasks,
+  isAllowedMediaProxyUrl,
+} from './gateway/media-router.js'
 import { resetSafetyConfigCache, resolveSafetyFor } from './gateway/safety.js'
 import {
   emptyApiKeyUsage,
@@ -88,14 +115,29 @@ import {
   resetUsageWindow,
   toApiKeyView,
 } from './store/apikeys.js'
-import { authenticate, clientIpOf, countUse, registerSubkeyUsage } from './gateway/authz.js'
+import {
+  apiKeyOf,
+  authenticate,
+  clientIpOf,
+  constantTimeEqual,
+  countUse,
+  isDataPlaneAuthPath,
+  registerSubkeyUsage,
+} from './gateway/authz.js'
 import { authBlocked, noteAuthFailure, noteAuthSuccess } from './gateway/inbound-limit.js'
 import { utc8DayKey } from './store/usage.js'
 import { BodyTooLargeError, MAX_IMPORT_BYTES, MAX_REQUEST_BYTES, readJsonCapped } from './gateway/body.js'
 import { fetchBalance } from './upstream/checkin.js'
 import { claimCompensation, fetchCompensationStatus } from './upstream/compensation.js'
+import {
+  CampaignError,
+  claimAccountCampaignTasks,
+  fetchCampaignSnapshot,
+  isCampaignEligible,
+  resolveCampaignSpec,
+} from './upstream/campaign.js'
 import { listTasks } from './upstream/tasks.js'
-import { listModels, pickCredential } from './gateway/models.js'
+import { listModels } from './gateway/models.js'
 /**
  * 为 `/v1/models` 取聚合目录（跨 realm）。
  *
@@ -152,7 +194,13 @@ async function loadAggregateCatalogForModels(
   return buildVirtualModels(catalogs)
 }
 
-import { jsonError } from './gateway/http.js'
+import {
+  applyCorsHeaders,
+  CORS_DEFAULT_MAX_AGE,
+  handleCorsPreflight,
+  isDataPlaneCorsPath,
+  jsonError,
+} from './gateway/http.js'
 import { APP_VERSION } from './version.js'
 import { bindBuddy, WORKBUDDY_INTL } from './providers/buddy.js'
 import {
@@ -210,36 +258,85 @@ function json(value: unknown, status = 200, extraHeaders: Record<string, string>
 }
 
 /**
- * 常量时间字符串比较。
+ * 数据面（`/v1/*`、`/mcp`）CORS 配置的进程内短 TTL 缓存（持久化真源为 `AccountPoolDO` 的 `systemCorsConfig`）。
  *
- * ⚠️ 用摘要 + `timingSafeEqual` 而不是 `===`：`===` 会在首个不同字节处短路，
- * 泄漏「已匹配多少前缀」的时序信息，足以逐字节爆破密钥
- * （Go 侧 `internal/httpauth` 同口径，连缺头也走一次比较以保持耗时形状）。
+ * 未通过管理端覆盖时 `value` 为 `undefined`，自动回落到环境变量 `CORS_ORIGINS`。
+ * 绑定 `poolNs`（`env.ACCOUNT_POOL` 引用）防止同一进程内多套测试运行时互相串读。
  */
-async function constantTimeEqual(a: string, b: string): Promise<boolean> {
-  const enc = new TextEncoder()
-  // 先各自摘要成定长，避免「长度不同」本身泄漏信息
-  const [ha, hb] = await Promise.all([
-    crypto.subtle.digest('SHA-256', enc.encode(a)),
-    crypto.subtle.digest('SHA-256', enc.encode(b)),
-  ])
-  const va = new Uint8Array(ha)
-  const vb = new Uint8Array(hb)
-  let diff = 0
-  for (let i = 0; i < va.length; i += 1) diff |= (va[i] ?? 0) ^ (vb[i] ?? 0)
-  return diff === 0
+const CORS_CACHE_TTL_MS = 10_000
+let corsConfigCache: { poolNs: unknown; at: number; value: PersistedCorsConfig | undefined } | undefined
+
+/** 重置运行时 CORS 与自动续写缓存（供写接口即时失效与单测隔离状态使用）。 */
+export function resetCorsConfigCache(): void {
+  corsConfigCache = undefined
+  setAutoContinuationOverride(undefined)
+  resetAutoContinuationCache()
 }
 
-/** 校验 Bearer 密钥。未配置 `API_KEY` 时**拒绝一切**（fail-closed，不 fail-open）。 */
+async function readPersistedCorsConfig(env: Env, now = Date.now()): Promise<PersistedCorsConfig | undefined> {
+  if (
+    corsConfigCache !== undefined &&
+    corsConfigCache.poolNs === env.ACCOUNT_POOL &&
+    now - corsConfigCache.at < CORS_CACHE_TTL_MS
+  ) {
+    return corsConfigCache.value
+  }
+  if (env.ACCOUNT_POOL === undefined) return undefined
+  try {
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const persisted = await cnPool.getCorsConfig()
+    corsConfigCache = { poolNs: env.ACCOUNT_POOL, at: now, value: persisted }
+    return persisted
+  } catch {
+    return undefined
+  }
+}
+
+async function writePersistedCorsConfig(
+  env: Env,
+  next: PersistedCorsConfig | null,
+): Promise<PersistedCorsConfig | undefined> {
+  const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+  const saved = await cnPool.setCorsConfig(next)
+  const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+  await globalPool.setCorsConfig(next)
+  corsConfigCache = { poolNs: env.ACCOUNT_POOL, at: Date.now(), value: saved }
+  return saved
+}
+
+async function effectiveCors(env: Env): Promise<{ origins: string[]; maxAge: number }> {
+  const persisted = await readPersistedCorsConfig(env)
+  if (persisted !== undefined) {
+    return {
+      origins: persisted.enabled ? persisted.origins : [],
+      maxAge: persisted.maxAge,
+    }
+  }
+  return {
+    origins: resolveCorsOrigins(env),
+    maxAge: CORS_DEFAULT_MAX_AGE,
+  }
+}
+
+/**
+ * 校验主密钥。未配置 `API_KEY` 时**拒绝一切**（fail-closed，不 fail-open）。
+ *
+ * - `/admin/*` 仅认 `Authorization: Bearer <API_KEY>`；
+ * - `/v1/*` 与 `/mcp` 数据面同时兼容 `Authorization: Bearer <API_KEY>` 与 `x-api-key: <API_KEY>`。
+ */
 async function authorized(request: Request, env: Env): Promise<boolean> {
   const expected = env.API_KEY
   // ⚠️ fail-closed：没配密钥就是配置错误，不能静默放行。
   if (expected === undefined || expected === '') return false
 
-  const header = request.headers.get('authorization') ?? ''
-  const prefix = 'Bearer '
-  const provided = header.startsWith(prefix) ? header.slice(prefix.length) : ''
-  // 即使 provided 为空也执行比较，保持耗时形状
+  let allowXApiKey = false
+  try {
+    allowXApiKey = isDataPlaneAuthPath(new URL(request.url).pathname)
+  } catch {
+    allowXApiKey = false
+  }
+  const provided = apiKeyOf(request, { allowXApiKey })
+  // 即使 provided 为空也执行恒定时间摘要比较，保持耗时形状一致
   return await constantTimeEqual(provided, expected)
 }
 
@@ -548,7 +645,11 @@ function loginCallbackPage(input: {
 </html>`
   return new Response(body, {
     status: input.status,
-    headers: { ...securityHeaders(), 'content-type': 'text/html; charset=utf-8' },
+    headers: {
+      ...securityHeaders(),
+      'x-robots-tag': 'noindex, nofollow',
+      'content-type': 'text/html; charset=utf-8',
+    },
   })
 }
 
@@ -1206,30 +1307,26 @@ function publicOrigin(env: Env, url: URL): string {
 
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    return await handleInner(request, env, ctx)
+    const url = new URL(request.url)
+    const isCors = isDataPlaneCorsPath(url.pathname)
+    const cors = isCors ? await effectiveCors(env) : undefined
+    if (cors !== undefined && request.method === 'OPTIONS') {
+      return handleCorsPreflight(request, cors.origins, cors.maxAge)
+    }
+    const response = await handleInner(request, env, ctx)
+    return cors !== undefined ? applyCorsHeaders(response, request, cors.origins) : response
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     const stack = error instanceof Error ? (error.stack ?? '') : ''
-    // ⚠️ 打完整堆栈进 Workers Logs —— 否则排查时只剩一个 1101。
-    // 请求信息也打上（路径 + 方法），但**绝不打 Authorization**。
-    const url = (() => { try { return new URL(request.url) } catch { return undefined } })()
-    console.error(
-      `[unhandled] ${request.method} ${url?.pathname ?? '(bad url)'} → ${message}\n${stack}`,
-    )
-    /**
-     * 🔴 **不回显内部异常原文**（2026-10-21 审查补，安全面专项）。
-     *
-     * 原来直接把 `error.message` 拼进响应。任何持 key 者（含配额最紧的子密钥）
-     * 都能稳定把内部文案读回来 —— 实测 `POST body: null` 就回
-     * `服务内部错误：Cannot read properties of null (reading 'model')`；
-     * 而这通道对 `SQLITE_*`、文件路径、表名同样直通。
-     *
-     * 改为：对外固定文案 + 一个 `traceId`（与日志里的同一串），
-     * 用户报障时给这个 id，我们按它去日志里找完整堆栈。
-     */
+    let pathname = '(bad url)'
+    try {
+      pathname = new URL(request.url).pathname
+    } catch {}
+    // ⚠️ 打完整堆栈进 Workers Logs（绝不打 Authorization / x-api-key）；对外固定文案 + traceId，不回显内部异常。
+    console.error(`[unhandled] ${request.method} ${pathname} → ${message}\n${stack}`)
     const traceId = crypto.randomUUID().slice(0, 8)
     console.error(`[unhandled] traceId=${traceId}（对外不再回显内部原因）`)
-    return new Response(
+    const errRes = new Response(
       JSON.stringify({
         error: {
           message: `服务内部错误，请稍后重试（如反复出现请把 traceId 反馈给我们：${traceId}）`,
@@ -1240,6 +1337,9 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       }),
       { status: 500, headers: { 'content-type': 'application/json; charset=utf-8' } },
     )
+    if (!isDataPlaneCorsPath(pathname)) return errRes
+    const errCors = await effectiveCors(env).catch(() => ({ origins: resolveCorsOrigins(env), maxAge: CORS_DEFAULT_MAX_AGE }))
+    return applyCorsHeaders(errRes, request, errCors.origins)
   }
 }
 
@@ -1342,6 +1442,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       'content-type': asset.contentType,
       'cache-control': asset.cacheControl,
       etag: asset.etag,
+      'x-robots-tag': 'noindex, nofollow',
     }
     // ⚠️ 支持条件请求：内容没变就回 304（省流量），变了才回全量。
     // 这正是 `no-cache` 能成立的前提 —— 没有 ETag 的 `no-cache` 等于每次全量重下。
@@ -1353,13 +1454,13 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   }
   // 旧版独立登录页已并入单页面板（未登录时面板自己显示登录表单）——旧书签直接跳过去。
   if (path === '/login' || path === '/login/') {
-    return new Response(null, { status: 302, headers: { ...securityHeaders(), location: '/panel/' } })
+    return new Response(null, { status: 302, headers: { ...securityHeaders(), 'x-robots-tag': 'noindex, nofollow', location: '/panel/' } })
   }
   // `/panel/*` 下不存在的文件直接 404（面板用 hash 路由，不需要服务端回落到 index.html）。
   // ⚠️ 不能落进下面的鉴权分支：那会对一个静态路径返回 401 JSON，让人误以为是密钥问题。
   // 只拦带尾斜杠的子路径；`/panel` 本身在下面 302 到 `/panel/`。
   if (path.startsWith('/panel/')) {
-    return new Response('Not Found', { status: 404, headers: { ...securityHeaders(), 'content-type': 'text/plain; charset=utf-8' } })
+    return new Response('Not Found', { status: 404, headers: { ...securityHeaders(), 'x-robots-tag': 'noindex, nofollow', 'content-type': 'text/plain; charset=utf-8' } })
   }
 
   // ── /favicon.ico：显式返回 204 ──
@@ -1374,7 +1475,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
   // 老的 /panel 前缀（无尾斜杠）重定向到带斜杠，避免相对路径解析错误
   if (path === '/panel') {
-    return new Response(null, { status: 302, headers: { location: '/panel/' } })
+    return new Response(null, { status: 302, headers: { 'x-robots-tag': 'noindex, nofollow', location: '/panel/' } })
   }
 
   // ── CodeArts 浏览器登录回调（**免鉴权**，见 handleCodeArtsCallback 的说明） ──
@@ -1413,7 +1514,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   //
   // ⚠️ 判定顺序刻意为「主密钥优先」：子密钥路径要打一次 DO（查哈希），
   // 主密钥不用。日常运维走的是主密钥，不该为子密钥的选择付代价。
-  const isV1Path = path.startsWith('/v1/')
+  const isDataPlane = isDataPlaneAuthPath(path)
   /**
    * 🔴 **子密钥记录必须提到外层作用域**（2026-10-21 审查补，M6 指出高危）。
    *
@@ -1448,14 +1549,14 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
   let subkeyRecord: ApiKeyRecord | undefined
   if (!(await authorized(request, env))) {
-    // 不是主密钥 ⇒ 只有在 `/v1/*` 上才尝试子密钥。
-    if (!isV1Path) {
+    // 不是主密钥 ⇒ 只有在 `/v1/*` 与 `/mcp` 数据面上才尝试子密钥（同时兼容 Bearer 与 `x-api-key`）。
+    if (!isDataPlane) {
       noteAuthFailure(clientIp)
       return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
     }
     // ⚠️ 此时还不知道模型，先传空串跳过模型检查；真正的模型校验在
-    // 拿到请求体之后（见下方 `/v1/chat/completions` 分支）。
-    const sub = await authenticate(request, env, '')
+    // 拿到请求体之后（见下方 `/v1/chat/completions`、`/v1/messages`、`/v1/responses` 等分支）。
+    const sub = await authenticate(request, env, '', { allowXApiKey: true })
     if (sub.kind === 'none') {
       noteAuthFailure(clientIp)
       return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
@@ -1474,19 +1575,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       // `countUse` 内部的 `recordApiKeyUse` 只累加请求数，不校验模型。
       // 模型白名单改在拿到请求体后单独判（见下方 `subkeyRecord` 的用法）。
       subkeyRecord = sub.record
-    /**
-     * 🔴 登记本次请求的「子密钥归属」（2026-10-21 审查补，安全面专项）。
-     *
-     * `token` 配额此前是一条**从未接线**的死限制：`authenticate()` 只用
-     * `input=0/output=0` 记一次请求，而唯一能补真实用量的 `settleUsage()`
-     * **零调用者** ⇒ `maxTokens` 永远判不到（实测 `maxTokens=5` 连发 3 次全放行）。
-     *
-     * 挂到 `ctx` 上（WeakMap，随请求回收）：网关在 4 个「用量已知」的点调
-     * `settleSubkeyUsage(...)` 把真实 token 补回去。主密钥路径没有条目，零开销。
-     */
-    registerSubkeyUsage(ctx, sub.record, clientIpOf(request))
+      registerSubkeyUsage(ctx, sub.record, clientIpOf(request))
       ctx.waitUntil(countUse(env, sub.record, request, ''))
     }
+  } else {
+    noteAuthSuccess(clientIp)
   }
 
   // ── 登录：发起（返回授权 URL 给前端/用户） ──
@@ -1705,6 +1798,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   if (path === '/admin/accounts/balance' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as { realm?: string; uid?: string }
     const now = Date.now()
+    const singleUid = typeof body.uid === 'string' && body.uid !== ''
     const realms = typeof body.realm === 'string' && body.realm !== '' ? [body.realm] : ['cn', 'global']
     const results: Array<{ uid: string; provider: string; ok: boolean; credits?: number; error?: string }> = []
 
@@ -1712,7 +1806,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
       const accounts = await pool.listAccounts(realm, now)
       for (const account of accounts) {
-        if (typeof body.uid === 'string' && body.uid !== '' && account.uid !== body.uid) continue
+        if (singleUid && account.uid !== body.uid) continue
         const providerId = account.provider ?? DEFAULT_PROVIDER
         // ⚠️ 同 cron：buddy 必须用绑定版（它的 balance 闭包依赖 env）。
         const template = findProvider(providerId)
@@ -1728,11 +1822,20 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
             results.push({ uid: account.uid, provider: providerId, ok: false, error: '凭据不可读' })
             continue
           }
+          // 静态 API Key（如 Gemini 官方 AIzaSy...）无在线余额端点：全量扫描直接静默跳过，单 uid 指定时如实说明
+          if (credential.extras?.['authMode'] === 'api_key') {
+            if (singleUid) {
+              results.push({ uid: account.uid, provider: providerId, ok: false, error: '静态 API Key 无在线余额端点' })
+            }
+            continue
+          }
           const b = await provider.balance(credential, AbortSignal.timeout(20_000))
+          const paid = extractPaidStatusFromSummary(b) ?? extractPaidStatusFromSummary(credential)
           await pool.updateBalance(account.uid, now, {
             credits: b.total,
             expiring: b.expiring,
             earliestExpiry: b.earliestExpiry,
+            ...(typeof paid === 'boolean' ? { isPaid: paid } : {}),
           })
           // 🔴 余额恢复 ⇒ 解冻 `hard`（402 余额耗尽）冷却。**必须显式调用**：
           // `updateBalance` 刻意只写额度、不碰惩罚态（见该方法注释），
@@ -3337,22 +3440,145 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ ok: true, config })
   }
 
+  // ── 数据面 CORS 白名单配置（持久化于 AccountPoolDO，跨 isolate 与容器重启生效；未覆盖时回落 CORS_ORIGINS 环境变量） ──
+  if (path === '/admin/config/cors' && request.method === 'GET') {
+    const envOrigins = resolveCorsOrigins(env)
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const persisted = await cnPool.getCorsConfig()
+    corsConfigCache = { poolNs: env.ACCOUNT_POOL, at: Date.now(), value: persisted }
+    const activeOrigins = persisted !== undefined ? (persisted.enabled ? persisted.origins : []) : envOrigins
+    return json({
+      ok: true,
+      config: {
+        enabled: activeOrigins.length > 0,
+        origins: persisted?.origins ?? envOrigins,
+        maxAge: persisted?.maxAge ?? CORS_DEFAULT_MAX_AGE,
+        source: persisted !== undefined ? 'runtime' : 'env',
+        envOrigins,
+      },
+    })
+  }
+  if (path === '/admin/config/cors' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      enabled?: unknown
+      origins?: unknown
+      maxAge?: unknown
+      resetToEnv?: unknown
+    }
+    if (body.resetToEnv === true) {
+      await writePersistedCorsConfig(env, null)
+      const envOrigins = resolveCorsOrigins(env)
+      return json({
+        ok: true,
+        config: {
+          enabled: envOrigins.length > 0,
+          origins: envOrigins,
+          maxAge: CORS_DEFAULT_MAX_AGE,
+          source: 'env',
+          envOrigins,
+        },
+      })
+    }
+
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const curPersisted = await cnPool.getCorsConfig()
+    const curOrigins = curPersisted?.origins ?? resolveCorsOrigins(env)
+    let nextOrigins = curOrigins
+    if (body.origins !== undefined) {
+      const rawItems: unknown[] =
+        typeof body.origins === 'string'
+          ? body.origins.split(/[,\r\n]+/)
+          : Array.isArray(body.origins)
+            ? body.origins
+            : [NaN]
+      if (rawItems.length > 64) {
+        return jsonError(400, '最多配置 64 条跨域来源', 'invalid_cors_origin')
+      }
+      const cleaned: string[] = []
+      for (const item of rawItems) {
+        if (typeof item !== 'string') {
+          return jsonError(400, 'origins 必须是字符串或字符串数组', 'invalid_cors_origin')
+        }
+        if (item.trim() === '') continue
+        const norm = normalizeCorsOrigin(item)
+        if (norm === '') {
+          return jsonError(
+            400,
+            `非法跨域来源「${item}」（请填写 * 或形如 https://app.example.com 的标准来源，不含路径与凭据）`,
+            'invalid_cors_origin',
+          )
+        }
+        if (!cleaned.includes(norm)) cleaned.push(norm)
+      }
+      nextOrigins = cleaned
+    }
+
+    let nextMaxAge = curPersisted?.maxAge ?? CORS_DEFAULT_MAX_AGE
+    if (body.maxAge !== undefined) {
+      if (typeof body.maxAge !== 'number' || !Number.isInteger(body.maxAge) || body.maxAge < 0 || body.maxAge > 7200) {
+        return jsonError(400, 'maxAge 必须是 0–7200 之间的整数秒', 'invalid_cors_origin')
+      }
+      nextMaxAge = body.maxAge
+    }
+
+    const nextEnabled =
+      typeof body.enabled === 'boolean' ? body.enabled : (curPersisted?.enabled ?? nextOrigins.length > 0)
+    const saved = await writePersistedCorsConfig(env, {
+      enabled: nextEnabled && nextOrigins.length > 0,
+      origins: nextOrigins,
+      maxAge: nextMaxAge,
+    })
+    return json({
+      ok: true,
+      config: {
+        enabled: saved?.enabled ?? false,
+        origins: saved?.origins ?? nextOrigins,
+        maxAge: saved?.maxAge ?? nextMaxAge,
+        source: 'runtime',
+        envOrigins: resolveCorsOrigins(env),
+      },
+    })
+  }
+
   // ── 路由与调度策略配置 ──
   if (path === '/admin/config/routing' && request.method === 'GET') {
     const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
     const config = await cnPool.getRoutingConfig()
-    return json({ ok: true, config })
+    const effectiveAutoCont =
+      typeof config.autoContinuation === 'boolean' ? config.autoContinuation : await isAutoContinuationEnabled(env)
+    return json({ ok: true, config: { ...config, autoContinuation: effectiveAutoCont } })
   }
   if (path === '/admin/config/routing' && request.method === 'POST') {
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+    if (body.corsOrigins !== undefined) {
+      const curPersisted = await readPersistedCorsConfig(env)
+      const parsed =
+        typeof body.corsOrigins === 'string' || Array.isArray(body.corsOrigins)
+          ? parseCorsOrigins(body.corsOrigins as string | string[])
+          : []
+      await writePersistedCorsConfig(env, {
+        enabled: parsed.length > 0,
+        origins: parsed,
+        maxAge: curPersisted?.maxAge ?? CORS_DEFAULT_MAX_AGE,
+      })
+    }
+    const routingInput: Record<string, unknown> = { ...body }
+    if (body.autoContinuation !== undefined) {
+      routingInput.autoContinuation = body.autoContinuation === null ? null : Boolean(body.autoContinuation)
+    }
     const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
-    const config = await cnPool.setRoutingConfig(body)
+    const config = await cnPool.setRoutingConfig(routingInput)
     // ⚠️ 必须镜像到 global 分片：国际版账号在那里选号 / 记冷却，
-    // 只写 cn 会让「负载均衡模式」「软冷却时长」对国际版账号不生效（与永久积分锁同一个坑）。
+    // 只写 cn 会让「负载均衡模式」「软冷却时长」「自动续写」对国际版账号不生效（与永久积分锁同一个坑）。
     const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
-    await globalPool.setRoutingConfig(config)
+    await globalPool.setRoutingConfig(
+      body.autoContinuation === null ? { ...config, autoContinuation: null } : config,
+    )
+    setAutoContinuationOverride(undefined)
     resetMaxRotateCache()
-    return json({ ok: true, config })
+    const effectiveAutoCont =
+      typeof config.autoContinuation === 'boolean' ? config.autoContinuation : resolveAutoContinuation(env)
+    return json({ ok: true, config: { ...config, autoContinuation: effectiveAutoCont } })
   }
 
   // ── 系统内置已知模型目录 ──
@@ -3703,6 +3929,208 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ realm, accounts: out })
   }
 
+  // ── 运营活动查询与一键领奖（`/portal/activity/...`，默认安全闸门 dryRun=true） ──
+  if (path === '/admin/campaign' && request.method === 'GET') {
+    const rawModule = url.searchParams.get('module') ?? undefined
+    const rawCode = url.searchParams.get('code') ?? undefined
+    const onlyUid = (url.searchParams.get('uid') ?? '').trim()
+    let spec: { module: string; code: string }
+    try {
+      spec = resolveCampaignSpec({
+        ...(rawModule === undefined ? {} : { module: rawModule }),
+        ...(rawCode === undefined ? {} : { code: rawCode }),
+      })
+    } catch (error) {
+      if (error instanceof CampaignError) {
+        return jsonError(error.httpStatus, error.message, 'invalid_campaign_spec')
+      }
+      return jsonError(400, error instanceof Error ? error.message : String(error), 'invalid_campaign_spec')
+    }
+
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const results: Array<Record<string, unknown>> = []
+    let skippedIneligible = 0
+
+    for (const a of accounts) {
+      if (onlyUid !== '' ? a.uid !== onlyUid : a.disabled) continue
+      const credential = (await pool.getCredential(a.uid)) as ProviderCredential | undefined
+      const enterpriseId = credential?.extras?.enterpriseId || credential?.extras?.enterprise_id
+      const eligible =
+        credential !== undefined &&
+        isCampaignEligible({
+          realm: a.realm,
+          provider: a.provider ?? DEFAULT_PROVIDER,
+          ...(enterpriseId ? { enterpriseId } : {}),
+          accessToken: credential.accessToken,
+        })
+      if (!eligible) {
+        skippedIneligible += 1
+        if (onlyUid !== '') {
+          results.push({
+            uid: a.uid,
+            nickname: a.nickname,
+            ok: false,
+            eligible: false,
+            error: '仅国内个人版 Buddy OAuth 账号支持运营活动',
+          })
+        }
+        continue
+      }
+      try {
+        const snapshot = await fetchCampaignSnapshot(
+          { uid: a.uid, accessToken: credential.accessToken, realm: a.realm },
+          env,
+          spec,
+        )
+        results.push({
+          uid: a.uid,
+          nickname: a.nickname,
+          ok: true,
+          snapshot,
+        })
+      } catch (error) {
+        results.push({
+          uid: a.uid,
+          nickname: a.nickname,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    return json({
+      ok: true,
+      realm,
+      module: spec.module,
+      code: spec.code,
+      skippedIneligible,
+      accounts: results,
+      now: Date.now(),
+    })
+  }
+
+  if (path === '/admin/campaign/claim' && request.method === 'POST') {
+    let rawBody: Record<string, unknown> = {}
+    try {
+      const parsed = await readJsonCapped(request).catch((err: unknown) => {
+        if (err instanceof BodyTooLargeError) throw err
+        return {}
+      })
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        rawBody = parsed as Record<string, unknown>
+      }
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        return jsonError(413, error.message, 'payload_too_large')
+      }
+    }
+
+    const rawModule = typeof rawBody.module === 'string' ? rawBody.module : undefined
+    const rawCode = typeof rawBody.code === 'string' ? rawBody.code : undefined
+    let spec: { module: string; code: string }
+    try {
+      spec = resolveCampaignSpec({
+        ...(rawModule === undefined ? {} : { module: rawModule }),
+        ...(rawCode === undefined ? {} : { code: rawCode }),
+      })
+    } catch (error) {
+      if (error instanceof CampaignError) {
+        return jsonError(error.httpStatus, error.message, 'invalid_campaign_spec')
+      }
+      return jsonError(400, error instanceof Error ? error.message : String(error), 'invalid_campaign_spec')
+    }
+
+    // ⚠️ 默认安全闸门：未显式传 `dryRun: false`（或 `dry_run: false`）时一律预演，不向活动接口发 POST！
+    const explicitDryRun =
+      typeof rawBody.dryRun === 'boolean'
+        ? rawBody.dryRun
+        : typeof rawBody.dry_run === 'boolean'
+          ? rawBody.dry_run
+          : true
+    const dryRun = explicitDryRun !== false
+
+    const onlyUid = typeof rawBody.uid === 'string' ? rawBody.uid.trim() : ''
+    const uidSet = Array.isArray(rawBody.uids)
+      ? new Set(rawBody.uids.filter((u): u is string => typeof u === 'string' && u.trim() !== '').map((u) => u.trim()))
+      : undefined
+    const taskCodes = Array.isArray(rawBody.taskCodes)
+      ? rawBody.taskCodes.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+      : Array.isArray(rawBody.task_codes)
+        ? rawBody.task_codes.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+        : undefined
+    const gapMs =
+      typeof rawBody.gapMs === 'number' && Number.isFinite(rawBody.gapMs) && rawBody.gapMs >= 0
+        ? Math.min(Math.trunc(rawBody.gapMs), 10_000)
+        : undefined
+
+    const realm =
+      typeof rawBody.realm === 'string' && (rawBody.realm === 'cn' || rawBody.realm === 'global')
+        ? rawBody.realm
+        : (url.searchParams.get('realm') ?? 'cn')
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await pool.listAccounts(realm, Date.now())
+    const results: Array<Record<string, unknown>> = []
+    let skippedIneligible = 0
+
+    for (const a of accounts) {
+      if (onlyUid !== '' && a.uid !== onlyUid) continue
+      if (uidSet !== undefined && uidSet.size > 0 && !uidSet.has(a.uid)) continue
+      if (onlyUid === '' && (uidSet === undefined || uidSet.size === 0) && a.disabled) continue
+
+      const credential = (await pool.getCredential(a.uid)) as ProviderCredential | undefined
+      const enterpriseId = credential?.extras?.enterpriseId || credential?.extras?.enterprise_id
+      const eligible =
+        credential !== undefined &&
+        isCampaignEligible({
+          realm: a.realm,
+          provider: a.provider ?? DEFAULT_PROVIDER,
+          ...(enterpriseId ? { enterpriseId } : {}),
+          accessToken: credential.accessToken,
+        })
+      if (!eligible) {
+        skippedIneligible += 1
+        continue
+      }
+      try {
+        const summary = await claimAccountCampaignTasks(
+          { uid: a.uid, accessToken: credential.accessToken, realm: a.realm },
+          env,
+          {
+            ...spec,
+            dryRun,
+            ...(taskCodes === undefined ? {} : { taskCodes }),
+            ...(gapMs === undefined ? {} : { gapMs }),
+          },
+        )
+        results.push({
+          ...summary,
+          nickname: a.nickname,
+          ok: true,
+        })
+      } catch (error) {
+        results.push({
+          uid: a.uid,
+          nickname: a.nickname,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    return json({
+      ok: true,
+      realm,
+      dryRun,
+      module: spec.module,
+      code: spec.code,
+      skippedIneligible,
+      accounts: results,
+      now: Date.now(),
+    })
+  }
+
   // ── IP 级 WAF 护栏状态（面板要能看出「是不是 IP 被拦了」） ──
   if (path === '/admin/waf' && request.method === 'GET') {
     const realm = url.searchParams.get('realm') ?? 'cn'
@@ -3787,7 +4215,21 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
     let entries: Array<{ raw: unknown; source?: string }>
     try {
-      entries = parseAuthPayload(payload)
+      if (typeof payload === 'string') {
+        const trimmed = payload.trim()
+        if (trimmed !== '' && !trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+          // 兼容直接传入裸令牌字符串（如 `ms-...`、`AIzaSy...`，支持多行批量粘贴）
+          const lines = trimmed
+            .split(/\r?\n/)
+            .map((s) => s.trim())
+            .filter((s) => s !== '' && !s.startsWith('#'))
+          entries = lines.map((raw, i) => ({ raw, source: lines.length === 1 ? '(string)' : `line[${i}]` }))
+        } else {
+          entries = parseAuthPayload(payload)
+        }
+      } else {
+        entries = parseAuthPayload(payload)
+      }
     } catch (error) {
       return json(
         { error: { message: error instanceof Error ? error.message : String(error), type: 'invalid_payload' } },
@@ -4198,6 +4640,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         credits: a.credits,
         creditsExpiring: a.creditsExpiring ?? 0,
         creditsEarliestExpiry: a.creditsEarliestExpiry ?? 0,
+        ...(typeof a.isPaid === 'boolean' ? { isPaid: a.isPaid } : {}),
         coolKind: a.coolKind,
         until: a.until,
         lastCheckinDay: a.lastCheckinDay,
@@ -4573,385 +5016,128 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return result.response
   }
 
-  // ── OpenAI 兼容：**图像生成**（2026-11-05 新增） ──
-  //
-  // ## 为什么只支持国际版
-  //
-  // 实测（池内真实账号）：国内版 `www.workbuddy.cn` 的 `/v2/images/generations`
-  // 返回 **401**（APISIX 网关层拒绝），国际版 `www.workbuddy.ai` 返回 **200 出图**。
-  // 故这里在 realm 不匹配时**如实报错**，不回落成对话 —— 回落会让客户端拿到
-  // 一段「模型描述图片的文字」，用户以为出图成功了。
-  //
-  // ## 客户端支持
-  // Cherry Studio / ChatBox / Open WebUI / LobeChat / NextChat 等，
-  // 它们都用 DALL·E 的 `/v1/images/generations` 形状。
+  // ── Anthropic **Messages API**（Claude Code / Anthropic SDK 原生协议） ──
+  if ((path === '/v1/messages/count_tokens' || path === '/messages/count_tokens') && request.method === 'POST') {
+    if (subkeyRecord !== undefined && subkeyRecord.limits.models.length > 0) {
+      const m = await peekOptionalModel(request)
+      if (m !== '' && !modelAllowed(m, subkeyRecord.limits.models)) {
+        return anthropicErrorJson(`该 API Key 不被允许使用模型「${m}」`, 403, 'permission_error')
+      }
+    }
+    const result = await handleMessagesCountTokens(request)
+    return result.response
+  }
+
+  if ((path === '/v1/messages' || path === '/messages') && request.method === 'POST') {
+    const realm = url.searchParams.get('realm') ?? 'cn'
+    const denied = await subkeyModelDenied(request, subkeyRecord, { anthropic: true })
+    if (denied !== undefined) return denied
+    const result = await handleMessages(request, env, realm, ctx)
+    return result.response
+  }
+
+  // ── 媒体、视频、混元 3D、联网检索与网页抓取（统一委托 media-router 智能选号、续期容灾与幂等记账） ──
   if (path === '/v1/images/generations' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const realm = await resolveMediaRealm(env, url)
-
-    if (!mediaCapable(realm)) {
-      return jsonError(
-        400,
-        `图像生成目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`
-          + '请用 `?realm=global` 调用，或在面板添加 WorkBuddy 国际版账号。',
-        'unsupported_realm',
-      )
-    }
-
-    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
-    if (prompt === '') return jsonError(400, 'prompt 必填', 'invalid_request')
-
-    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
-    if (credential === undefined) {
-      return jsonError(503, '没有可用的国际版账号（请先在面板登录）', 'no_available_account')
-    }
-
-    try {
-      const r = await generateImage(
-        { uid: credential.uid, accessToken: credential.credential.accessToken },
-        env,
-        {
-          prompt,
-          ...(typeof body.model === 'string' && body.model !== '' ? { model: body.model } : {}),
-          ...(typeof body.size === 'string' && body.size !== '' ? { size: body.size } : {}),
-          ...(typeof body.n === 'number' ? { n: body.n } : {}),
-        },
-      )
-      if (r.images.length === 0) {
-        return jsonError(502, '上游返回成功但没有图片（响应里 data 为空）', 'upstream_error')
-      }
-      return json({
-        created: r.created,
-        data: r.images,
-        ...(r.credit === undefined ? {} : { usage: { credit: r.credit } }),
-      })
-    } catch (error) {
-      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
-    }
+    const reqModel = subkeyRecord !== undefined && subkeyRecord.limits.models.length > 0 ? await peekOptionalModel(request) : ''
+    const candidates = isImageModelId(reqModel)
+      ? [reqModel, `workbuddy/${reqModel}`]
+      : ['hy-image-3.5', 'workbuddy/hy-image-3.5']
+    const denied = checkMediaSubkeyModel(subkeyRecord, candidates)
+    if (denied !== undefined) return denied
+    return await handleImageGenerations(request, env, ctx)
   }
 
-  // ── OpenAI 兼容：**改图 / 图生图** ──
   if (path === '/v1/images/edits' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const realm = await resolveMediaRealm(env, url)
-    if (!mediaCapable(realm)) {
-      return jsonError(400, `图像编辑目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
-    }
-    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
-    /**
-     * 输入图：**字符串或字符串数组**都接受。
-     *
-     * ⚠️ 上游 `image` 字段是 **data URL 数组**（社区实测），单张也统一成数组传。
-     * ⚠️ 必须是**公网可访问的 URL** 或 **`data:` URL** —— 我们**不下载、不转存**。
-     *    裸 base64 上游取不到，传了只会得到一句含糊的失败，故提前拦掉并说清原因。
-     */
-    const rawImage = body.image
-    const images: string[] = Array.isArray(rawImage)
-      ? rawImage.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map((x) => x.trim())
-      : typeof rawImage === 'string' && rawImage.trim() !== ''
-        ? [rawImage.trim()]
-        : []
-    if (prompt === '') return jsonError(400, 'prompt 必填', 'invalid_request')
-    if (images.length === 0) {
-      return jsonError(
-        400,
-        'image 必填。**本网关不会替你下载图片** —— 请传公网可访问的 URL 或 `data:` URL，'
-          + '上游要能直接取到它。',
-        'invalid_request',
-      )
-    }
-    // 裸 base64（既不是 URL 也不是 data:）提前拒掉：上游只会回一句含糊的失败
-    const bad = images.find((x) => !/^(https?:\/\/|data:image\/)/i.test(x))
-    if (bad !== undefined) {
-      return jsonError(
-        400,
-        'image 必须是 http(s) URL 或 `data:image/...;base64,...`。'
-          + '如果是本地图片，前端可以用 FileReader 读成 data URL 再传。',
-        'invalid_request',
-      )
-    }
-    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
-    if (credential === undefined) {
-      return jsonError(503, '没有可用的国际版账号', 'no_available_account')
-    }
-    try {
-      const r = await editImage(
-        { uid: credential.uid, accessToken: credential.credential.accessToken },
-        env,
-        {
-          prompt,
-          image: images,
-          ...(typeof body.model === 'string' && body.model !== '' ? { model: body.model } : {}),
-          ...(typeof body.size === 'string' && body.size !== '' ? { size: body.size } : {}),
-        },
-      )
-      if (r.images.length === 0) return jsonError(502, '上游返回成功但没有图片', 'upstream_error')
-      return json({
-        created: r.created,
-        data: r.images,
-        ...(r.credit === undefined ? {} : { usage: { credit: r.credit } }),
-      })
-    } catch (error) {
-      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
-    }
+    const reqModel = subkeyRecord !== undefined && subkeyRecord.limits.models.length > 0 ? await peekOptionalModel(request) : ''
+    const candidates = isImageModelId(reqModel)
+      ? [reqModel, `workbuddy/${reqModel}`]
+      : ['hy-image-3.5', 'workbuddy/hy-image-3.5']
+    const denied = checkMediaSubkeyModel(subkeyRecord, candidates)
+    if (denied !== undefined) return denied
+    return await handleImageEdits(request, env, ctx)
   }
 
-  // ── 联网检索（官方 agenttool 透传，按 DSH 与 OpenAI 兼容格式） ──
-  //
-  // ⚠️ 适配 DSH Search API 与扩展端点。
-  // 兼容入参：query, count, max_results, need_content, ori_question, rerank
   if (path === '/v1/search' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const query = typeof body.query === 'string' ? body.query.trim() : ''
-    if (query === '') return jsonError(400, 'query 不能为空', 'invalid_request_error')
-
-    const countRaw = body.count ?? body.max_results
-    const maxResults = typeof countRaw === 'number' && countRaw > 0 ? Math.min(countRaw, 20) : 5
-    // 相关性重排：默认开启（压制同名不同物的噪声），`rerank: false` 可关闭
-    const rerank = typeof body.rerank === 'boolean' ? body.rerank : true
-
-    const preferredRealm = (await resolveMediaRealm(env, url)) as 'cn' | 'global'
-    const realmCandidates: Array<{ realm: 'cn' | 'global'; providerId: string }> =
-      preferredRealm === 'global'
-        ? [
-            { realm: 'global', providerId: WORKBUDDY_INTL.id },
-            { realm: 'cn', providerId: DEFAULT_PROVIDER },
-          ]
-        : [
-            { realm: 'cn', providerId: DEFAULT_PROVIDER },
-            { realm: 'global', providerId: WORKBUDDY_INTL.id },
-          ]
-
-    let lastError: unknown
-    for (const cand of realmCandidates) {
-      const picked = await pickCredential(env, cand.realm, cand.providerId)
-      if (picked === undefined) continue
-      try {
-        const enterpriseId = picked.credential.extras?.enterpriseId || picked.credential.extras?.enterprise_id
-        const r = await webSearch(
-          {
-            uid: picked.uid,
-            accessToken: picked.credential.accessToken,
-            realm: cand.realm,
-            enterpriseId,
-          },
-          env,
-          { query, count: maxResults, rerank },
-        )
-        return json({ results: r.results })
-      } catch (error) {
-        lastError = error
-        console.warn(`[websearch] 分片 ${cand.realm} 账号 ${picked.uid} 搜索失败，尝试下一候选：`, error)
-      }
-    }
-
-    if (lastError !== undefined) {
-      return jsonError(502, lastError instanceof Error ? lastError.message : String(lastError), 'upstream_error')
-    }
-    return jsonError(503, '没有可用的搜索凭据（请先登录国内或国际版账号）', 'no_available_account')
+    return await handleSearch(request, env, ctx)
   }
 
-  // ── 抓网页正文（官方 agenttool 透传，返回 DSH 兼容结构） ──
   if (path === '/v1/fetch' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const target = typeof body.url === 'string' ? body.url.trim() : ''
-    if (!/^https?:\/\//i.test(target)) return jsonError(400, 'url 必须是 http(s) 绝对地址', 'invalid_request_error')
-
-    const preferredRealm = (await resolveMediaRealm(env, url)) as 'cn' | 'global'
-    const realmCandidates: Array<{ realm: 'cn' | 'global'; providerId: string }> =
-      preferredRealm === 'global'
-        ? [
-            { realm: 'global', providerId: WORKBUDDY_INTL.id },
-            { realm: 'cn', providerId: DEFAULT_PROVIDER },
-          ]
-        : [
-            { realm: 'cn', providerId: DEFAULT_PROVIDER },
-            { realm: 'global', providerId: WORKBUDDY_INTL.id },
-          ]
-
-    let lastError: unknown
-    for (const cand of realmCandidates) {
-      const picked = await pickCredential(env, cand.realm, cand.providerId)
-      if (picked === undefined) continue
-      try {
-        const enterpriseId = picked.credential.extras?.enterpriseId || picked.credential.extras?.enterprise_id
-        const r = await webFetch(
-          {
-            uid: picked.uid,
-            accessToken: picked.credential.accessToken,
-            realm: cand.realm,
-            enterpriseId,
-          },
-          env,
-          { url: target },
-        )
-        return json({ content: r.content })
-      } catch (error) {
-        lastError = error
-        console.warn(`[webfetch] 分片 ${cand.realm} 账号 ${picked.uid} 抓取失败，尝试下一候选：`, error)
-      }
-    }
-
-    if (lastError !== undefined) {
-      return jsonError(502, lastError instanceof Error ? lastError.message : String(lastError), 'upstream_error')
-    }
-    return jsonError(503, '没有可用的抓取凭据（请先登录国内或国际版账号）', 'no_available_account')
+    return await handleFetch(request, env, ctx)
   }
 
-  // ── 视频生成（异步，2026-11-05 实测可用） ──
-  //
-  // ## 为什么是「提交 + 轮询」而不是一次返回
-  //
-  // 实测 4 秒片子 **73 秒**出片。同步等会超过多数客户端超时（默认 30–60 秒），
-  // 请求被客户端断开后用户什么也拿不到，还照样扣积分。
-  //
-  // ## ⚠️ 查询用 POST，不是 GET
-  //
-  // `GET /v2/videos/generations/{id}` 返回 `404 page not found`。
-  // 真实路径是 `POST /v2/videos/tasks` + `{task_id}`。
-  if (path === '/v1/videos/generations' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const realm = await resolveMediaRealm(env, url)
-    if (!mediaCapable(realm)) {
-      return jsonError(400, `视频生成目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
-    }
-    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
-    if (prompt === '') return jsonError(400, 'prompt 必填', 'invalid_request')
-
-    /**
-     * 图生视频（可选）：`image` 是**首帧**，`last_image` 是尾帧。
-     *
-     * ⚠️ 与改图同样的纪律：必须是 http(s) URL 或 `data:image/...`，
-     * 我们**不下载、不转存**。裸 base64 提前拒绝并说清原因
-     *（上游取不到时只会回一句含糊的失败）。
-     */
-    const pickImage = (v: unknown): string | undefined =>
-      typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined
-    const firstImage = pickImage(body.image)
-    const lastImage = pickImage(body.last_image)
-    for (const [name, url] of [['image', firstImage], ['last_image', lastImage]] as const) {
-      if (url !== undefined && !/^(https?:\/\/|data:image\/)/i.test(url)) {
-        return jsonError(
-          400,
-          `${name} 必须是 http(s) URL 或 \`data:image/...;base64,...\`。`,
-          'invalid_request',
-        )
-      }
-    }
-
-    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
-    if (credential === undefined) return jsonError(503, '没有可用的国际版账号', 'no_available_account')
-
-    try {
-      const r = await submitVideo(
-        { uid: credential.uid, accessToken: credential.credential.accessToken },
-        env,
-        {
-          prompt,
-          ...(typeof body.model === 'string' && body.model !== '' ? { model: body.model } : {}),
-          ...(typeof body.seconds === 'number' ? { seconds: body.seconds } : {}),
-          ...(typeof body.aspect_ratio === 'string' && body.aspect_ratio !== ''
-            ? { aspectRatio: body.aspect_ratio }
-            : {}),
-          ...(typeof body.resolution === 'string' && body.resolution !== ''
-            ? { resolution: body.resolution }
-            : {}),
-          ...(typeof body.enable_audio === 'boolean' ? { enableAudio: body.enable_audio } : {}),
-          ...(firstImage === undefined ? {} : { image: firstImage }),
-          ...(lastImage === undefined ? {} : { lastImage }),
-        },
-      )
-      return json({
-        id: r.taskId,
-        object: 'video',
-        status: r.status,
-        // ⚠️ 明确告诉调用方去哪查、多久查 —— 否则客户端不知道 73 秒这件事
-        hint: '已提交。用 POST /v1/videos/tasks {"task_id":"…"} 查状态，通常 60–120 秒出片。'
-          + '⚠️ 涉政 / 真实领导人 / 敏感事件等题材会被上游内容审核拒绝（返回 failed 与原因，不扣积分）；'
-          + '普通题材（动物 / 静物 / 风景）不受影响。',
-      })
-    } catch (error) {
-      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
-    }
+  if ((path === '/v1/videos/generations' || path === '/v1/videos') && request.method === 'POST') {
+    const reqModel = subkeyRecord !== undefined && subkeyRecord.limits.models.length > 0 ? await peekOptionalModel(request) : ''
+    const candidates = isVideoModelId(reqModel)
+      ? [reqModel, `workbuddy/${reqModel}`]
+      : ['kling-video-v3', 'minimax-video-h3', 'workbuddy/kling-video-v3', 'workbuddy/minimax-video-h3']
+    const denied = checkMediaSubkeyModel(subkeyRecord, candidates)
+    if (denied !== undefined) return denied
+    return await handleVideoGenerations(request, env, ctx)
   }
 
-  // ── 查询视频任务 ──
   if (path === '/v1/videos/tasks' && request.method === 'POST') {
-    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-    const taskId = typeof body.task_id === 'string' ? body.task_id.trim() : ''
-    if (taskId === '') return jsonError(400, 'task_id 必填', 'invalid_request')
-    const realm = await resolveMediaRealm(env, url)
-    if (!mediaCapable(realm)) {
-      return jsonError(400, `视频生成目前只有**国际版**账号支持（${realm} 分片实测返回 401）。`, 'unsupported_realm')
-    }
-    const credential = await pickCredential(env, realm, WORKBUDDY_INTL.id)
-    if (credential === undefined) return jsonError(503, '没有可用的国际版账号', 'no_available_account')
-    try {
-      const r = await getVideoTask(
-        { uid: credential.uid, accessToken: credential.credential.accessToken },
-        env,
-        taskId,
-      )
-      return json({
-        id: r.taskId,
-        object: 'video',
-        status: r.status,
-        ...(r.urls.length === 0 ? {} : { data: r.urls.map((u) => ({ url: u })) }),
-        ...(r.durationSeconds === undefined ? {} : { seconds: r.durationSeconds }),
-        ...(r.credit === undefined ? {} : { usage: { credit: r.credit } }),
-        // ⚠️ `failed` 必须把上游原话交出去（例如风控拦截），
-        // 笼统报「生成失败」会让用户反复重试同一个 prompt。
-        ...(r.error === undefined ? {} : { error: { message: r.error } }),
-        ...(r.status === 'completed'
-          ? { hint: '视频是签名直链（约 12 小时有效），需要请立即下载。' }
-          : {}),
-      })
-    } catch (error) {
-      return jsonError(502, error instanceof Error ? error.message : String(error), 'upstream_error')
-    }
+    const denied = checkMediaSubkeyModel(subkeyRecord, [
+      'kling-video-v3',
+      'minimax-video-h3',
+      'workbuddy/kling-video-v3',
+      'workbuddy/minimax-video-h3',
+    ])
+    if (denied !== undefined) return denied
+    return await handleVideoTasks(request, env, ctx)
   }
 
-  // ── 媒体**代理下载**（解决图片/视频直链的跨域问题） ──
+  if (path === '/v1/3d/generations' && request.method === 'POST') {
+    const reqModel = subkeyRecord !== undefined && subkeyRecord.limits.models.length > 0 ? await peekOptionalModel(request) : ''
+    const candidates = [
+      'hy-3d',
+      'workbuddy/hy-3d',
+      'buddy/hy-3d',
+      ...(reqModel === '3.0' || reqModel === '3.1' ? [`hy-3d-${reqModel}`] : []),
+    ]
+    const denied = checkMediaSubkeyModel(subkeyRecord, candidates)
+    if (denied !== undefined) return denied
+    return await handleThreeDGenerations(request, env, ctx)
+  }
+
+  if (path === '/v1/3d/tasks' && request.method === 'POST') {
+    const denied = checkMediaSubkeyModel(subkeyRecord, ['hy-3d', 'workbuddy/hy-3d', 'buddy/hy-3d', 'hy-3d-3.0', 'hy-3d-3.1'])
+    if (denied !== undefined) return denied
+    return await handleThreeDTasks(request, env, ctx)
+  }
+
+  if (path.startsWith('/v1/3d/') && request.method === 'GET') {
+    const denied = checkMediaSubkeyModel(subkeyRecord, ['hy-3d', 'workbuddy/hy-3d', 'buddy/hy-3d', 'hy-3d-3.0', 'hy-3d-3.1'])
+    if (denied !== undefined) return denied
+    return await handleThreeDJobGet(request, env, ctx)
+  }
+
+  // ── 媒体**代理下载**（解决图片/视频/3D 直链的跨域问题） ──
   //
   // ## 为什么需要它
   //
-  // 上游返回的是 COS **签名直链**（图片约 24h、视频约 12h 有效）。
+  // 上游返回的是 COS **签名直链**（图片/3D 约 24h、视频约 12h 有效）。
   // 浏览器里 `<a download>` 对**跨域**资源不生效 —— 点击只会跳转打开，
   // 而不是下载。而 `fetch(url).then(blob)` 又会被 COS 的 CORS 拦掉。
   //
   // ⇒ 由网关**代理一次**：服务端拿到字节再原样回给浏览器，
   //   同源 ⇒ `download` 属性可用、`fetch` 不会被拦。
   //
-  // ⚠️ **只允许代理上游白名单域名**：这是个开放代理的经典漏洞入口
-  //（攻击者拿我们的 Worker/服务器去打任意目标）。用前缀白名单硬拦。
+  // ⚠️ **只允许代理上游白名单域名（`*.myqcloud.com` / `*.tencentcos.cn`）并禁止 302 重定向跳板**。
   if (path === '/admin/media/proxy' && request.method === 'GET') {
     const target = url.searchParams.get('url') ?? ''
-    /**
-     * ⚠️ **只允许腾讯云 COS 域名**。
-     *
-     * 这是开放代理的经典漏洞入口：不加限制的话，任何人都能拿我们的服务
-     * 去打任意目标（内网扫描、蹭带宽、当跳板）。用**后缀白名单**硬拦，
-     * 不用 `includes`（`evil-myqcloud.com` 会被 `includes` 放过）。
-     */
-    let host = ''
-    try {
-      const u = new URL(target)
-      host = u.protocol === 'https:' ? u.hostname.toLowerCase() : ''
-    } catch {
-      host = ''
-    }
-    const allowed = host !== ''
-      && (host.endsWith('.myqcloud.com') || host.endsWith('.tencentcos.cn'))
-    if (!allowed) {
+    if (!isAllowedMediaProxyUrl(target)) {
       return jsonError(
         400,
-        '只允许代理上游媒体直链（*.myqcloud.com）。这是**有意限制**：'
+        '只允许代理上游媒体直链（*.myqcloud.com / *.tencentcos.cn）。这是**有意限制**：'
           + '开放任意 URL 代理会让本服务变成可被滥用的跳板。',
         'invalid_request',
       )
     }
     try {
-      const upstream = await fetch(target, { signal: AbortSignal.timeout(120_000) })
+      const upstream = await fetch(target, {
+        redirect: 'error',
+        signal: AbortSignal.timeout(120_000),
+      })
       if (!upstream.ok || upstream.body === null) {
         return jsonError(502, `上游媒体取回失败：HTTP ${upstream.status}`, 'upstream_error')
       }
@@ -4973,83 +5159,144 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   // ── MCP（Model Context Protocol）端点 ──
   //
   // 让 OpenCode / Claude Code / Cursor / Cline 这类 AI 客户端**自动发现并调用**
-  // 我们的联网检索、网页抓取、文生图能力 —— 用户不用为每个工具写集成。
+  // 我们的联网检索、网页抓取、文生图、视频与 3D 能力 —— 用户不用为每个工具写集成。
   //
-  // ⚠️ 位置必须在**鉴权之后**（与其它端点一致）：MCP 能花积分（生图），
+  // ⚠️ 位置必须在**鉴权之后**（与其它端点一致）：MCP 能花积分（生图/视频/3D），
   //    匿名可调用等于把额度公开。
   // ⚠️ 用 `GET /mcp` 探测的客户端会收到 405 + Allow: POST —— 这是规范允许的
   //    降级信号，客户端据此退回纯 POST，不要改成 404。
   if (path === '/mcp') {
-    const r = await handleMcp(request, env)
-    // ⚠️ 通知类请求（无 id）按规范不回响应 ⇒ 回 202 空体
-    return r ?? new Response(null, { status: 202 })
+    const mcpCheck = await guardMcpSubkey(request, subkeyRecord)
+    if (mcpCheck.denied !== undefined) return mcpCheck.denied
+    const r = await handleMcp(request, env, ctx)
+    if (r === undefined) return new Response(null, { status: 202 })
+    return mcpCheck.isToolsList && subkeyRecord !== undefined && subkeyRecord.limits.models.length > 0
+      ? await filterMcpToolsListResponse(r, subkeyRecord)
+      : r
   }
 
   return json({ error: { message: 'not found', path } }, 404)
 }
 
-/**
- * 子密钥**模型白名单**校验（2026-10-21 审查补，M6 指出高危）。
- *
- * ## 缺陷：三维限制只接通了一维
- * 子密钥支持三维限制：IP / **模型** / token 配额。
- * 但 `authenticate()` 只在鉴权那一刻调用一次，而**那一刻模型名还未知**
- *（在请求体里）⇒ 它被传入 `model = ''` ⇒ 模型检查**恒被跳过**。
- *
- * 源码里原本有一句注释「真正的模型校验见下方 chat 分支」，
- * 而**那个分支从来不存在** —— 注释描述了一个没有实现的校验点。
- *
- * ⇒ 用户给子密钥配了「只允许 X 模型」，实际**任何模型都能用**。
- * 这是**安全项**，不是显示问题。
- *
- * ## 为什么用 `clone()` 而不是改造 `handleChatCompletions`
- * 请求体是一次性的流。`clone()` 只在**存在子密钥**时才发生（主密钥路径零开销），
- * 且网关自己也有体积上限保护。这样改动集中在入口，不用把 `ApiKeyRecord`
- * 一路透传进 provider 层。
- *
- * ⚠️ 只判 `models` 非空的子密钥；空数组 = 不限制（`modelAllowed` 的既有语义）。
- */
-/**
- * 解析「媒体能力」用哪个 realm。
- *
- * ## 🔴 为什么不直接用 `?realm=` 的默认值
- *
- * 生图 / 检索 / 抓网页**只有国际版账号能做**（实测国内 `401`、国际 `200`）。
- * 而客户端（Cherry Studio / ChatBox / Open WebUI…）**根本没法在配置里加
- * 查询参数** —— 它们只能填一个基础地址。
- *
- * ⇒ 默认值必须是 **global**，而不是给对话用的 `cn`。
- *
- * ## 解析顺序
- *
- * 1. 调用方**显式**给了 `?realm=` ⇒ 用它（尊重显式意图，包括传 `cn` 时如实报错）；
- * 2. 没给 ⇒ 看 `global` 分片有没有**可用的国际版账号**：
- *    - 有 ⇒ `global`（绝大多数部署的正常路径）；
- *    - 没有 ⇒ 回落到 `cn`，让下面的 `mediaCapable` 如实报「只有国际版支持」，
- *      而不是报「没有可用账号」—— 后者会让用户以为是账号掉线。
- *
- * ⚠️ 这里只决定**报错文案的准确性**，不决定成败：真正的闸门是
- * `mediaCapable(realm)`。所以「探测账号」失败（DO 读不到）也不该抛错，
- * 回落到 `global` 让下游走正常的错误路径。
- */
-async function resolveMediaRealm(env: Env, url: URL): Promise<string> {
-  const explicit = url.searchParams.get('realm')
-  if (explicit !== null && explicit !== '') return explicit
+function isImageModelId(model: string): boolean {
+  return model !== '' && /image|flux|dall-e|seedream|kolors|wanx/i.test(model)
+}
+
+function isVideoModelId(model: string): boolean {
+  return model !== '' && /video|kling|veo|sora|seedance|hailuo/i.test(model)
+}
+
+function mcpToolModelCandidates(toolName: string, argModel: string): string[] | undefined {
+  switch (toolName) {
+    case 'generate_image':
+      return isImageModelId(argModel)
+        ? [argModel, `workbuddy/${argModel}`]
+        : ['hy-image-3.5', 'workbuddy/hy-image-3.5']
+    case 'generate_video':
+      return isVideoModelId(argModel)
+        ? [argModel, `workbuddy/${argModel}`]
+        : ['kling-video-v3', 'minimax-video-h3', 'workbuddy/kling-video-v3', 'workbuddy/minimax-video-h3']
+    case 'get_video_task':
+      return ['kling-video-v3', 'minimax-video-h3', 'workbuddy/kling-video-v3', 'workbuddy/minimax-video-h3']
+    case 'generate_3d':
+      return [
+        'hy-3d',
+        'workbuddy/hy-3d',
+        'buddy/hy-3d',
+        ...(argModel === '3.0' || argModel === '3.1' ? [`hy-3d-${argModel}`] : []),
+      ]
+    case 'get_3d_task':
+      return ['hy-3d', 'workbuddy/hy-3d', 'buddy/hy-3d', 'hy-3d-3.0', 'hy-3d-3.1']
+    default:
+      return undefined
+  }
+}
+
+async function guardMcpSubkey(
+  request: Request,
+  record: ApiKeyRecord | undefined,
+): Promise<{ denied?: Response; isToolsList: boolean }> {
+  if (record === undefined || record.limits.models.length === 0 || request.method !== 'POST') {
+    return { isToolsList: false }
+  }
+  let payload: unknown
   try {
-    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
-    const accounts = await pool.listAccounts('global', Date.now())
-    const hasIntl = accounts.some(
-      (a) => !a.disabled && (a.provider ?? DEFAULT_PROVIDER) === WORKBUDDY_INTL.id,
+    payload = await readJsonCapped(request.clone())
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      return { denied: jsonError(413, '请求体超过允许上限', 'payload_too_large'), isToolsList: false }
+    }
+    return { isToolsList: false }
+  }
+  const messages = Array.isArray(payload) ? payload : [payload]
+  let isToolsList = false
+  for (const item of messages) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
+    const msg = item as Record<string, unknown>
+    const method = typeof msg['method'] === 'string' ? msg['method'] : ''
+    if (method === 'tools/list') {
+      isToolsList = true
+      continue
+    }
+    if (method !== 'tools/call') continue
+    const params =
+      msg['params'] !== null && typeof msg['params'] === 'object' && !Array.isArray(msg['params'])
+        ? (msg['params'] as Record<string, unknown>)
+        : {}
+    const toolName = typeof params['name'] === 'string' ? params['name'] : ''
+    const args =
+      params['arguments'] !== null && typeof params['arguments'] === 'object' && !Array.isArray(params['arguments'])
+        ? (params['arguments'] as Record<string, unknown>)
+        : {}
+    const argModel = typeof args['model'] === 'string' ? args['model'].trim() : ''
+    const candidates = mcpToolModelCandidates(toolName, argModel)
+    if (candidates !== undefined) {
+      const denied = checkMediaSubkeyModel(record, candidates)
+      if (denied !== undefined) return { denied, isToolsList: false }
+    }
+  }
+  return { isToolsList }
+}
+
+async function filterMcpToolsListResponse(response: Response, record: ApiKeyRecord): Promise<Response> {
+  try {
+    const body = (await response.clone().json()) as {
+      jsonrpc?: string
+      id?: unknown
+      result?: { tools?: Array<{ name?: unknown }> }
+    }
+    if (!Array.isArray(body?.result?.tools)) return response
+    const visibleTools = body.result.tools.filter((tool) => {
+      const name = typeof tool?.name === 'string' ? tool.name : ''
+      const candidates =
+        name === 'generate_3d'
+          ? ['hy-3d', 'workbuddy/hy-3d', 'buddy/hy-3d', 'hy-3d-3.0', 'hy-3d-3.1']
+          : mcpToolModelCandidates(name, '')
+      return candidates === undefined || checkMediaSubkeyModel(record, candidates) === undefined
+    })
+    return Response.json(
+      { ...body, result: { ...body.result, tools: visibleTools } },
+      { status: response.status, headers: response.headers },
     )
-    return hasIntl ? 'global' : 'cn'
   } catch {
-    return 'global'
+    return response
+  }
+}
+
+async function peekOptionalModel(request: Request): Promise<string> {
+  try {
+    const probe = request.clone()
+    const body = (await readJsonCapped(probe)) as { model?: unknown } | undefined
+    return typeof body?.model === 'string' ? body.model.trim() : ''
+  } catch {
+    return ''
   }
 }
 
 async function subkeyModelDenied(
   request: Request,
   record: ApiKeyRecord | undefined,
+  options?: { anthropic?: boolean },
 ): Promise<Response | undefined> {
   if (record === undefined) return undefined
   const rules = record.limits.models
@@ -5059,23 +5306,19 @@ async function subkeyModelDenied(
   const probe = request.clone()
   const body = (await readJsonCapped(probe).catch(() => undefined)) as { model?: unknown } | undefined
   const model = typeof body?.model === 'string' ? body.model : ''
-  /**
-   * 🔴 **拿不到模型名就直接 400**（2026-10-21 审查补，安全面专项）。
-   *
-   * 原来是「不拦，交给下游报错」—— 那是 **fail-open**：`{"model":123}` 这种
-   * 非字符串会让白名单校验整条跳过（实测拿到的是「没有可用账号」而不是 403）。
-   * 当前下游恰好也按 `typeof === 'string'` 取值，所以还不可利用；
-   * 但只要任何一层将来对空模型名做默认回填，这条立刻变成真实绕过。
-   *
-   * 与 `/v1/responses` 对齐：`model 必填`。
-   */
   if (model === '') {
+    if (options?.anthropic === true) {
+      return anthropicErrorJson('model 必填，且必须是字符串', 400, 'invalid_request_error')
+    }
     return json(
       { error: { message: 'model 必填，且必须是字符串', type: 'invalid_request_error' } },
       400,
     )
   }
   if (modelAllowed(model, rules)) return undefined
+  if (options?.anthropic === true) {
+    return anthropicErrorJson(`该 API Key 不被允许使用模型「${model}」`, 403, 'permission_error')
+  }
   return json(
     {
       error: {
@@ -5278,6 +5521,14 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
         continue
       }
       if (credential === undefined) continue
+      // 静态 API Key（如 Gemini AIzaSy...）或不含 refreshToken 的静态凭据不支持 OAuth 续期，直接跳过避免整点刷错误日志
+      if (
+        credential.extras?.['authMode'] === 'api_key' ||
+        typeof credential.refreshToken !== 'string' ||
+        credential.refreshToken.trim() === ''
+      ) {
+        continue
+      }
 
       const expiresAt = credential.expiresAt
       /**
@@ -5393,6 +5644,10 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {  l
         skipped += 1
         continue
       }
+      if (credential.extras?.['authMode'] === 'api_key') {
+        skipped += 1
+        continue
+      }
 
       try {
         /**
@@ -5435,10 +5690,12 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {  l
         // ⚠️ 走到这里说明「续期也救不回来」或「本来就不是鉴权错误」——
         // 成功路径必须清零鉴权失败计数（否则偶发失败会累积成误判）。
         await pool.noteAuthSuccess(account.uid).catch(() => undefined)
+        const paid = extractPaidStatusFromSummary(b) ?? extractPaidStatusFromSummary(credential)
         await pool.updateBalance(account.uid, now, {
           credits: b.total,
           expiring: b.expiring,
           earliestExpiry: b.earliestExpiry,
+          ...(typeof paid === 'boolean' ? { isPaid: paid } : {}),
         })
         // 🔴 余额恢复 ⇒ 解冻 `hard`（402 余额耗尽）冷却（与 `/admin/accounts/balance`
         // 同一段逻辑，两处各写一份必然分叉）。余额为 0 / 仍在冷却的其它维度一律不动，

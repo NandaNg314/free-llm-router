@@ -22,6 +22,7 @@ import { parseBalance } from '../src/upstream/checkin.ts'
 
 /** 造一份和线上同形的余额响应：18 个有效包（276 + 17×100 = 1976）+ 3 个失效包。 */
 function balancePayload(): string {
+  const futureExpiry = Date.now() + 30 * 86_400_000
   const accounts = []
   for (let i = 0; i < 18; i += 1) {
     accounts.push({
@@ -33,7 +34,7 @@ function balancePayload(): string {
       CapacityUnit: 'credits',
       CycleStartTime: '2026-10-16 11:43:33',
       CycleEndTime: '2026-11-16 11:43:32',
-      DeductionEndTime: 1794800612000,
+      DeductionEndTime: futureExpiry,
       PackageName: 'CodeBuddy个人版国内运营裂变',
       CapacityRemain: 100,
       CapacityUsed: 0,
@@ -47,7 +48,7 @@ function balancePayload(): string {
     accounts.push({
       AccountId: 1 + i, PackageName: 'CodeBuddy个人版拉新权益包',
       CapacityRemain: 0, CycleCapacityRemain: 0, Status: 3,
-      DeductionEndTime: 1794800612000,
+      DeductionEndTime: futureExpiry,
     })
   }
   return JSON.stringify({

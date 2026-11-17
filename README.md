@@ -2,12 +2,12 @@
 
 # free-llm-router
 
-**把多家大模型供应商的账号池，汇成一个 OpenAI 兼容 API。**
+**把多家大模型供应商的账号池，汇成统一的 OpenAI + Anthropic 兼容 API。**
 
-自动选号 · 冷却与容灾 · 签到与每日任务自动跑 · 生图 / 视频 / 联网检索 · 自带管理面板
+自动选号 · 冷却与容灾 · 签到与每日任务自动跑 · 生图 / 视频 / 混元 3D / 联网检索 · 自带管理面板
 
-![OpenAI 兼容](https://img.shields.io/badge/API-OpenAI%20%E5%85%BC%E5%AE%B9-412991)
-![15 家供应商](https://img.shields.io/badge/%E4%BE%9B%E5%BA%94%E5%95%86-15%20%E5%AE%B6-orange)
+![OpenAI & Anthropic 兼容](https://img.shields.io/badge/API-OpenAI%20%2B%20Anthropic-412991)
+![16 家供应商](https://img.shields.io/badge/%E4%BE%9B%E5%BA%94%E5%95%86-16%20%E5%AE%B6-orange)
 ![支持 Windows](https://img.shields.io/badge/%E6%9C%AC%E5%9C%B0%E7%89%88-Windows%20%7C%20macOS%20%7C%20Linux-0078D4)
 ![Node](https://img.shields.io/badge/Node-%E2%89%A5%2022.13-339933)
 ![License MIT](https://img.shields.io/badge/license-MIT-blue)
@@ -40,34 +40,36 @@
 
 ### 网关
 
-- **一个入口**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`，支持流式、非流式和工具调用。凡是能填自定义 Base URL 的 OpenAI 客户端都能直接接。
-- **出站自动修正**：工具调用配对断裂、`tool_choice`/`tools`/`stop` 形态不对、DeepSeek 思考模式缺 `reasoning_content`、`max_completion_tokens` 不被识别等，都在发出前修好，避免上游 400 让整条会话报废。
-- **15 家供应商**：Buddy、WorkBuddy、Cline、MiniMax、CodeArts、LobsterAI、TRAE、Qoder（国内 / 国际）、OpenCode、Raccoon、ZCode、Loomy、Gemini、Meoo。
+- **双协议原生入口**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（含 `/v1/messages/count_tokens`），支持流式、非流式、思考链和工具调用。数据面同时支持 `Authorization: Bearer <key>` 与 `x-api-key: <key>` 鉴权，并支持通过 `CORS_ORIGINS`（或面板配置页）控制跨域白名单。
+- **出站自动修正与续写救援**：工具调用配对断裂与跨轮重排、工具参数 Schema 归一化、Responses 结构化输出与 `reasoning.encrypted_content` 签名回传、Anthropic 工具内嵌图片与 `cache_read_input_tokens` 精确扣除均在网关内完成；支持可选开启流式截断自动续写与 Agent 预告句悬停救援（`AUTO_CONTINUATION=true`）。
+- **16 家供应商**：Buddy、WorkBuddy、Cline、MiniMax、CodeArts、LobsterAI、TRAE、Qoder（国内 / 国际）、OpenCode、Raccoon、ZCode、Loomy、Gemini（OAuth + API Key）、Meoo、ModelScope（魔搭社区）。
 
 ### 账号池
 
-- **自动调度**：默认先用积分最早到期的账号；失败时按上游错误类型决定换号、罚号还是只冷却某个模型。
-- **冷却与熔断**：账号级 / 模型级分开；国内版全部不可用时自动切国际版。
+- **自动调度与 Pro 专属模型分层**：默认先用积分最早到期的账号；针对 Pro 付费专属模型优先挑选付费档账号（无付费号时自动兜底）；按调用方作用域（`user` / `metadata.user_id` / 子密钥 ID）隔离会话粘性槽位。
+- **冷却与熔断**：账号级 / 模型级分开；`11140` 区域波次闸门按号池规模动态缩放阈值并支持指数退避与平静期清零；国内版全部不可用时自动切国际版。
 - **聚合模型**：`aggregate/<模型名>` 把多家的同一个模型归到一起，优先走积分最快作废的渠道，失败自动换下一家。
-- **多账号登录**：面板里设备码、扫码、短信登录，或粘贴凭据导入（自动识别是哪一家）。
+- **多账号登录**：面板里设备码、扫码、短信登录，或粘贴凭据 / API Key 导入（自动识别是哪一家）。
 
 ### 自动化
 
-- **每日签到**、**成长任务**（20+ 项，含专家体验、模板、画布、连登兑换、抽奖、猫猫旅行）。
+- **每日签到**、**成长任务**（覆盖 `skill_share`、`Sequential_Tasks_1` / `Sequential_Tasks_2`、专家体验、模板、画布、连登兑换、抽奖、猫猫旅行等全套任务）。
+- **运营活动查询与领奖**：内置 `/admin/campaign` 与 `/admin/campaign/claim`（默认 `dryRun: true` 安全预演，确认后一键领取星巴克等运营活动奖励）。
 - **国际版每日活跃**：自动跑完网页端 agent 会话（这是国际版拿积分的唯一方式）。
 - **后台维护**：每小时续期凭据、刷新余额、清理会话；到期时间未知的凭据也会保活。
 
-### 媒体能力（国际版账号）
+### 媒体能力与混元 3D
 
-- **生图** `/v1/images/generations`、**改图** `/v1/images/edits`（支持传入图片）
-- **视频** `/v1/videos/generations`（异步，支持图生视频）
-- **联网检索** `/v1/search`、**网页抓取** `/v1/fetch`
-- **MCP** `/mcp` —— OpenCode / Claude Code / Cursor / Cline 自动发现工具
+- **生图** `/v1/images/generations`、**改图** `/v1/images/edits`（国际版账号，支持传入本地图片 data URL）
+- **视频** `/v1/videos/generations`、`/v1/videos/tasks`（国际版账号，异步提交 + 归属账号轮询，支持首尾帧图生视频）
+- **混元 3D** `/v1/3d/generations`、`/v1/3d/tasks`、`GET /v1/3d/:jobId`（国际版与国内版 OAuth 账号均支持，自动签发临时云凭证 + TC3 签名，输出 `GLB` / `OBJ` / `FBX` / `STL` / `USDZ`）
+- **联网检索** `/v1/search`、**网页抓取** `/v1/fetch`（双分片智能选号与容灾）
+- **MCP** `/mcp` —— OpenCode / Claude Code / Cursor / Cline 自动发现 7 项工具（检索、抓取、生图、视频提交/查询、3D 提交/查询）
 
 ### 管理与安全
 
-- **子密钥**：给不同工具各发一把 Key，可限制请求数、token 数、可用模型、来源 IP（CIDR）、过期时间。
-- **管理面板**：8 个视图，深浅主题，手机可用；不加载任何外部资源，严格 CSP。
+- **子密钥**：给不同工具各发一把 Key（兼容 Bearer 与 `x-api-key`），可限制请求数、token 数、可用模型（含 `/v1/messages` 与媒体/3D 路由）、来源 IP（CIDR）、过期时间。
+- **管理面板**：8 个视图（含 3D 生成工作台与数据面 CORS 配置），深浅主题，手机可用；默认注入 `X-Robots-Tag: noindex, nofollow` 防搜索引擎收录，严格 CSP。
 - **凭据加密**：AES-GCM 落盘，密钥不进数据库（除非你选择自动生成）。
 
 ## 两种部署形态
@@ -161,7 +163,7 @@ node --env-file=.env dist/server.mjs
 |---|---|
 | **OpenAI SDK / 任何兼容客户端** | Base URL `http://127.0.0.1:11451/v1`，API Key 填子密钥 |
 | **Cherry Studio / ChatBox / Open WebUI / LobeChat** | 同上；生图也走这一套（`/v1/images/generations`） |
-| **Claude Code** | `ANTHROPIC_BASE_URL=http://127.0.0.1:11451`（走 `/v1/messages`） |
+| **Claude Code / Anthropic SDK** | `ANTHROPIC_BASE_URL=http://127.0.0.1:11451`、`ANTHROPIC_API_KEY=<主密钥或子密钥>`（原生支持 `/v1/messages`、`/v1/messages/count_tokens` 与 `x-api-key` 头） |
 | **Codex / DSH** | Base URL + `/v1/responses` |
 | **OpenCode / Cursor / Cline** | MCP：`/mcp`（见下） |
 
@@ -173,11 +175,11 @@ opencode mcp add my-router --global \
   --header 'Authorization=Bearer 你的API_KEY'
 ```
 
-接入后 AI 会自动发现三个工具：`web_search` / `web_fetch` / `generate_image`。
+接入后 AI 会自动发现 7 个工具：`web_search` / `web_fetch` / `generate_image` / `generate_video` / `get_video_task` / `generate_3d` / `get_3d_task`。
 
 ## 媒体能力
 
-这三项**只有 WorkBuddy 国际版账号**支持（国内账号实测返回 401）。
+生图与视频需要 **WorkBuddy 国际版账号**；混元 3D 生成、联网检索与抓网页支持国际版与国内版 OAuth 账号自动选号与容灾。
 
 ### 生图
 
@@ -222,6 +224,21 @@ curl -X POST http://127.0.0.1:11451/v1/videos/tasks \
 > 返回 `failed` 与原因（`Failure to pass the risk control system`）。
 > 这类失败**不扣积分**（上游失败任务不回 `usage`，实测确认）。
 
+### 混元 3D 生成（异步）
+
+```bash
+# 1. 提交文生 3D 或图生 3D（支持 GLB / OBJ / FBX / STL / USDZ）
+curl -X POST http://127.0.0.1:11451/v1/3d/generations \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"prompt":"一把蒸汽朋克单手剑，精细PBR材质","model":"3.1","result_format":"GLB","enable_pbr":true}'
+# → {"id":"job_...","job_id":"job_...","object":"3d.task","status":"RUN"}
+
+# 2. 按原提交账号轮询任务状态（POST /v1/3d/tasks 或 GET /v1/3d/:job_id）
+curl -X POST http://127.0.0.1:11451/v1/3d/tasks \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"job_id":"job_..."}'
+```
+
 ### 联网检索 / 抓网页
 
 ```bash
@@ -247,9 +264,10 @@ curl -X POST http://127.0.0.1:11451/v1/fetch -H "Authorization: Bearer $KEY" \
 | OpenCode | ✅ | — | — | — | 匿名通道 |
 | Raccoon | ✅ | 扫码 | ✅ | — | |
 | ZCode | ✅ | 扫码 | ✅ | ✅ | |
-| Loomy | ✅ | 短信 | ✅ | — | |
-| Gemini | ✅ | 凭据导入 | ✅ | — | OAuth 形态 |
+| Loomy | ✅ | 短信 / 微信扫码 | ✅ | — | |
+| Gemini | ✅ | 凭据 / API Key 导入 | ✅ | — | 支持 Gemini CLI OAuth 与 Google AI Studio 免费 API Key（`AIzaSy...`） |
 | Meoo | ✅ | 设备码 | ✅ | — | |
+| ModelScope（魔搭） | ✅ | API Key 导入 | — | — | 魔搭社区免费推理 API Key（`ms-...`） |
 
 ## 管理面板
 
@@ -260,10 +278,10 @@ curl -X POST http://127.0.0.1:11451/v1/fetch -H "Authorization: Bearer $KEY" \
 | 供应商与账号 | 账号池健康度、每家供应商的账号与能力、单号运维 |
 | 用量 | 请求量、token、成功率，按模型和账号拆分 |
 | 任务中心 | 签到、成长任务、限时补偿；**自动调度开关** |
-| 媒体与检索 | 生图 / 改图 / 视频 / 联网检索 / 抓网页 |
+| 媒体与检索 | 生图 / 改图 / 视频 / 混元 3D 生成 / 联网检索 / 抓网页 |
 | API Key | 子密钥签发与管理 |
 | 模型 | 模型目录、启停、单模型资费探测 |
-| 配置 | 接入指南、路由策略、永久积分锁 |
+| 配置 | 接入指南、路由策略、流式自动续写、数据面 CORS、永久积分锁 |
 | 日志 | 最近的请求与任务记录 |
 
 ## API 一览
@@ -272,14 +290,22 @@ curl -X POST http://127.0.0.1:11451/v1/fetch -H "Authorization: Bearer $KEY" \
 |---|---|---|
 | GET | `/v1/models` | 模型目录 |
 | POST | `/v1/chat/completions` | 对话（OpenAI 格式） |
-| POST | `/v1/responses` | Responses API |
+| POST | `/v1/responses` | OpenAI Responses API |
+| POST | `/v1/messages` | Anthropic Messages API（兼容 `x-api-key`） |
+| POST | `/v1/messages/count_tokens` | Anthropic 上下文 Token 估算 |
 | POST | `/v1/images/generations` | 文生图 |
 | POST | `/v1/images/edits` | 改图 / 图生图 |
 | POST | `/v1/videos/generations` | 提交视频任务 |
 | POST | `/v1/videos/tasks` | 查询视频任务 |
+| POST | `/v1/3d/generations` | 提交混元 3D 任务（文生 3D / 图生 3D） |
+| POST | `/v1/3d/tasks` | 查询混元 3D 任务进度 |
+| GET | `/v1/3d/:jobId` | 按 Job ID 查询混元 3D 任务 |
 | POST | `/v1/search` | 联网检索 |
 | POST | `/v1/fetch` | 抓网页正文 |
-| POST | `/mcp` | MCP（Streamable HTTP） |
+| POST | `/mcp` | MCP（Streamable HTTP，7 项工具） |
+| GET | `/admin/campaign` | 查询国内个人版账号运营活动进度 |
+| POST | `/admin/campaign/claim` | 批量预演或领取运营活动奖励（默认 `dryRun: true`） |
+| GET / POST | `/admin/config/cors` | 读取或热更新数据面 CORS 白名单 |
 | GET | `/version` | 版本号 |
 | GET | `/healthz` | 存活探针 |
 
@@ -311,10 +337,8 @@ docker compose up -d --build
 
 ## 已知限制
 
-- **生图 / 视频 / 检索 / MCP 只支持国际版账号** —— 国内账号在上游侧就是 401，不是我们的限制。
-- **两个任务做不了**：`wb_wechat_oa_subscribe_task`（要真实关注公众号满 24 小时）、
-  `Sequential_Tasks_1`（小程序口径，判据未验证）。
-- **`WorkBuddy_Valorant` 有活动截止日**（2026-11-15），过期后任务消失。
+- **生图与视频仅支持国际版账号** —— 国内账号在生图/视频上游侧返回 401；混元 3D、联网检索与抓网页支持国际版与国内版 OAuth 账号（静态 `ck_` API Key 账号不支持签发 3D 临时云凭证）。
+- **仅剩一项任务无法自动化**：`wb_wechat_oa_subscribe_task`（要求真实微信扫码关注公众号满 24 小时）；`skill_share` 与 `Sequential_Tasks_1` / `Sequential_Tasks_2` 均已支持自动完成；已过期的 `WorkBuddy_Valorant` 已从默认队列退役。
 - **视频内容审核**：涉政、真实领导人、敏感事件等题材会被上游风控拒绝。
   **不扣积分**（失败任务不回 `usage`）。
   这是内容合规限制，与时长/画质无关；换成普通题材即可正常出片。

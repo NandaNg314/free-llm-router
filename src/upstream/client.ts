@@ -122,6 +122,11 @@ export const CHANNEL_BLOCKED_CODE = -108128
 /** 已知业务码 → 错误类别。数值来自 Go 侧实测。 */
 const CODE_KIND: Record<number, ErrorKind> = {
   6004: 'rate_limited',
+  // 6020（queue.waiting.title）/ 6021（queue.full.title）：渠道级准入排队，非账号故障（`b957e32` / `c06cd51`）
+  6020: 'rate_limited',
+  6021: 'rate_limited',
+  // 10105：网页端单账号活跃会话已达上限（`1e1ee4d`），按结构化业务码识别
+  10105: 'rate_limited',
   11102: 'model_unavailable',
   14003: 'rate_limited',
   14018: 'credit_exhausted',
@@ -176,12 +181,13 @@ const CODE_KIND: Record<number, ErrorKind> = {
   11135: 'image_invalid',
   // ── 请求形状类（与账号无关，见 `bad_request` 的说明） ──
   11101: 'bad_request', // 参数反序列化失败（如 stop 传了字符串、arguments 传了对象）
-  11129: 'bad_request', // 工具 schema 不合法
-  11133: 'bad_request', // tool_call 名字为空等
+  11129: 'bad_request', // 工具 schema 不合法（绝不喂账号连败降权或熔断，`615dc75`）
+  11133: 'bad_request', // tool_call 名字为空 / 模型拒绝参数
   11148: 'bad_request', // tool_call 配对/顺序断裂
   11150: 'bad_request', // reasoning_effort 该模型不支持
+  11151: 'bad_request', // 消息含空 content 段（确定性请求级 400）
   11155: 'bad_request', // 思考模式下缺上一轮 reasoning_content
-  // 11134「模型供应方暂不可用」：模型级繁忙，与 6004/14003 同档（见 `refineModelScoped`）
+  // 11134「模型供应方暂不可用 / 过载」：供应商过载（非渠道排队，换模型有效），与 6004/14003 同档（`c06cd51`）
   11134: 'rate_limited',
   // ⚠️ **11128 不是 `request_illegal`**（实测缺陷，用户报「账号是好的但就是用不了」）。
   //
@@ -471,16 +477,191 @@ export function isWafBlocked(httpStatus: number, bodyText: string): boolean {
   return true
 }
 
+const RETRY_AFTER_SANITY_SEC = 600
+
+/**
+ * 是否包含确定性的请求参数/工具定义损坏标记（`615dc75`）。
+ *
+ * 部分网关层或 `extError` 形态不带顶层数字 `code: 11129`（例如
+ * `{"extError":{"code":"invalid_function_parameters"}}` 或纯文本 `invalid function call parameters`）。
+ * 若漏判落入 `unknown` / `server`，会白白触发换号甚至喂账号熔断。
+ */
+function isBadParamsMarker(bodyText: string): boolean {
+  const lower = bodyText.toLowerCase()
+  return (
+    lower.includes('invalid_function_parameters') ||
+    lower.includes('invalid function call parameters') ||
+    lower.includes('unmarshal chat params failed')
+  )
+}
+
+/**
+ * 报告响应体是否为结构化业务码 `11134`（模型供应商暂时过载，`c06cd51`）。
+ *
+ * ⚠️ 成因是模型供应商侧过载而非渠道排队（`6020`/`6021`）：「换个模型」是有效出路，
+ * 给客户端的提示绝不能说「队列满」（`queue is full`）。只认结构化业务码。
+ */
+export function isProviderOverloaded(bodyText: string): boolean {
+  return parseEnvelope(bodyText)?.code === 11134
+}
+
+/**
+ * 报告响应体是否为结构化业务码 `6020` / `6021`（上游渠道准入排队 / 队列满，`b957e32`）。
+ *
+ * ⚠️ 只认结构化 `code` 字段，避免 `requestId` 等碰巧含 `6020`/`6021` 造成误判。
+ */
+export function isUpstreamQueueBusy(bodyText: string): boolean {
+  const code = parseEnvelope(bodyText)?.code
+  return code === 6020 || code === 6021
+}
+
+/**
+ * 从排队（`6020`/`6021` 的 `data.retry_after`）或供应商过载（`11134` 的 `retry_policy.retry_after`）
+ * 响应体中提取上游明示的等待秒数（上限 600 秒，`b957e32` / `panel-client.go`）。
+ */
+export function parseQueueRetryAfterSec(bodyText: string): number | undefined {
+  const env = parseEnvelope(bodyText)
+  let secs: number | undefined
+  if (env !== undefined && env.data !== null && typeof env.data === 'object' && !Array.isArray(env.data)) {
+    const raw = (env.data as Record<string, unknown>).retry_after
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+      secs = Math.ceil(raw)
+    }
+  }
+  if (secs === undefined) {
+    try {
+      const parsed = JSON.parse(bodyText.trim().replace(/^data:\s*/, '')) as unknown
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const obj = parsed as Record<string, unknown>
+        const dataObj = obj.data
+        if (dataObj !== null && typeof dataObj === 'object' && !Array.isArray(dataObj)) {
+          const d = (dataObj as Record<string, unknown>).retry_after
+          if (typeof d === 'number' && Number.isFinite(d) && d > 0) secs = Math.ceil(d)
+        }
+        if (secs === undefined) {
+          const rp = obj.retry_policy
+          if (rp !== null && typeof rp === 'object' && !Array.isArray(rp)) {
+            const r = (rp as Record<string, unknown>).retry_after
+            if (typeof r === 'number' && Number.isFinite(r) && r > 0) secs = Math.ceil(r)
+          }
+        }
+      }
+    } catch {
+      // 非纯 JSON 时忽略，绝不从自由文本里盲抓数字
+    }
+  }
+  if (secs === undefined || secs <= 0) return undefined
+  return Math.min(secs, RETRY_AFTER_SANITY_SEC)
+}
+
+/**
+ * 区分 `11134`（模型供应商过载）与 `6020`/`6021`（渠道排队）的精准网关提示文案（`c06cd51`）。
+ */
+export function upstreamBusyHint(bodyText: string): string | undefined {
+  if (isProviderOverloaded(bodyText)) {
+    return 'the upstream model provider is temporarily overloaded (not an account problem); retry after the Retry-After delay or switch to another model'
+  }
+  if (isUpstreamQueueBusy(bodyText)) {
+    return 'upstream admission queue is full (channel-level capacity, not an account problem); retry after a short wait'
+  }
+  return undefined
+}
+
+/**
+ * 判定建网页会话是否因「活跃会话已达上限」（业务码 `10105`）被拒（`1e1ee4d`）。
+ *
+ * ⚠️ **必须按结构化业务码 `code === 10105` 判定，绝不在错误文本中做子串搜索**：
+ * `requestId: "r-10105-x"`、其他业务码消息提及 `"10105"` 或网关 HTML/纯文本含 `"10105"`
+ * 均不得误判，否则会误停用户正在使用的活跃会话。
+ */
+export function isWebConversationLimit(input: unknown, bodyText?: string): boolean {
+  if (typeof bodyText === 'string') {
+    return parseEnvelope(bodyText)?.code === 10105
+  }
+  if (input === null || input === undefined) return false
+  if (typeof input === 'string') {
+    return parseEnvelope(input)?.code === 10105
+  }
+  if (input instanceof UpstreamError) {
+    if (input.code === 10105) return true
+    return parseEnvelope(input.detail)?.code === 10105
+  }
+  if (input instanceof Error) {
+    return parseEnvelope(input.message)?.code === 10105
+  }
+  if (typeof input === 'object' && !Array.isArray(input)) {
+    const code = (input as Record<string, unknown>).code
+    if (code === 10105 || code === '10105') return true
+  }
+  return false
+}
+
+/**
+ * 报告响应体是否为「账号被上游风控限制」（结构化 `code === 11140` + 账号专属风控文书，`c06cd51`）。
+ *
+ * ⚠️ 两条必须同时成立，且剔除泛化词「已被限制」：
+ * - 泛化措辞「已被限制」会命中 `{"code":11140,"msg":"该模型已被限制使用，请稍后再试"}`（模型级限制）；
+ * - 无 `code: 11140` 的风控文本（如其他业务码或正文讨论）也不算账号风控限制。
+ */
+export function isRestricted(bodyText: string): boolean {
+  if (parseEnvelope(bodyText)?.code !== 11140) return false
+  const lower = bodyText.toLowerCase()
+  return bodyText.includes('账号存在异常行为') || lower.includes('unusual activity')
+}
+
+/**
+ * 报告响应体是否属于 `11140` 账号级风控限制的任一形态（风控文书或 `11140` + `request illegal`，`c06cd51`）。
+ *
+ * ⚠️ 两种形态都要求结构化 `code === 11140`：`"11-128"` 渠道校验或其他业务码（如 `10001`）
+ * 上的 `"request illegal"` 不属于账号风控限制，不得触发连坐暂停。
+ */
+export function isAccountRestriction(bodyText: string): boolean {
+  if (isRestricted(bodyText)) return true
+  if (parseEnvelope(bodyText)?.code !== 11140) return false
+  const lower = bodyText.toLowerCase()
+  return lower.includes('request illegal') || lower.includes('illegal request')
+}
+
+/**
+ * 细化 `code === 11140` 的具体错误类别（`c06cd51`）：
+ * `11140` 同时承载账号风控限制、模型供应商限流、模型/功能级限制与内容安全审核，
+ * 若一律归为 `request_illegal` 会把临时限流或模型限制误判成封号并触发区域连坐暂停。
+ */
+function classifyCode11140(bodyText: string): ErrorKind {
+  if (isAccountRestriction(bodyText)) return 'request_illegal'
+  const lower = bodyText.toLowerCase()
+  if (/rate[- ]?limit|too many requests|频率限制|请求过多/.test(lower)) {
+    return 'rate_limited'
+  }
+  if (/(?:该|此|当前)?模型已被限制|功能已被限制|model\s+(?:is|has been)\s+restricted/.test(lower)) {
+    return 'model_denied'
+  }
+  if (/safety review|content policy|security review|内容安全|安全审核/.test(lower)) {
+    return 'bad_request'
+  }
+  return 'request_illegal'
+}
+
+function normalizeClassifiedMsg(code: number, rawMsg: string): string {
+  if (code === 11134 && (rawMsg === '' || /queue/i.test(rawMsg))) {
+    return 'upstream model provider is temporarily overloaded; retry after a short wait or switch to another model'
+  }
+  if ((code === 6020 || code === 6021) && (rawMsg === '' || rawMsg === 'queue.waiting.title' || rawMsg === 'queue.full.title')) {
+    return 'upstream admission queue is full; retry after a short wait'
+  }
+  return rawMsg
+}
+
 /**
  * 分类一次响应。
  *
  * 判定顺序即语义（Go 侧 12 层优先级的精简版，保留了顺序敏感的部分）：
  * 1. WAF（403 无信封）—— 必须**最先**判，否则会被通用 4xx 分支吃掉；
- * 2. 5xx → `server`；
- * 3. 信封里的业务码 → 对应类别；
+ * 2. 5xx → 已知业务码优先，否则 `server`；
+ * 3. 信封里的业务码 → 对应类别（含 `11140` 子类细化）；
  * 4. 401/403（有信封或非 403）→ `auth_error`；
  * 5. 404 → `not_found`；
- * 6. 其余 → 按状态码粗分。
+ * 6. 其余 → 按状态码与确定性参数错误特征粗分。
  */
 export function classify(httpStatus: number, bodyText: string): { kind: ErrorKind; code?: number; msg: string } {
   // ── 1. WAF：必须最先判 ──
@@ -499,21 +680,29 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
   // 旧实现把 5xx 判在业务码之前 ⇒ 这类被一律成 `server`（账号级，喂熔断），
   // 连续几次就把好账号熔断掉 —— 「账号是好的却用不了」的第二条来源。
   //
-  // 判据要**足够窄**：只有信封里的 code 属于已知业务码时才越过 5xx，
-  // 否则真网关故障（HTML/无信封/未知码）仍必须落 `server`。
+  // 判据要**足够窄**：只有信封里的 code 属于已知业务码（或明确是请求参数反序列化/工具参数错误）
+  // 时才越过 5xx，否则真网关故障（HTML/无信封/未知码）仍必须落 `server`。
   if (httpStatus >= 500) {
-    const known = envelope !== undefined ? CODE_KIND[envelope.code] : undefined
+    const known =
+      envelope !== undefined
+        ? envelope.code === 11140
+          ? classifyCode11140(bodyText)
+          : CODE_KIND[envelope.code]
+        : undefined
     if (known !== undefined && envelope !== undefined) {
-      return { kind: known, code: envelope.code, msg: envelope.msg }
+      return { kind: known, code: envelope.code, msg: normalizeClassifiedMsg(envelope.code, envelope.msg) }
+    }
+    if (envelope === undefined && isBadParamsMarker(bodyText)) {
+      return { kind: 'bad_request', msg: bodyText.trim().slice(0, 200) }
     }
     return { kind: 'server', code: envelope?.code, msg: envelope?.msg ?? `upstream ${httpStatus}` }
   }
 
   // ── 3. 业务码（有信封时优先按码判） ──
   if (envelope !== undefined) {
-    const mapped = CODE_KIND[envelope.code]
+    const mapped = envelope.code === 11140 ? classifyCode11140(bodyText) : CODE_KIND[envelope.code]
     if (mapped !== undefined) {
-      return { kind: mapped, code: envelope.code, msg: envelope.msg }
+      return { kind: mapped, code: envelope.code, msg: normalizeClassifiedMsg(envelope.code, envelope.msg) }
     }
     // ── 3b. 码已归一但仍落在表外的兜底 ──
     //
@@ -530,10 +719,13 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
     if (httpStatus === 429) {
       return { kind: 'rate_limited', code: envelope.code, msg: envelope.msg }
     }
+    if (httpStatus >= 400 && isBadParamsMarker(bodyText)) {
+      return { kind: 'bad_request', code: envelope.code, msg: envelope.msg }
+    }
     return { kind: 'unknown', code: envelope.code, msg: envelope.msg }
   }
 
-  // ── 4. 无信封：按状态码 ──
+  // ── 4. 无信封：按状态码与确定性参数错误特征 ──
   if (httpStatus === 401 || httpStatus === 403) {
     return { kind: 'auth_error', msg: `upstream ${httpStatus}` }
   }
@@ -547,6 +739,9 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
     return { kind: 'credit_exhausted', msg: 'upstream 402' }
   }
   if (httpStatus >= 400) {
+    if (isBadParamsMarker(bodyText)) {
+      return { kind: 'bad_request', msg: bodyText.trim().slice(0, 200) || `upstream ${httpStatus}` }
+    }
     return { kind: 'unknown', msg: `upstream ${httpStatus}` }
   }
 

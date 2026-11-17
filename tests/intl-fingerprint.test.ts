@@ -17,7 +17,15 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { deriveUuidLike, intlDeviceHeaders } from '../src/upstream/headers.ts'
+import {
+  billingHeaders,
+  cliChatHeaders,
+  cliCommonHeaders,
+  deriveUuidLike,
+  desktopHeaders,
+  intlDeviceHeaders,
+  referenceChatHeaders,
+} from '../src/upstream/headers.ts'
 import { deriveIntlConversationId } from '../src/upstream/conversation.ts'
 
 const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -75,4 +83,26 @@ test('⚠️ 会话键为空时退回随机（不伪造稳定值）', async () =
   const b = await deriveIntlConversationId('workbuddy:aaa', '')
   assert.notEqual(a, b, '无法判定会话时宁可随机，也不要谎称它们是同一会话')
   assert.match(a, UUID_SHAPE)
+})
+
+test('🔴 国际服所有出站头构造器均不得泄漏国内 5.11.3 的 X-Client-* 三头', () => {
+  const glHeaders = [
+    referenceChatHeaders({ uid: 'workbuddy:u-1', accessToken: 'tok', variant: 'workbuddy' }),
+    cliCommonHeaders({ uid: 'u-1', machineId: 'm1', sessionId: 's1', variant: 'workbuddy' }),
+    cliChatHeaders({
+      uid: 'u-1',
+      machineId: 'm1',
+      sessionId: 's1',
+      accessToken: 'tok',
+      conversationRequestId: 'r'.repeat(32),
+      variant: 'workbuddy',
+    }),
+    desktopHeaders({ uid: 'workbuddy:u-1', accessToken: 'tok', realm: 'global' }),
+    billingHeaders({ uid: 'workbuddy:u-1', accessToken: 'tok', realm: 'global' }),
+  ]
+  for (const h of glHeaders) {
+    for (const key of ['X-Client-Version', 'X-Client-Platform', 'X-Client-Product']) {
+      assert.ok(!(key in h), `国际服头集出现国内专属 ${key}=${h[key]}`)
+    }
+  }
 })

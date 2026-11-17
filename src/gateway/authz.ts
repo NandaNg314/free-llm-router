@@ -27,24 +27,67 @@ import {
   resetUsageWindow,
 } from '../store/apikeys.js'
 
-/** 主密钥（`API_KEY` secret）比较：恒定时间。 */
-function constantTimeEqual(a: string, b: string): boolean {
-  const ea = new TextEncoder().encode(a)
-  const eb = new TextEncoder().encode(b)
-  // 长度不同也要走完整比较（否则长度会泄漏），故用最大长度循环。
-  const len = Math.max(ea.length, eb.length)
-  let diff = ea.length ^ eb.length
-  for (let i = 0; i < len; i += 1) {
-    diff |= (ea[i] ?? 0) ^ (eb[i] ?? 0)
+/**
+ * 主密钥（`API_KEY` secret）恒定时间比较。
+ *
+ * ⚠️ 先各自做 SHA-256 摘要固定为 32 字节再按位异或：
+ * 避免直接按最大长度循环泄漏期望密钥的长度侧信道，且空串也走完整摘要保持耗时形状一致。
+ */
+export async function constantTimeEqual(a: string, b: string): Promise<boolean> {
+  const enc = new TextEncoder()
+  const [ha, hb] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(a)),
+    crypto.subtle.digest('SHA-256', enc.encode(b)),
+  ])
+  const va = new Uint8Array(ha)
+  const vb = new Uint8Array(hb)
+  let diff = 0
+  for (let i = 0; i < va.length; i += 1) {
+    diff |= (va[i] ?? 0) ^ (vb[i] ?? 0)
   }
   return diff === 0
 }
 
-/** 从请求头取 Bearer 明文。 */
+/** 从请求头取 `Authorization: Bearer <key>` 明文。 */
 export function bearerOf(request: Request): string {
-  const header = request.headers.get('authorization') ?? ''
-  const prefix = 'Bearer '
-  return header.startsWith(prefix) ? header.slice(prefix.length) : ''
+  const header = (request.headers.get('authorization') ?? '').trim()
+  const match = /^Bearer\s+(.+)$/i.exec(header)
+  return match === null ? '' : (match[1] ?? '').trim()
+}
+
+/** 从请求头取 Anthropic 风格的 `x-api-key` 明文。 */
+export function xApiKeyOf(request: Request): string {
+  return (request.headers.get('x-api-key') ?? '').trim()
+}
+
+/** 是否属于数据面鉴权路径（`/v1/*`、`/messages*` 与 `/mcp` 同时接受 Bearer 与 `x-api-key`，且允许子密钥）。 */
+export function isDataPlaneAuthPath(pathname: string): boolean {
+  return (
+    pathname === '/v1' ||
+    pathname.startsWith('/v1/') ||
+    pathname === '/messages' ||
+    pathname === '/messages/count_tokens' ||
+    pathname === '/mcp' ||
+    pathname.startsWith('/mcp/')
+  )
+}
+
+/**
+ * 提取请求携带的 API 密钥。
+ *
+ * - 优先 `Authorization: Bearer <key>`；若已显式提供非空 Bearer，绝不回退尝试第二个头
+ *  （防止单次请求携带双头试探两把密钥或混淆主/子密钥身份）；
+ * - 若未提供 Bearer 且 `allowXApiKey !== false`，兼容读取 `x-api-key: <key>`
+ *  （Claude Code / Anthropic SDK 默认只发 `x-api-key`）。
+ */
+export function apiKeyOf(request: Request, options?: { allowXApiKey?: boolean }): string {
+  const bearer = bearerOf(request)
+  if (bearer !== '') return bearer
+  if (options?.allowXApiKey !== false) {
+    const xKey = xApiKeyOf(request)
+    if (xKey !== '') return xKey
+  }
+  return ''
 }
 
 /**
@@ -89,14 +132,21 @@ export async function authenticate(
   request: Request,
   env: Env,
   model: string,
+  options?: { allowXApiKey?: boolean },
 ): Promise<AuthResult> {
-  const provided = bearerOf(request)
-  if (provided === '') return { kind: 'none' }
+  const provided = apiKeyOf(request, options)
+  if (provided === '') {
+    // 仍跑一次空摘要比较以抹平缺头的时序形状
+    if (env.API_KEY !== undefined && env.API_KEY !== '') {
+      await constantTimeEqual('', env.API_KEY)
+    }
+    return { kind: 'none' }
+  }
 
   // ① 先比主密钥。⚠️ 顺序有意义：主密钥的处理**不碰 DO**
   //（省一次往返，且主密钥不依赖任何存储状态 —— 即使 DO 挂了管理端仍可用）。
   const expected = env.API_KEY
-  if (expected !== undefined && expected !== '' && constantTimeEqual(provided, expected)) {
+  if (expected !== undefined && expected !== '' && (await constantTimeEqual(provided, expected))) {
     return { kind: 'admin' }
   }
 
@@ -208,6 +258,12 @@ const subkeyByCtx = new WeakMap<object, { record: ApiKeyRecord; ip: string }>()
 export function registerSubkeyUsage(ctx: object | undefined, record: ApiKeyRecord, ip: string): void {
   if (ctx === undefined) return
   subkeyByCtx.set(ctx, { record, ip })
+}
+
+/** 读取挂在 `ctx` 上的子密钥记录（主密钥请求返回 `undefined`）。 */
+export function subkeyOf(ctx: object | undefined): ApiKeyRecord | undefined {
+  if (ctx === undefined) return undefined
+  return subkeyByCtx.get(ctx)?.record
 }
 
 /**

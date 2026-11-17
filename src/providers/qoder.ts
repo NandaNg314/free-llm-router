@@ -313,6 +313,74 @@ const EXTRA_MACHINE_TOKEN = 'machineToken'
 const EXTRA_MACHINE_TYPE = 'machineType'
 /** 可选的第三件（`Cosy-MachineCode`），runtime-info 输出里与 token/type 同出。 */
 const EXTRA_MACHINE_CODE = 'machineCode'
+/** 可选的计算机主机名（`Cosy-MachineHostname`），Windows 中文系统常见非 ASCII 字符（`88lin` `43d8960`）。 */
+const EXTRA_MACHINE_HOSTNAME = 'machineHostname'
+/** 可选的设备身份来源标记（`real` | `derived`，参考 `xu20060420fan-cell` `6e453f3`）。 */
+const EXTRA_MACHINE_IDENTITY_SOURCE = 'machineIdentitySource'
+
+/**
+ * 返回 Qoder 官方 `runtime-info` 辅助程序对应的环境码（对齐 `xu20060420fan-cell` `f46a277`）。
+ *
+ * - **国际版（`qoder`）→ `'3'`**：调用方式 `runtime-info 3 --account-stdin`，stdin 传入 `{"account":"<uid>"}\n`；
+ * - **中国版（`qodercn`）→ `'0'`**：调用方式 `runtime-info 0 --account-stdin`。
+ *
+ * ⚠️ 踩坑记录：裸跑 `runtime-info`（不传 `'3'`）产出的默认是国内环境 `'0'` 的 token，
+ * 拿去打国际版 `/sash/api/v1/me/campaigns` 会被静默过滤掉 `CLAIM_BENEFIT`（只剩 `VIEW_DETAILS`）。
+ */
+export function qoderRuntimeInfoEnv(variant: 'qoder' | 'qodercn' | string): '3' | '0' {
+  const v = variant.trim().toLowerCase()
+  return v === 'qodercn' || v === 'cn' || v === 'china' ? '0' : '3'
+}
+
+/**
+ * 将可能含非 ASCII（如中文 Windows 主机名 `"小林的电脑"`、`"电脑-café"`）的请求头值编码为
+ * Web Standard `fetch` / `Headers` 合法的 UTF-8 → Latin-1 `ByteString`，并拦截 CR/LF/NUL 头注入。
+ *
+ * ## 为什么必须有这一层（参考 `88lin/workbuddy-auto-signin` `43d8960`）
+ *
+ * WHATWG Fetch 规范要求所有请求头值为 `ByteString`（每个 UTF-16 码元 `<= 0xFF`）。
+ * 当凭据携带含中文或重音字符的计算机名/设备字段时，直接传给 `fetch` 会立即抛：
+ * `TypeError: Cannot convert argument to a ByteString because the character ... has a value > 255`。
+ * 将 UTF-8 字节序列按单字节映射到 Latin-1 码元（`0x00..0xFF`），既满足 `Headers` 校验、对纯 ASCII 零开销且幂等，
+ * 又能在底层传输层原样写出 UTF-8 字节；同时显式拒绝 `\r` / `\n` / `\0` 防止请求头行注入。
+ */
+export function encodeQoderHeaderValue(value: string, headerName = ''): string {
+  if (/[\r\n\0]/.test(value)) {
+    throw new ProviderError({
+      provider: 'qoder',
+      message: `Qoder 请求头${headerName === '' ? '' : ` ${headerName}`}含非法换行或空字节控制字符`,
+    })
+  }
+  let hasNonLatin1 = false
+  for (let i = 0; i < value.length; i += 1) {
+    if (value.charCodeAt(i) > 0xff) {
+      hasNonLatin1 = true
+      break
+    }
+  }
+  if (!hasNonLatin1) return value
+  const utf8 = new TextEncoder().encode(value)
+  let out = ''
+  for (let i = 0; i < utf8.length; i += 1) {
+    out += String.fromCharCode(utf8[i]!)
+  }
+  return out
+}
+
+/** 对整组出站 HTTP 请求头执行控制字符校验与 UTF-8 `ByteString` 编码（幂等）。 */
+export function sanitizeQoderHeaders(headers: Record<string, string>): Record<string, string> {
+  const safe: Record<string, string> = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (/[\r\n\0]/.test(key)) {
+      throw new ProviderError({
+        provider: 'qoder',
+        message: 'Qoder 请求头名称含非法换行或空字节控制字符',
+      })
+    }
+    safe[key] = encodeQoderHeaderValue(value, key)
+  }
+  return safe
+}
 
 /** 宽容读取：接受嵌套（`{credential:{…}}` / `{data:{…}}`）与扁平两种形态。 */
 function unwrapCredential(input: unknown): Record<string, unknown> {
@@ -441,6 +509,17 @@ export function parseCredential(input: unknown): ProviderCredential {
   if (machineType !== undefined) extras[EXTRA_MACHINE_TYPE] = machineType
   const machineCode = readString(source, ['machineCode', 'machine_code', 'cosyMachineCode'])
   if (machineCode !== undefined) extras[EXTRA_MACHINE_CODE] = machineCode
+  const machineHostname = readString(source, [
+    'machineHostname',
+    'machine_hostname',
+    'cosyMachineHostname',
+    'hostname',
+    'computerName',
+    'computer_name',
+  ])
+  if (machineHostname !== undefined) extras[EXTRA_MACHINE_HOSTNAME] = machineHostname
+  const identitySource = readString(source, ['machineIdentitySource', 'identity_source', 'identitySource'])
+  if (identitySource !== undefined) extras[EXTRA_MACHINE_IDENTITY_SOURCE] = identitySource
 
   return {
     provider: 'qoder',
@@ -705,7 +784,7 @@ export async function fetchQoderModelCatalog(
   const timeout = AbortSignal.timeout(QODER_CATALOG_TIMEOUT_MS)
   const response = await fetch(`${product.encryptedInferBase}/algo${QODER_MODEL_LIST_PATH}?Encode=1`, {
     method: 'GET',
-    headers,
+    headers: sanitizeQoderHeaders(headers),
     signal: signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
   })
   const text = await response.text()
@@ -1298,7 +1377,7 @@ async function postQoderInfer(
   // `403 Signature invalid`（参考实现 `src/qoder-wasm.ts:649-655`）。
   return await fetch(prepared.url, {
     method: 'POST',
-    headers: prepared.headers,
+    headers: sanitizeQoderHeaders(prepared.headers),
     body: prepared.body,
     // ⚠️ 超时由调用方的 `signal` 承担（见 `chat()` 的「首帧超时」说明）——
     // **不能**在这里挂 `AbortSignal.timeout`：fetch 的 signal 同样管着响应体，
@@ -1697,8 +1776,10 @@ function sashHeaders(
     headers['Cosy-MachineType'] = type
     const code = credential.extras[EXTRA_MACHINE_CODE]
     if (code !== undefined) headers['Cosy-MachineCode'] = code
+    const hostname = credential.extras[EXTRA_MACHINE_HOSTNAME]
+    if (hostname !== undefined) headers['Cosy-MachineHostname'] = hostname
   }
-  return headers
+  return sanitizeQoderHeaders(headers)
 }
 
 /** 一个额度桶（`/sash/api/v2/me/usage` 的 `qoderUsage` 子项）。 */
@@ -1953,22 +2034,28 @@ async function checkin(
     // ⚠️ 国际版缺 machine 头 → 服务端只下发 `VIEW_DETAILS`，此时「今天已领」与
     // 「没有可领项」**无法区分**，如实报错说明缺什么，绝不谎报已领。
     if (product.checkinRequiresMachine && !hasMachine) {
+      const envCode = qoderRuntimeInfoEnv(product.id)
       throw new ProviderError({
         provider: product.id,
-        message: 'Qoder 国际版自动签到需要设备身份头 `Cosy-MachineToken` + `Cosy-MachineType`（必须成对）。'
-          + '请在导入凭据时把这两个值一并放进 `machineToken` / `machineType`（可选 `machineCode`）字段'
-          + '（取自官方客户端 / qodercli 的 runtime-info 输出，或桌面端的 `machine_token.json`：'
-          + '`token` → machineToken、`type` → machineType）。'
+        message: 'Qoder 国际版自动签到需要真实设备身份头 `Cosy-MachineToken` + `Cosy-MachineType`（必须成对，派生/伪造值无效）。'
+          + '请在导入凭据时把这两个值一并放进 `machineToken` / `machineType`（可选 `machineCode` / `machineHostname`）字段'
+          + `（取自官方客户端 / qodercli：执行 \`runtime-info ${envCode} --account-stdin\` 并传入 \`{"account":"${credential.uid}"}\`，`
+          + '注意国际版环境码必须是 `3` 而非裸跑默认的国内 `0`；或取桌面端 `machine_token.json` 的 `token` / `type`）。'
           + `缺这两个头时服务端不下发可领项（${listed}）`,
       })
     }
     // ⚠️ 不返回 `alreadyDone:true`：调用方会据此记「今日已签到」，
     // 而这里服务端确实没有给可领项 —— 如实报错，下一轮 cron 再试。
+    const isDerived = credential.extras[EXTRA_MACHINE_IDENTITY_SOURCE]?.toLowerCase() === 'derived'
     throw new ProviderError({
       provider: product.id,
       message: `Qoder 当前没有可领取的签到活动（${listed}）。`
         + '每日活动在 10:00（UTC+8）刷新；若今天已在客户端领过，活动行可能直接消失'
-        + (hasMachine ? '；若导入了 machineToken，它可能已过期，可删除后重试' : ''),
+        + (hasMachine
+          ? (isDerived
+            ? '；当前凭据标记为派生（derived）机器身份，上游会过滤非真实 runtime-info 签发的 token'
+            : `；若导入了 machineToken，请确认它是真实客户端产出且环境码匹配（国际版需 \`runtime-info ${qoderRuntimeInfoEnv(product.id)} --account-stdin\`），过期或用错环境码会被过滤`)
+          : ''),
     })
   }
 
@@ -2522,7 +2609,7 @@ export async function fetchQoderUserNickname(
   try {
     const res = await fetch(`${product.openApiBase}/api/v1/userinfo`, {
       method: 'GET',
-      headers: { Accept: 'application/json', Authorization: `Bearer ${credential.accessToken}` },
+      headers: sanitizeQoderHeaders({ Accept: 'application/json', Authorization: `Bearer ${credential.accessToken}` }),
       signal: signal.aborted ? signal : AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
     })
     if (!res.ok) return undefined

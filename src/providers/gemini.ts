@@ -79,6 +79,10 @@ export const GEMINI_STREAM_PATH = '/v1internal:streamGenerateContent?alt=sse'
 export const GEMINI_QUOTA_PATH = '/v1internal:retrieveUserQuotaSummary'
 /** Google OAuth 令牌端点（续期）。 */
 export const GEMINI_TOKEN_URL = 'https://oauth2.googleapis.com/token'
+/** Google Gemini 官方 API Key 的 OpenAI 兼容端点（无需 OAuth 续期，参考 `abe31d4`）。 */
+export const GEMINI_API_KEY_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai'
+/** 官方 Gemini API Key 裸串判别正则（支持 `AIza...`、`gemini:AIza...` 与 `AQ....`）。 */
+export const GEMINI_BARE_KEY_PATTERN = /^(?:gemini:)?(?:AIza[A-Za-z0-9_-]{20,}|AQ\.[A-Za-z0-9_.-]{20,})$/
 
 /**
  * 上游 Cloud Code 客户端的 **public client** 标识（默认值）。
@@ -189,6 +193,37 @@ export const EXTRA_PROJECT = 'project'
 export const EXTRA_SUB = 'sub'
 export const EXTRA_EMAIL = 'email'
 export const EXTRA_ID_TOKEN = 'idToken'
+export const EXTRA_AUTH_MODE = 'authMode'
+export const EXTRA_BASE_URL = 'baseUrl'
+
+/** 判断字符串是否为官方 Gemini API Key（支持可选 `gemini:` 前缀）。 */
+export function isGeminiApiKeyString(raw: string): boolean {
+  return GEMINI_BARE_KEY_PATTERN.test(raw.trim())
+}
+
+/** 归一官方 Gemini API Key：剥除可选的 `gemini:` 前缀。 */
+export function normalizeGeminiApiKey(raw: string): string {
+  const trimmed = raw.trim()
+  return trimmed.toLowerCase().startsWith('gemini:') ? trimmed.slice('gemini:'.length).trim() : trimmed
+}
+
+/** 判断已解析的凭据是否走官方 Gemini API Key 通道（与 Cloud Code Assist OAuth 区分）。 */
+export function isGeminiApiKeyCredential(credential: ProviderCredential): boolean {
+  if (credential.extras[EXTRA_AUTH_MODE] === 'api_key') return true
+  return isGeminiApiKeyString(credential.accessToken)
+}
+
+/**
+ * 判断 Google 官方 API 的 400/403 响应体是否表示「API Key 无效或已过期」（参考 `abe31d4`）。
+ *
+ * Google Generative Language API 对无效 Key 常返回 HTTP 400（而非 401）搭配 `API_KEY_INVALID` /
+ * `API key not valid`。命中时应标记可换号轮转，普通参数错误（如 schema 非法）则绝不换号。
+ */
+export function bodyIndicatesGeminiBadKey(body: string): boolean {
+  return /api[_ ]?key not valid|api_key_invalid|invalid api[_ ]?key|apikey not valid|api[_ ]?key expired/i.test(
+    body,
+  )
+}
 
 /** 取第一个非空字符串字段。 */
 function readString(source: Record<string, unknown>, keys: readonly string[]): string | undefined {
@@ -297,8 +332,7 @@ export function geminiIdentityFromIdToken(idToken: string): { sub?: string; emai
  *
  * @see 文件内「判别式」小节的完整理由。
  */
-export function looksLikeGeminiCredential(input: Record<string, unknown>): boolean {
-  const source = unwrap(input)
+function looksLikeGeminiOAuthObject(source: Record<string, unknown>): boolean {
   if (readString(source, ['access_token', 'accessToken']) === undefined) return false
   // ① Cloud Code 独有的项目号字段
   if (hasScalar(source, ['cloudaicompanionProject', 'cloudaicompanion_project'])) return true
@@ -308,6 +342,39 @@ export function looksLikeGeminiCredential(input: Record<string, unknown>): boole
   const refresh = readString(source, ['refresh_token', 'refreshToken'])
   const expiry = hasScalar(source, ['expiry', 'expires_in', 'expiresIn'])
   return refresh !== undefined && expiry
+}
+
+function extractGeminiApiKeyFromObject(
+  root: Record<string, unknown>,
+  source: Record<string, unknown>,
+): string | undefined {
+  const dedicated = readString(source, [
+    'gemini_api_key',
+    'geminiApiKey',
+    'GEMINI_API_KEY',
+    'GOOGLE_API_KEY',
+  ])
+  if (dedicated !== undefined) return normalizeGeminiApiKey(dedicated)
+
+  const genericKey = readString(source, ['apiKey', 'api_key', 'key', 'accessToken', 'access_token', 'token'])
+  if (genericKey !== undefined && isGeminiApiKeyString(genericKey)) {
+    return normalizeGeminiApiKey(genericKey)
+  }
+
+  const explicitProvider =
+    readString(root, ['provider'])?.toLowerCase() === 'gemini' ||
+    readString(source, ['provider'])?.toLowerCase() === 'gemini'
+  const explicitKeyField = readString(source, ['apiKey', 'api_key', 'key'])
+  if (explicitProvider && explicitKeyField !== undefined) {
+    return normalizeGeminiApiKey(explicitKeyField)
+  }
+  return undefined
+}
+
+export function looksLikeGeminiCredential(input: Record<string, unknown>): boolean {
+  const source = unwrap(input)
+  if (looksLikeGeminiOAuthObject(source)) return true
+  return extractGeminiApiKeyFromObject(input, source) !== undefined
 }
 
 /**
@@ -336,21 +403,70 @@ export function looksLikeGeminiCredential(input: Record<string, unknown>): boole
  *    产出一个必然失败的账号而用户看到的是「导入成功」。
  */
 export function parseCredential(input: unknown): ProviderCredential {
+  if (typeof input === 'string') {
+    const trimmed = input.trim()
+    if (!isGeminiApiKeyString(trimmed)) {
+      throw new ProviderError({
+        provider: 'gemini',
+        message:
+          '裸字符串形态仅支持官方 Gemini API Key（如 `AIzaSy...` 或 `gemini:AIzaSy...`）；'
+          + 'Cloud Code Assist OAuth 凭据请粘贴完整 JSON 对象。',
+      })
+    }
+    const key = normalizeGeminiApiKey(trimmed)
+    return {
+      provider: 'gemini',
+      uid: `gemini-key-${fnv1a64HashForUid(key)}`,
+      accessToken: key,
+      refreshToken: '',
+      expiresAt: 0,
+      nickname: `Gemini API Key (${key.slice(0, 8)}…)`,
+      extras: {
+        [EXTRA_AUTH_MODE]: 'api_key',
+      },
+    }
+  }
+
   if (typeof input === 'object' && input !== null && !Array.isArray(input)) {
     const root = input as Record<string, unknown>
     if (!looksLikeGeminiCredential(root)) {
       throw new ProviderError({
         provider: 'gemini',
         message:
-          '这不像是 Gemini（Cloud Code Assist）的凭据：需要非空 `access_token`，'
-          + '且至少还要有一个 Gemini 独有的判别字段 —— '
-          + '`cloudaicompanionProject`、`id_token`，或 `refresh_token` 搭配 `expiry` / `expires_in`。'
-          + '（只凭 `access_token` 无法与其它供应商区分，故不予接受。）'
-          + '请从已登录的 Antigravity / Cloud Code 客户端导出凭据文件后整体粘贴。',
+          '这不像是 Gemini 凭据：支持官方 API Key（`{ "apiKey": "AIzaSy..." }` 或裸 `AIzaSy...`）'
+          + '或 Cloud Code Assist OAuth 凭据（非空 `access_token` 搭配 `cloudaicompanionProject`、'
+          + '`id_token`，或 `refresh_token` + `expiry` / `expires_in`）。',
       })
     }
 
     const source = unwrap(root)
+    if (!looksLikeGeminiOAuthObject(source)) {
+      const apiKey = extractGeminiApiKeyFromObject(root, source)
+      if (apiKey === undefined || apiKey === '') {
+        throw new ProviderError({ provider: 'gemini', message: 'Gemini API Key 不能为空' })
+      }
+      const rawBaseUrl = readString(source, ['baseUrl', 'base_url', 'endpoint'])
+        ?? readString(root, ['baseUrl', 'base_url', 'endpoint'])
+      const baseUrl = rawBaseUrl !== undefined ? rawBaseUrl.replace(/\/+$/, '') : ''
+      const customUid = readString(source, ['uid', 'id']) ?? readString(root, ['uid', 'id']) ?? ''
+      const nickname =
+        readString(source, ['nickname', 'name', 'label', 'email']) ??
+        readString(root, ['nickname', 'name', 'label', 'email']) ??
+        `Gemini API Key (${apiKey.slice(0, 8)}…)`
+      return {
+        provider: 'gemini',
+        uid: customUid !== '' ? customUid : `gemini-key-${fnv1a64HashForUid(apiKey)}`,
+        accessToken: apiKey,
+        refreshToken: '',
+        expiresAt: 0,
+        nickname,
+        extras: {
+          [EXTRA_AUTH_MODE]: 'api_key',
+          ...(baseUrl !== '' ? { [EXTRA_BASE_URL]: baseUrl } : {}),
+        },
+      }
+    }
+
     const accessToken = readString(source, ['access_token', 'accessToken'])
     // 上面的判别式已保证它存在；这里再取一次是为了让类型收窄（不做静默兜底）。
     if (accessToken === undefined) {
@@ -387,9 +503,7 @@ export function parseCredential(input: unknown): ProviderCredential {
   throw new ProviderError({
     provider: 'gemini',
     message:
-      'Gemini 凭据必须是一个 JSON 对象（至少含 `access_token`）。'
-      + '本项目的 Gemini **不支持登录**（OAuth 回调必须是 `http://localhost:<port>`，'
-      + 'Workers 没有监听 socket），请从已登录的客户端导出凭据后粘贴。',
+      'Gemini 凭据必须是官方 API Key（`AIzaSy...`）或 Cloud Code Assist OAuth JSON 对象（含 `access_token`）。',
   })
 }
 
@@ -458,6 +572,13 @@ export async function refreshGeminiCredential(
   credential: ProviderCredential,
   signal: AbortSignal,
 ): Promise<ProviderCredential> {
+  if (isGeminiApiKeyCredential(credential)) {
+    throw new ProviderError({
+      provider: 'gemini',
+      retryable: false,
+      message: 'Gemini 官方 API Key 为静态密钥，不支持 OAuth 自动续期，请更换有效密钥或重新登录',
+    })
+  }
   const refreshToken = credential.refreshToken
   if (refreshToken === '') {
     throw new ProviderError({
@@ -1807,16 +1928,421 @@ export function geminiSseToOpenAiSse(
 
 // ─────────────────────────── 模型目录 / 对话 ───────────────────────────
 
+/** 官方 Gemini API Key 通道的兜底模型目录（远端返回空表时使用）。 */
+export const GEMINI_API_KEY_FALLBACK_MODELS: readonly GeminiModelEntry[] = [
+  {
+    id: 'gemini-2.5-flash',
+    name: 'Gemini 2.5 Flash',
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
+    supportsImage: true,
+    isFree: true,
+  },
+  {
+    id: 'gemini-2.5-pro',
+    name: 'Gemini 2.5 Pro',
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
+    supportsImage: true,
+    isFree: true,
+  },
+  {
+    id: 'gemini-2.5-flash-lite',
+    name: 'Gemini 2.5 Flash-Lite',
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
+    supportsImage: true,
+    isFree: true,
+  },
+  {
+    id: 'gemini-2.0-flash',
+    name: 'Gemini 2.0 Flash',
+    contextWindow: 1_048_576,
+    maxOutput: 8_192,
+    supportsImage: true,
+    isFree: true,
+  },
+]
+
+function geminiApiKeyBaseUrl(credential: ProviderCredential): string {
+  const custom = credential.extras[EXTRA_BASE_URL]
+  if (typeof custom === 'string' && custom.trim() !== '') {
+    return custom.trim().replace(/\/+$/, '')
+  }
+  return GEMINI_API_KEY_BASE_URL
+}
+
+function stripGeminiModelPrefix(rawModel: string): string {
+  let m = rawModel.trim()
+  if (m.toLowerCase().startsWith('gemini:')) m = m.slice('gemini:'.length).trim()
+  if (m.toLowerCase().startsWith('gemini/')) m = m.slice('gemini/'.length).trim()
+  if (m.startsWith('models/')) m = m.slice('models/'.length).trim()
+  return m
+}
+
+function isNonChatGeminiModelId(id: string): boolean {
+  const lower = id.toLowerCase()
+  return (
+    lower === '' ||
+    lower.includes('embedding') ||
+    lower.startsWith('aqa') ||
+    lower.startsWith('imagen-') ||
+    lower.startsWith('veo-') ||
+    lower.startsWith('chirp') ||
+    lower.startsWith('text-bison') ||
+    lower.startsWith('chat-bison')
+  )
+}
+
+function isGeminiApiKeyRetryable(status: number, body: string): boolean {
+  if (status === 401 || status === 402 || status === 429 || status === 408 || status >= 500) return true
+  if (status === 400) return bodyIndicatesGeminiBadKey(body)
+  if (status === 403) {
+    return (
+      isGeminiRetryable(403, body) ||
+      bodyIndicatesGeminiBadKey(body) ||
+      /api[_ ]?key|permission[_ ]denied/i.test(body)
+    )
+  }
+  return false
+}
+
+function normalizeOpenAiTools(rawTools: unknown): Array<Record<string, unknown>> | undefined {
+  if (!Array.isArray(rawTools) || rawTools.length === 0) return undefined
+  const out: Array<Record<string, unknown>> = []
+  for (const item of rawTools) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
+    const t = item as Record<string, unknown>
+    if (t.type === 'function' && t.function !== null && typeof t.function === 'object') {
+      out.push(t)
+      continue
+    }
+    if (typeof t.name === 'string' && t.name.trim() !== '') {
+      out.push({
+        type: 'function',
+        function: {
+          name: t.name.trim(),
+          ...(typeof t.description === 'string' ? { description: t.description } : {}),
+          parameters:
+            t.parameters !== null && typeof t.parameters === 'object'
+              ? t.parameters
+              : t.input_schema !== null && typeof t.input_schema === 'object'
+                ? t.input_schema
+                : { type: 'object', properties: {} },
+        },
+      })
+    }
+  }
+  return out.length > 0 ? out : undefined
+}
+
+function buildGeminiApiKeyChatBody(model: string, rawBody: Record<string, unknown>): Record<string, unknown> {
+  const targetModel = stripGeminiModelPrefix(model) || 'gemini-2.5-flash'
+  const rawMessages = Array.isArray(rawBody['messages']) ? [...(rawBody['messages'] as unknown[])] : []
+  if (rawBody['system'] !== undefined) {
+    const sys = rawBody['system']
+    if (typeof sys === 'string' && sys.trim() !== '') {
+      rawMessages.unshift({ role: 'system', content: sys })
+    } else if (Array.isArray(sys)) {
+      const text = sys
+        .map((b) =>
+          typeof b === 'string'
+            ? b
+            : b !== null && typeof b === 'object' && typeof (b as { text?: unknown }).text === 'string'
+              ? (b as { text: string }).text
+              : '',
+        )
+        .filter((s) => s !== '')
+        .join('\n')
+      if (text !== '') rawMessages.unshift({ role: 'system', content: text })
+    }
+  }
+  if (rawMessages.length === 0) {
+    throw new ProviderError({
+      provider: 'gemini',
+      httpStatus: 400,
+      retryable: false,
+      message: 'Gemini 对话请求缺少非空的 messages 数组',
+    })
+  }
+
+  const out: Record<string, unknown> = {
+    model: targetModel,
+    messages: rawMessages,
+    stream: true,
+    stream_options:
+      rawBody['stream_options'] !== null && typeof rawBody['stream_options'] === 'object'
+        ? { ...(rawBody['stream_options'] as Record<string, unknown>), include_usage: true }
+        : { include_usage: true },
+  }
+
+  const tools = normalizeOpenAiTools(rawBody['tools'])
+  if (tools !== undefined) {
+    out['tools'] = tools
+    if (rawBody['tool_choice'] !== undefined) out['tool_choice'] = rawBody['tool_choice']
+  }
+  for (const key of [
+    'temperature',
+    'top_p',
+    'max_tokens',
+    'max_completion_tokens',
+    'reasoning_effort',
+    'response_format',
+    'stop',
+  ] as const) {
+    if (rawBody[key] !== undefined) out[key] = rawBody[key]
+  }
+  return out
+}
+
+function completionJsonToOpenAiSse(payload: Record<string, unknown>, fallbackModel: string): Response {
+  const id = typeof payload['id'] === 'string' && payload['id'] !== '' ? payload['id'] : `chatcmpl-${Date.now()}`
+  const created =
+    typeof payload['created'] === 'number' && Number.isFinite(payload['created'])
+      ? payload['created']
+      : Math.floor(Date.now() / 1000)
+  const model =
+    typeof payload['model'] === 'string' && payload['model'] !== ''
+      ? stripGeminiModelPrefix(payload['model'])
+      : stripGeminiModelPrefix(fallbackModel) || 'gemini-2.5-flash'
+  const choices = Array.isArray(payload['choices']) ? (payload['choices'] as Array<Record<string, unknown>>) : []
+  const first = choices[0] ?? {}
+  const msg =
+    first['message'] !== null && typeof first['message'] === 'object'
+      ? (first['message'] as Record<string, unknown>)
+      : {}
+  const finishReason =
+    typeof first['finish_reason'] === 'string' && first['finish_reason'] !== ''
+      ? first['finish_reason']
+      : Array.isArray(msg['tool_calls']) && (msg['tool_calls'] as unknown[]).length > 0
+        ? 'tool_calls'
+        : 'stop'
+
+  const delta: Record<string, unknown> = { role: 'assistant' }
+  if (typeof msg['reasoning_content'] === 'string' && msg['reasoning_content'] !== '') {
+    delta['reasoning_content'] = msg['reasoning_content']
+  }
+  if (typeof msg['content'] === 'string') {
+    delta['content'] = msg['content']
+  }
+  if (Array.isArray(msg['tool_calls']) && (msg['tool_calls'] as unknown[]).length > 0) {
+    delta['tool_calls'] = (msg['tool_calls'] as Array<Record<string, unknown>>).map((tc, idx) => ({
+      index: typeof tc['index'] === 'number' ? tc['index'] : idx,
+      ...tc,
+    }))
+  }
+
+  const frames: string[] = [
+    sseFrame(
+      JSON.stringify({
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta, finish_reason: null }],
+      }),
+    ),
+    sseFrame(
+      JSON.stringify({
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        ...(payload['usage'] !== null && typeof payload['usage'] === 'object' ? { usage: payload['usage'] } : {}),
+      }),
+    ),
+    'data: [DONE]\n\n',
+  ]
+
+  return new Response(frames.join(''), {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-store',
+    },
+  })
+}
+
+async function listGeminiApiKeyModels(
+  credential: ProviderCredential,
+  signal: AbortSignal,
+): Promise<ProviderModel[]> {
+  const url = `${geminiApiKeyBaseUrl(credential)}/models`
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${credential.accessToken}`,
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.any([signal, AbortSignal.timeout(GEMINI_BALANCE_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    if (signal.aborted) {
+      throw new ProviderError({ provider: 'gemini', message: '请求已被客户端取消' })
+    }
+    throw new ProviderError({
+      provider: 'gemini',
+      retryable: true,
+      message: `Gemini 官方模型目录请求失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  const text = await response.text().catch(() => '')
+  if (!response.ok) {
+    const detail = geminiErrorDetail(parseJsonObject(text), text, response.status)
+    throw new ProviderError({
+      provider: 'gemini',
+      httpStatus: response.status,
+      retryable: isGeminiApiKeyRetryable(response.status, text),
+      message: `Gemini 官方模型目录拉取失败（HTTP ${response.status}）：${detail}`,
+    })
+  }
+
+  const payload = parseJsonObject(text)
+  const rawItems = Array.isArray(payload?.['data'])
+    ? (payload!['data'] as unknown[])
+    : Array.isArray(payload?.['models'])
+      ? (payload!['models'] as unknown[])
+      : []
+
+  const seen = new Set<string>()
+  const out: ProviderModel[] = []
+  for (const raw of rawItems) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const item = raw as Record<string, unknown>
+    const methods = Array.isArray(item['supportedGenerationMethods'])
+      ? (item['supportedGenerationMethods'] as unknown[])
+      : undefined
+    if (methods !== undefined && !methods.includes('generateContent')) continue
+
+    const rawId =
+      typeof item['id'] === 'string'
+        ? item['id']
+        : typeof item['name'] === 'string'
+          ? item['name']
+          : ''
+    const id = stripGeminiModelPrefix(rawId)
+    if (isNonChatGeminiModelId(id) || seen.has(id)) continue
+    seen.add(id)
+
+    const fallback = GEMINI_API_KEY_FALLBACK_MODELS.find((m) => m.id === id)
+    const displayName =
+      typeof item['display_name'] === 'string' && item['display_name'].trim() !== ''
+        ? item['display_name'].trim()
+        : typeof item['displayName'] === 'string' && item['displayName'].trim() !== ''
+          ? item['displayName'].trim()
+          : (fallback?.name ?? id)
+    const contextWindow =
+      typeof item['inputTokenLimit'] === 'number' && item['inputTokenLimit'] > 0
+        ? item['inputTokenLimit']
+        : typeof item['context_window'] === 'number' && item['context_window'] > 0
+          ? item['context_window']
+          : (fallback?.contextWindow ?? 1_048_576)
+    const maxOutput =
+      typeof item['outputTokenLimit'] === 'number' && item['outputTokenLimit'] > 0
+        ? item['outputTokenLimit']
+        : typeof item['max_output_tokens'] === 'number' && item['max_output_tokens'] > 0
+          ? item['max_output_tokens']
+          : (fallback?.maxOutput ?? 65_536)
+
+    out.push({
+      id,
+      name: displayName,
+      contextWindow,
+      maxOutput,
+      supportsImage: true,
+      isFree: true,
+    })
+  }
+
+  if (out.length > 0) return out
+  return GEMINI_API_KEY_FALLBACK_MODELS.map((entry) => ({ ...entry }))
+}
+
+async function chatWithGeminiApiKey(
+  credential: ProviderCredential,
+  request: ChatRequest,
+): Promise<Response> {
+  const payload = buildGeminiApiKeyChatBody(request.model, request.body)
+  const url = `${geminiApiKeyBaseUrl(credential)}/chat/completions`
+
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${credential.accessToken}`,
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.any([request.signal, AbortSignal.timeout(GEMINI_REQUEST_TIMEOUT_MS)]),
+    })
+  } catch (error) {
+    if (request.signal.aborted) {
+      throw new ProviderError({ provider: 'gemini', message: '请求已被客户端取消' })
+    }
+    throw new ProviderError({
+      provider: 'gemini',
+      retryable: true,
+      message: `Gemini 官方 API 请求失败：${error instanceof Error ? error.message : String(error)}`,
+    })
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    const detail = geminiErrorDetail(parseJsonObject(text), text, response.status)
+    throw new ProviderError({
+      provider: 'gemini',
+      httpStatus: response.status,
+      retryable: isGeminiApiKeyRetryable(response.status, text),
+      message: `Gemini 官方 API 推理失败：http=${response.status} ${detail}`,
+    })
+  }
+
+  if (response.body === null) {
+    throw new ProviderError({ provider: 'gemini', message: 'Gemini 官方 API 返回 200 但没有响应体' })
+  }
+
+  const contentType = (response.headers.get('content-type') ?? '').toLowerCase()
+  if (contentType.includes('application/json')) {
+    const text = await response.text().catch(() => '')
+    const json = parseJsonObject(text)
+    if (json === undefined) {
+      throw new ProviderError({
+        provider: 'gemini',
+        httpStatus: 502,
+        retryable: true,
+        message: `Gemini 官方 API 返回无法解析的 JSON：${text.slice(0, 200)}`,
+      })
+    }
+    return completionJsonToOpenAiSse(json, request.model)
+  }
+
+  return new Response(response.body, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-store',
+    },
+  })
+}
+
 /**
- * 列出模型目录（**静态表，不拉远端**）。
- *
- * ⚠️ 参考实现的选择就是静态表，理由是「目录每次现算零成本、无缓存，
- * 缓存只会带来『表被改过但进程还拿着旧值』这一种故障」。
+ * 列出模型目录：
+ * - Cloud Code Assist OAuth 凭据：返回静态目录（裸名 + 四档思考变体）；
+ * - 官方 Gemini API Key 凭据：调用 `generativelanguage.googleapis.com/v1beta/openai/models` 并剥除 `models/` 前缀。
  */
 export async function listModels(
-  _credential: ProviderCredential,
-  _signal: AbortSignal,
+  credential: ProviderCredential,
+  signal: AbortSignal,
 ): Promise<ProviderModel[]> {
+  if (isGeminiApiKeyCredential(credential)) {
+    return await listGeminiApiKeyModels(credential, signal)
+  }
   return geminiModelEntries().map((entry) => ({
     id: entry.id,
     name: entry.name,
@@ -1831,9 +2357,12 @@ export async function listModels(
  * 发起一次流式对话，返回**已转成 OpenAI SSE** 的响应。
  *
  * ⚠️ 失败一律抛 `ProviderError`（而不是返回一个 `!ok` 的 Response）——
- * 与本项目其余 11 家一致，网关的 `catch` 分支会据此走续期重放。
+ * 与本项目其余 provider 一致，网关的 `catch` 分支会据此走续期或换号重试。
  */
 export async function chat(credential: ProviderCredential, request: ChatRequest): Promise<Response> {
+  if (isGeminiApiKeyCredential(credential)) {
+    return await chatWithGeminiApiKey(credential, request)
+  }
   const prepared = buildGeminiInferPayload(credential, request.model, request.body)
 
   let response: Response
@@ -2048,6 +2577,13 @@ export async function balance(
   credential: ProviderCredential,
   signal: AbortSignal,
 ): Promise<ProviderBalance> {
+  if (isGeminiApiKeyCredential(credential)) {
+    throw new ProviderError({
+      provider: 'gemini',
+      retryable: false,
+      message: 'Gemini 官方 API Key 通道无配额桶余额查询接口（请前往 Google AI Studio 查看配额）',
+    })
+  }
   const project = geminiProjectOf(credential) || GEMINI_DEFAULT_PROJECT
 
   let response: Response
@@ -2129,7 +2665,8 @@ export const geminiProvider: Provider = {
       'Gemini 的登录是浏览器回调式 OAuth，回调地址必须是 `http://localhost:<端口>/oauth-callback`'
       + '（Google 对原生应用只允许 loopback 重定向）—— Workers 没有监听 socket，接不住这个回调。'
       + '请从已登录的 Antigravity / Cloud Code 客户端导出凭据后导入'
-      + '（至少含 `access_token`，带 `refresh_token` 才能自动续期）。',
+      + '（至少含 `access_token`，带 `refresh_token` 才能自动续期），'
+      + '或直接粘贴 Google AI Studio 官方 Gemini API Key（`AIza...` / `AQ....`）导入。',
     checkinBlockedReason:
       'Cloud Code Assist **没有每日签到接口** —— 它的额度是按 5 小时 / 周两个窗口滚动的'
       + '**配额比例**（见余额），不是可领取的积分。这是上游产品形态，不是本服务的缺失。',
@@ -2144,9 +2681,21 @@ export const geminiProvider: Provider = {
   matchesShape(input) {
     return looksLikeGeminiCredential(input)
   },
-  // ⚠️ **刻意不声明 `bareStringPattern`**：Gemini 凭据是 JSON 对象
-  // （`access_token` + 判别字段），不存在「只粘一个令牌」的合法形态；
-  // 声明一个宽松的裸串匹配只会把任意文本吞成一个必然失败的账号。
+  /**
+   * 裸字符串判别式：仅匹配官方 Gemini API Key（`AIzaSy...`、`gemini:AIzaSy...`、`AQ....`），
+   * 绝不匹配裸 OAuth `ya29...` 或其它供应商密钥。
+   */
+  bareStringPattern: GEMINI_BARE_KEY_PATTERN,
+  shouldRotate(status, body) {
+    if (status === 400) return bodyIndicatesGeminiBadKey(body)
+    if (status === 401 || status === 402 || status === 429 || status === 408 || status >= 500) {
+      return true
+    }
+    if (status === 403) {
+      return isGeminiRetryable(403, body) || bodyIndicatesGeminiBadKey(body)
+    }
+    return false
+  },
   listModels,
   chat,
   balance,

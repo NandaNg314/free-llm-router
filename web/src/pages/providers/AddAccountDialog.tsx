@@ -8,7 +8,7 @@ import { useImportAccount } from '@/lib/queries'
 import type { Provider } from '@/lib/types'
 import { loginKindLabel } from './LoginFlow'
 
-/** 粘贴凭据 JSON 导入。provider 固定时不显示下拉。 */
+/** 粘贴凭据 JSON 或裸访问令牌 / API Key 导入。provider 固定时不显示下拉。 */
 export function ImportForm({ provider: fixed, providers, onDone }: { provider?: string; providers?: Provider[]; onDone?: () => void }) {
   const [provider, setProvider] = useState('')
   const [text, setText] = useState('')
@@ -17,14 +17,45 @@ export function ImportForm({ provider: fixed, providers, onDone }: { provider?: 
   const target = fixed ?? provider
 
   const submit = () => {
+    const trimmed = text.trim()
+    if (!trimmed) return
     let payload: unknown
     try {
-      payload = JSON.parse(text)
+      payload = JSON.parse(trimmed)
+      if (typeof payload === 'string') {
+        const lines = payload
+          .split(/\r?\n/)
+          .map((s) => s.trim())
+          .filter((s) => s !== '' && !s.startsWith('#'))
+        if (lines.length === 0) {
+          setErr('凭据内容不能为空')
+          return
+        }
+        payload = { ...(target ? { provider: target } : {}), accounts: lines }
+      } else if (Array.isArray(payload)) {
+        if (target) payload = { provider: target, accounts: payload }
+      } else if (payload && typeof payload === 'object') {
+        if (target) payload = { ...payload, provider: target }
+      } else {
+        setErr('不是合法的凭据 JSON 或访问令牌')
+        return
+      }
     } catch {
-      setErr('不是合法的 JSON')
-      return
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        setErr('不是合法的 JSON')
+        return
+      }
+      // 非 JSON 字面量（如 ModelScope `ms-...`、Gemini 官方 `AIzaSy...` / `AQ....` 等裸令牌）按行拆分提交
+      const lines = trimmed
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter((s) => s !== '' && !s.startsWith('#'))
+      if (lines.length === 0) {
+        setErr('请输入凭据 JSON 或访问令牌')
+        return
+      }
+      payload = { ...(target ? { provider: target } : {}), accounts: lines }
     }
-    if (target && payload && typeof payload === 'object' && !Array.isArray(payload)) payload = { ...payload, provider: target }
     setErr('')
     imp.mutate(payload, {
       onSuccess: () => {
@@ -52,14 +83,14 @@ export function ImportForm({ provider: fixed, providers, onDone }: { provider?: 
         </div>
       )}
       <div>
-        <Label htmlFor={`add-json-${fixed ?? 'any'}`} hint="支持数组或 {accounts:[…]} 批量导入">
-          凭据 JSON
+        <Label htmlFor={`add-json-${fixed ?? 'any'}`} hint="支持 JSON、数组，或直接粘贴 API Key / 令牌（支持多行）">
+          凭据 JSON 或访问令牌
         </Label>
         <Textarea
           id={`add-json-${fixed ?? 'any'}`}
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder='{"uid": "...", "accessToken": "..."}'
+          placeholder={'{"uid": "...", "accessToken": "..."}\n或直接粘贴访问令牌 / API Key（如 ms-... / AIzaSy...，每行一个）'}
           rows={6}
           className="font-mono text-[12.5px]"
         />
@@ -95,7 +126,7 @@ export function AddAccountDialog({
       open={open}
       onOpenChange={onOpenChange}
       title="添加账号"
-      description={mode === 'login' ? '选一家，用设备码 / 扫码 / 短信直接登录。' : '粘贴凭据 JSON，系统会自动识别是哪一家。'}
+      description={mode === 'login' ? '选一家，用设备码 / 扫码 / 短信直接登录。' : '粘贴凭据 JSON 或直接粘贴访问令牌 / API Key，系统会自动识别是哪一家。'}
     >
       <Segmented<Mode>
         value={mode}

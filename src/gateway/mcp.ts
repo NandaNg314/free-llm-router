@@ -1,43 +1,34 @@
 /**
  * MCP（Model Context Protocol）端点 —— Streamable HTTP 的**纯 POST 形态**。
  *
- * ## 这是什么
+ * ## 支持的工具（共 7 个，全部走 `media-router.ts` 多账号容灾、401 续期与任务归属台账）
  *
- * MCP 是 Anthropic 提出的标准协议：客户端（OpenCode / Claude Code / Cursor / Cline）
- * 连上来问「你有哪些工具」，服务端回一份清单，之后 AI 自己决定何时调用 ——
- * 用户不需要为每个工具写集成代码。
- *
- * ## 为什么用「纯 POST、无 SSE、无 session」
- *
- * 完整 MCP 支持 SSE 流与 session 协商。我们只需要**工具调用**这一件事：
- * - 工具都是一问一答（搜索 / 抓网页 / 生图），没有需要服务端主动推送的场景；
- * - 无 session ⇒ 天然无状态 ⇒ 多实例 / 重启都不影响（本服务跑在容器里，重启频繁）。
- *
- * ⇒ 走 Streamable HTTP 的最小子集：客户端 POST 一条 JSON-RPC，我们回一条 JSON-RPC。
- * `GET /mcp` 回 405 + `Allow: POST`，客户端据此退回纯 POST（这是规范允许的降级路径）。
- *
- * ## 鉴权
- *
- * 与 REST 完全相同（`Authorization: Bearer <API_KEY>`）。**不额外引入 OAuth**：
- * 本服务是**自托管、单用户**形态，API_KEY 就是唯一身份。OAuth 在这里只会
- * 增加一个「浏览器跳转授权」的环节，而使用者就是服务器主人本人。
- *
- * ## ⚠️ 能力边界（2026-11-05 实测，别再猜）
- *
- * | 工具 | 底层 | 国内版 | 国际版 |
- * |---|---|---|---|
- * | `web_search` | `/agenttool/v1/search` | 401 | ✅ 200 |
- * | `web_fetch` | `/agenttool/v1/webfetch` | 401 | ✅ 200 |
- * | `generate_image` | `/v2/images/generations` | 401 | ✅ 200 |
- *
- * ⇒ **三个工具都只对国际版（global 分片）可用**。无权限时如实回错，
- * 让模型自己读到「这个部署没有配置国际版账号」，而不是伪造一个空结果。
+ * - `web_search`：联网实时检索（含答案卡片多卡去重与相关性重排）
+ * - `web_fetch`：网页正文抓取并转 Markdown（含反爬回退）
+ * - `generate_image`：文生图（同步返回 COS 签名直链）
+ * - `generate_video`：文生视频 / 首尾帧图生视频（异步提交返回 `task_id`，可选 `wait=true`）
+ * - `get_video_task`：按 `task_id` 回到原提交账号查视频进度与直链（终态幂等记账）
+ * - `generate_3d`：混元 3D 模型生成（文生/图生/多视角，`OBJ`/`GLB`/`USDZ`/`FBX`/`STL`，自动签发临时云凭证）
+ * - `get_3d_task`：按 `job_id` 回到原提交账号查 3D 进度与模型文件直链（终态幂等记账）
  */
 import type { Env } from '../env.js'
-import { generateImage, mediaCapable, webFetch, webSearch, INTl_IMAGE_MODEL } from '../upstream/media.js'
-import { pickCredential } from './models.js'
-import { recordLog } from './server.js'
 import { WORKBUDDY_INTL } from '../providers/buddy.js'
+import { DEFAULT_PROVIDER } from '../providers/index.js'
+import { INTl_IMAGE_MODEL, INTl_VIDEO_MODEL } from '../upstream/media.js'
+import { redactThreeDSecrets } from '../upstream/three-d.js'
+import { APP_VERSION } from '../version.js'
+import {
+  formatThreeDTaskPayload,
+  runMediaFetch,
+  runMediaImageGeneration,
+  runMediaSearch,
+  runMediaThreeDQuery,
+  runMediaThreeDSubmit,
+  runMediaVideoQuery,
+  runMediaVideoSubmit,
+  type MediaExecutionHooks,
+} from './media-router.js'
+import { recordLog } from './server.js'
 
 /** MCP 协议版本（客户端发什么我们回什么，不认识就回最新的）。 */
 const SUPPORTED_PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
@@ -64,11 +55,8 @@ type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: bo
 /**
  * 工具清单。
  *
- * ⚠️ `description` 会被**塞进模型的上下文**，所以写的是「什么时候该用它」，
- * 不是「它做了什么」。模型选工具靠的是这句话。
- *
- * ⚠️ `inputSchema` 必须是合法 JSON Schema —— 少了 `type: 'object'` 或
- * `properties` 会让某些客户端的校验器直接拒绝整份清单。
+ * ⚠️ `description` 会被塞进模型的系统提示，必须写清「何时使用、参数边界与签名直链时效」；
+ * ⚠️ `inputSchema` 必须是合法 JSON Schema（`type: 'object'` + `properties`）。
  */
 const TOOLS = [
   {
@@ -122,6 +110,95 @@ const TOOLS = [
       required: ['prompt'],
     },
   },
+  {
+    name: 'generate_video',
+    description:
+      '提交异步视频生成任务（支持文生视频与图生视频首尾帧）。'
+      + '默认立即返回 task_id（通常 60–120 秒出片，随后用 get_video_task 轮询），也可设 wait=true 等待完成。'
+      + '成品视频为签名直链（约 12 小时有效）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: '视频画面、镜头运动与光影描述' },
+        image: { type: 'string', description: '可选首帧图：http(s) 公网 URL 或 data:image/...;base64,...' },
+        last_image: { type: 'string', description: '可选尾帧图：http(s) 公网 URL 或 data:image/...;base64,...' },
+        model: { type: 'string', description: `视频模型名，默认 ${INTl_VIDEO_MODEL}` },
+        seconds: { type: 'integer', minimum: 1, maximum: 15, description: '时长（秒），默认 5，实测支持 4–15 秒' },
+        aspect_ratio: {
+          type: 'string',
+          enum: ['16:9', '9:16', '1:1'],
+          description: '画面比例（仅文生视频有效），默认 16:9',
+        },
+        resolution: { type: 'string', description: '分辨率档位（如 768P / 1080P）' },
+        enable_audio: { type: 'boolean', description: '是否生成音轨（默认 true）' },
+        wait: { type: 'boolean', description: '是否阻塞等待出片（默认 false 立即返回 task_id）' },
+        timeout_seconds: { type: 'integer', minimum: 1, maximum: 600, description: 'wait=true 时的最长等待秒数（最大 600）' },
+      },
+      required: ['prompt'],
+    },
+  },
+  {
+    name: 'get_video_task',
+    description:
+      '按 generate_video 返回的 task_id 查询视频生成进度与结果 URL。'
+      + '本网关自动绑定原提交账号查询，status=completed 时返回视频签名直链（约 12 小时有效）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: 'generate_video 返回的任务 ID' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'generate_3d',
+    description:
+      '生成混元 3D 模型（异步任务）。文生 3D 传 prompt，图生 3D 传 image_url 或 image_base64，'
+      + '多视角生 3D 同时传主图与 multi_view_images（勿与 prompt 同传）。'
+      + '默认立即返回 job_id，用 get_3d_task 查询进度；产物支持 OBJ/GLB/USDZ/FBX/STL，直链约 24 小时有效。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: '3D 物体外观、结构、材质与风格描述' },
+        image_url: { type: 'string', description: '参考图公网 http(s) URL' },
+        image_base64: { type: 'string', description: '参考图 base64 或 data:image/...;base64,...（解码后最大 6MiB）' },
+        multi_view_images: {
+          type: 'array',
+          description: '多视角参考图数组，例如 [{"ViewType":"back","ViewImageUrl":"https://..."}]',
+          items: { type: 'object', properties: { ViewType: { type: 'string' }, ViewImageUrl: { type: 'string' } } },
+        },
+        model: { type: 'string', enum: ['3.0', '3.1'], description: '模型版本，默认 3.1；LowPoly 模式必须使用 3.0' },
+        enable_pbr: { type: 'boolean', description: '是否开启 PBR 物理材质贴图' },
+        face_count: { type: 'integer', minimum: 10000, maximum: 1500000, description: '目标面数（10000～1500000）' },
+        generate_type: {
+          type: 'string',
+          enum: ['Normal', 'LowPoly', 'Geometry', 'Sketch'],
+          description: '生成模式；Sketch 需同时提供 prompt 与参考图',
+        },
+        polygon_type: { type: 'string', enum: ['triangle', 'quadrilateral'], description: '网格多边形类型' },
+        result_format: {
+          type: 'string',
+          enum: ['OBJ', 'GLB', 'USDZ', 'FBX', 'STL'],
+          description: '指定额外导出的 3D 文件格式（默认含 OBJ/GLB）',
+        },
+        wait: { type: 'boolean', description: '默认 false 立即返回 job_id；true 时阻塞等待至完成或超时' },
+        timeout_seconds: { type: 'integer', minimum: 1, maximum: 600, description: 'wait=true 时的最长等待秒数（最大 600）' },
+      },
+    },
+  },
+  {
+    name: 'get_3d_task',
+    description:
+      '按 generate_3d 返回的 job_id 查询混元 3D 任务状态与产物下载直链。'
+      + 'status=DONE 时返回 GLB/OBJ 等模型文件签名直链（约 24 小时有效），未完成前请勿重复提交新任务。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'generate_3d 返回的 job_id' },
+      },
+      required: ['job_id'],
+    },
+  },
 ] as const
 
 /** 构造一条 JSON-RPC 成功响应。 */
@@ -135,109 +212,282 @@ function fail(id: unknown, code: number, message: string): Response {
   return Response.json({ jsonrpc: '2.0', id: id ?? null, error: { code, message } })
 }
 
-/**
- * 取一个可用凭据。
- *
- * ## 🔴 只能用国际版（2026-11-05 实测，别再改了）
- *
- * 文件头那张表是**用池内真实账号**测出来的：
- * 国内版（`copilot.tencent.com`）对 `agenttool/search`、`agenttool/webfetch`、
- * `v2/images/generations` **全部返回 401**（APISIX 网关层直接拒），
- * 这些能力只在国际版（`www.workbuddy.ai`）上开放。
- *
- * ⚠️ 我曾在 2026-11-09 试图加「回退国内版」：看到 `webToolCapable('cn')`
- * 返回 true 就以为国内能搜 —— **那是误读**。该函数只判断「是否支持这条调用路径」，
- * 不代表上游有这个权限。真跑下去就是拿国内账号去撞 401，
- * 把一个能正常工作的搜索变成一个必然失败的搜索。
- * ⇒ 宁可明确告诉用户「需要国际版账号」，也不要静默地换个注定失败的账号去试。
- */
-async function credentials(env: Env): Promise<{ ok: true; uid: string; token: string } | { ok: false; reason: string }> {
-  const c = await pickCredential(env, 'global', WORKBUDDY_INTL.id)
-  if (c === undefined) {
-    return {
-      ok: false,
-      reason: '这个网关没有可用的 WorkBuddy 国际版账号。'
-        + '生图、视频、联网检索、抓网页这四项能力都只有国际版支持（国内版实测 401），'
-        + '请先在面板「供应商与账号」登录一个国际版账号再重试。',
+function logEarlyMcpValidationFailure(env: Env, name: string, startedAt: number, errorText: string): void {
+  try {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    if (typeof pool.appendLog === 'function') {
+      recordLog(pool, {
+        type: 'mcp',
+        model: `mcp:${name}`,
+        provider: 'wb-router',
+        uid: 'mcp',
+        status: 400,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        error: redactThreeDSecrets(errorText).slice(0, 200),
+      })
     }
+  } catch {
+    // 审计日志失败不影响协议响应
   }
-  return { ok: true, uid: c.uid, token: c.credential.accessToken }
 }
 
 /**
- * 执行一次工具调用。
+ * 执行一次工具调用（全部接入 `media-router.ts` 的多账号容灾与幂等记账）。
  *
- * ⚠️ **执行失败返回 `isError: true` + 上游原话**，而不是 JSON-RPC error。
- * 这是规范里的区分：`isError` 是「工具跑了但失败」，模型能读到原因并自己决定
- * 换方案；JSON-RPC `-32602` 是「请求本身不合法」，模型看了也无从补救。
- * 把「账号没配」报成协议错误，模型只会反复重试同一个调用。
+ * ⚠️ 执行失败返回 `isError: true` + 可读原因，而不是 JSON-RPC error。
  */
-async function callTool(name: string, args: Record<string, unknown>, env: Env): Promise<ToolResult> {
-  const text = (t: string, isError = false): ToolResult => ({ content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) })
+async function callTool(
+  name: string,
+  args: Record<string, unknown>,
+  env: Env,
+  hooks: MediaExecutionHooks = {},
+): Promise<{ result: ToolResult; auditedByRouter: boolean }> {
+  const text = (t: string, isError = false): ToolResult => ({
+    content: [{ type: 'text', text: t }],
+    ...(isError ? { isError: true } : {}),
+  })
 
   if (typeof args !== 'object' || args === null || Array.isArray(args)) {
-    return text('参数必须是 JSON 对象', true)
+    return { result: text('参数必须是 JSON 对象', true), auditedByRouter: false }
   }
+
+  const routerHooks: MediaExecutionHooks = { ...hooks, logType: 'mcp' }
 
   if (name === 'web_search') {
     const query = typeof args.query === 'string' ? args.query.trim() : ''
-    if (query === '') return text('缺少 query', true)
-    const c = await credentials(env)
-    if (!c.ok) return text(c.reason, true)
+    if (query === '') return { result: text('缺少 query', true), auditedByRouter: false }
     try {
-      const r = await webSearch({ uid: c.uid, accessToken: c.token, realm: 'global' }, env, {
-        query,
-        ...(typeof args.max_results === 'number' ? { maxResults: args.max_results } : {}),
-        ...(typeof args.rerank === 'boolean' ? { rerank: args.rerank } : {}),
-      })
-      if (r.results.length === 0) return text(`没有找到「${query}」的结果。`)
+      const { result: r } = await runMediaSearch(
+        env,
+        {
+          query,
+          ...(typeof args.max_results === 'number' ? { maxResults: args.max_results } : {}),
+          ...(typeof args.rerank === 'boolean' ? { rerank: args.rerank } : {}),
+        },
+        {
+          ...routerHooks,
+          targets: [{ realm: 'global', providerId: WORKBUDDY_INTL.id }],
+        },
+      )
+      if (r.results.length === 0) {
+        return { result: text(`没有找到「${query}」的结果。`), auditedByRouter: true }
+      }
       const body = r.results
         .map((x, i) => `${i + 1}. ${x.title}\n   ${x.url}\n   ${x.snippet}`)
         .join('\n\n')
-      return text(`搜索「${query}」得到 ${r.results.length} 条结果：\n\n${body}`)
+      return {
+        result: text(`搜索「${query}」得到 ${r.results.length} 条结果：\n\n${body}`),
+        auditedByRouter: true,
+      }
     } catch (error) {
-      return text(`搜索失败：${error instanceof Error ? error.message : String(error)}`, true)
+      const msg = redactThreeDSecrets(error instanceof Error ? error.message : String(error))
+      return { result: text(`搜索失败：${msg}`, true), auditedByRouter: true }
     }
   }
 
   if (name === 'web_fetch') {
     const url = typeof args.url === 'string' ? args.url.trim() : ''
-    if (!/^https?:\/\//i.test(url)) return text('url 必须是 http(s) 地址', true)
-    const c = await credentials(env)
-    if (!c.ok) return text(c.reason, true)
+    if (!/^https?:\/\//i.test(url)) {
+      return { result: text('url 必须是 http(s) 地址', true), auditedByRouter: false }
+    }
     try {
-      const r = await webFetch({ uid: c.uid, accessToken: c.token, realm: 'global' }, env, { url })
+      const { result: r } = await runMediaFetch(
+        env,
+        { url },
+        {
+          ...routerHooks,
+          targets: [{ realm: 'global', providerId: WORKBUDDY_INTL.id }],
+        },
+      )
       const head = r.title === '' ? `# ${r.url}` : `# ${r.title}\n\n来源：${r.url}`
-      return text(`${head}\n\n${r.content}`)
+      return { result: text(`${head}\n\n${r.content}`), auditedByRouter: true }
     } catch (error) {
-      return text(`抓取失败：${error instanceof Error ? error.message : String(error)}`, true)
+      const msg = redactThreeDSecrets(error instanceof Error ? error.message : String(error))
+      return { result: text(`抓取失败：${msg}`, true), auditedByRouter: true }
     }
   }
 
   if (name === 'generate_image') {
     const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : ''
-    if (prompt === '') return text('缺少 prompt', true)
-    const c = await credentials(env)
-    if (!c.ok) return text(c.reason, true)
+    if (prompt === '') return { result: text('缺少 prompt', true), auditedByRouter: false }
     try {
-      const r = await generateImage({ uid: c.uid, accessToken: c.token }, env, {
-        prompt,
-        ...(typeof args.size === 'string' && args.size !== '' ? { size: args.size } : {}),
-        ...(typeof args.model === 'string' && args.model !== '' ? { model: args.model } : {}),
-      })
-      if (r.images.length === 0) return text('上游返回成功但没有图片', true)
-      const urls = r.images.map((x, i) => `${i + 1}. ${x.url}${x.size ? `（${x.size}）` : ''}`).join('\n')
-      return text(
-        `已生成 ${r.images.length} 张图片：\n\n${urls}\n\n`
-          + '⚠️ 这些是签名直链（约 24 小时有效），需要长期保存请立即下载。'
-          + (r.credit === undefined ? '' : `\n本次消耗 ${r.credit} 积分。`),
+      const { result: r } = await runMediaImageGeneration(
+        env,
+        {
+          prompt,
+          ...(typeof args.size === 'string' && args.size !== '' ? { size: args.size } : {}),
+          ...(typeof args.model === 'string' && args.model !== '' ? { model: args.model } : {}),
+        },
+        routerHooks,
       )
+      if (r.images.length === 0) {
+        return { result: text('上游返回成功但没有图片', true), auditedByRouter: true }
+      }
+      const urls = r.images.map((x, i) => `${i + 1}. ${x.url}${x.size ? `（${x.size}）` : ''}`).join('\n')
+      return {
+        result: text(
+          `已生成 ${r.images.length} 张图片：\n\n${urls}\n\n`
+            + '⚠️ 这些是签名直链（约 24 小时有效），需要长期保存请立即下载。'
+            + (r.credit === undefined ? '' : `\n本次消耗 ${r.credit} 积分。`),
+        ),
+        auditedByRouter: true,
+      }
     } catch (error) {
-      return text(`生成失败：${error instanceof Error ? error.message : String(error)}`, true)
+      const msg = redactThreeDSecrets(error instanceof Error ? error.message : String(error))
+      return { result: text(`生成失败：${msg}`, true), auditedByRouter: true }
     }
   }
 
-  return text(`未知工具：${name}`, true)
+  if (name === 'generate_video') {
+    const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : ''
+    if (prompt === '') return { result: text('缺少 prompt', true), auditedByRouter: false }
+
+    const firstImage = typeof args.image === 'string' && args.image.trim() !== '' ? args.image.trim() : undefined
+    const lastImage = typeof args.last_image === 'string' && args.last_image.trim() !== '' ? args.last_image.trim() : undefined
+    for (const [field, val] of [['image', firstImage], ['last_image', lastImage]] as const) {
+      if (val !== undefined && !/^(https?:\/\/|data:image\/)/i.test(val)) {
+        return {
+          result: text(`${field} 必须是 http(s) URL 或 data:image/...;base64,...`, true),
+          auditedByRouter: false,
+        }
+      }
+    }
+
+    try {
+      const { submitted, completedTask } = await runMediaVideoSubmit(
+        env,
+        {
+          prompt,
+          ...(typeof args.model === 'string' && args.model !== '' ? { model: args.model } : {}),
+          ...(typeof args.seconds === 'number' ? { seconds: args.seconds } : {}),
+          ...(typeof args.aspect_ratio === 'string' && args.aspect_ratio !== '' ? { aspectRatio: args.aspect_ratio } : {}),
+          ...(typeof args.resolution === 'string' && args.resolution !== '' ? { resolution: args.resolution } : {}),
+          ...(typeof args.enable_audio === 'boolean' ? { enableAudio: args.enable_audio } : {}),
+          ...(firstImage === undefined ? {} : { image: firstImage }),
+          ...(lastImage === undefined ? {} : { lastImage }),
+          ...(typeof args.wait === 'boolean' ? { wait: args.wait } : {}),
+          ...(typeof args.timeout_seconds === 'number' ? { timeoutSeconds: args.timeout_seconds } : {}),
+        },
+        routerHooks,
+      )
+
+      if (completedTask !== undefined) {
+        if (completedTask.status === 'failed') {
+          return {
+            result: text(
+              `视频任务失败（task_id=${completedTask.taskId}）：${completedTask.error ?? '未知原因'}`,
+              true,
+            ),
+            auditedByRouter: true,
+          }
+        }
+        if (completedTask.status === 'completed' && completedTask.urls.length > 0) {
+          const urls = completedTask.urls.map((u, i) => `${i + 1}. ${u}`).join('\n')
+          return {
+            result: text(
+              `视频已生成完成（task_id=${completedTask.taskId}）：\n\n${urls}\n\n`
+                + '⚠️ 视频是签名直链（约 12 小时有效），需要长期保存请立即下载。'
+                + (completedTask.credit === undefined ? '' : `\n本次消耗 ${completedTask.credit} 积分。`),
+            ),
+            auditedByRouter: true,
+          }
+        }
+      }
+
+      const payload = {
+        task_id: submitted.taskId,
+        status: completedTask?.status ?? submitted.status,
+        hint: '视频任务已提交（通常 60–120 秒出片）。请调用 get_video_task 传入 task_id 查询进度，不要重复提交。',
+      }
+      return { result: text(JSON.stringify(payload, null, 2)), auditedByRouter: true }
+    } catch (error) {
+      const msg = redactThreeDSecrets(error instanceof Error ? error.message : String(error))
+      return { result: text(`视频提交失败：${msg}`, true), auditedByRouter: true }
+    }
+  }
+
+  if (name === 'get_video_task') {
+    const rawId = typeof args.task_id === 'string' && args.task_id.trim() !== ''
+      ? args.task_id
+      : typeof args.id === 'string' && args.id.trim() !== ''
+        ? args.id
+        : typeof args.video_id === 'string'
+          ? args.video_id
+          : ''
+    const taskId = rawId.trim()
+    if (taskId === '') return { result: text('缺少 task_id', true), auditedByRouter: false }
+
+    try {
+      const { task: r } = await runMediaVideoQuery(env, taskId, routerHooks)
+      const payload = {
+        id: r.taskId,
+        task_id: r.taskId,
+        object: 'video',
+        status: r.status,
+        ...(r.urls.length === 0 ? {} : { data: r.urls.map((u) => ({ url: u })) }),
+        ...(r.durationSeconds === undefined ? {} : { seconds: r.durationSeconds }),
+        ...(r.credit === undefined ? {} : { usage: { credit: r.credit } }),
+        ...(r.error === undefined ? {} : { error: { message: r.error } }),
+      }
+      return {
+        result: text(JSON.stringify(payload, null, 2), r.status === 'failed'),
+        auditedByRouter: true,
+      }
+    } catch (error) {
+      const msg = redactThreeDSecrets(error instanceof Error ? error.message : String(error))
+      return { result: text(`查询视频任务失败：${msg}`, true), auditedByRouter: true }
+    }
+  }
+
+  if (name === 'generate_3d') {
+    try {
+      const { state, model } = await runMediaThreeDSubmit(env, args, {
+        ...routerHooks,
+        preferredRealm: 'global',
+      })
+      const payload = formatThreeDTaskPayload(state.jobId, state, model, state.credit)
+      return {
+        result: text(JSON.stringify(payload, null, 2), state.status === 'FAIL'),
+        auditedByRouter: true,
+      }
+    } catch (error) {
+      const msg = redactThreeDSecrets(error instanceof Error ? error.message : String(error))
+      // 参数校验错误发生在进路由器之前，auditedByRouter=false 由外层补一条错误日志
+      const isValidation = !(msg.includes('没有可用') || msg.includes('临时云凭证') || msg.includes('3D '))
+      return { result: text(`3D 生成失败：${msg}`, true), auditedByRouter: !isValidation }
+    }
+  }
+
+  if (name === 'get_3d_task') {
+    const rawId = typeof args.job_id === 'string' && args.job_id.trim() !== ''
+      ? args.job_id
+      : typeof args.id === 'string' && args.id.trim() !== ''
+        ? args.id
+        : typeof args.task_id === 'string'
+          ? args.task_id
+          : ''
+    const jobId = rawId.trim()
+    if (jobId === '') return { result: text('缺少 job_id', true), auditedByRouter: false }
+
+    try {
+      const { state, model, cachedCredit } = await runMediaThreeDQuery(env, jobId, {
+        ...routerHooks,
+        preferredRealm: 'global',
+      })
+      const payload = formatThreeDTaskPayload(jobId, state, model, cachedCredit)
+      return {
+        result: text(JSON.stringify(payload, null, 2), state.status === 'FAIL'),
+        auditedByRouter: true,
+      }
+    } catch (error) {
+      const msg = redactThreeDSecrets(error instanceof Error ? error.message : String(error))
+      return { result: text(`查询 3D 任务失败：${msg}`, true), auditedByRouter: true }
+    }
+  }
+
+  // 防止未引用的常量触发 lint 警告（双分片策略由 media-router 统一托管）
+  void DEFAULT_PROVIDER
+  return { result: text(`未知工具：${name}`, true), auditedByRouter: false }
 }
 
 /**
@@ -245,7 +495,12 @@ async function callTool(name: string, args: Record<string, unknown>, env: Env): 
  *
  * @returns 响应；`undefined` 表示这是一条**通知**（无 `id`），按规范不回响应。
  */
-export async function handleMcp(request: Request, env: Env): Promise<Response | undefined> {
+export async function handleMcp(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext,
+  hooks?: MediaExecutionHooks,
+): Promise<Response | undefined> {
   if (request.method === 'GET') {
     // ⚠️ 规范允许客户端探测 SSE 通道；我们不提供 ⇒ 405 + Allow，客户端会退回纯 POST
     return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'POST' } })
@@ -261,16 +516,21 @@ export async function handleMcp(request: Request, env: Env): Promise<Response | 
     return fail(null, RPC.parseError, '请求体不是合法 JSON')
   }
 
-  // 规范允许批量；我们只处理单条（批量在纯 POST 形态下几乎没人用，且会让错误处理复杂化）
   if (Array.isArray(payload)) {
     if (payload.length === 0) return fail(null, RPC.invalidRequest, '空批量')
     const first = payload[0] as RpcRequest
-    return await handleOne(first, env)
+    return await handleOne(first, env, request.signal, ctx, hooks)
   }
-  return await handleOne(payload as RpcRequest, env)
+  return await handleOne(payload as RpcRequest, env, request.signal, ctx, hooks)
 }
 
-async function handleOne(msg: RpcRequest, env: Env): Promise<Response | undefined> {
+async function handleOne(
+  msg: RpcRequest,
+  env: Env,
+  signal: AbortSignal,
+  ctx?: ExecutionContext,
+  hooks?: MediaExecutionHooks,
+): Promise<Response | undefined> {
   const id = msg.id
   const method = typeof msg.method === 'string' ? msg.method : ''
   // ⚠️ 没有 `id` 的是**通知**（如 notifications/initialized）—— 按规范不回响应
@@ -280,15 +540,13 @@ async function handleOne(msg: RpcRequest, env: Env): Promise<Response | undefine
     const params = (msg.params ?? {}) as Record<string, unknown>
     const requested = typeof params.protocolVersion === 'string' ? params.protocolVersion : ''
     return ok(id, {
-      // ⚠️ 客户端要的版本在我们支持列表里就原样回；否则回我们最新的
-      //（回一个客户端不认识的版本会让它直接断连）
       protocolVersion: SUPPORTED_PROTOCOLS.includes(requested) ? requested : LATEST_PROTOCOL,
       capabilities: { tools: {} },
-      // ⚠️ `version` 是本网关自己的版本，随 package.json 走（发布 Release 时会一起升）
-      serverInfo: { name: 'free-llm-router', version: '1.1.1' },
+      serverInfo: { name: 'free-llm-router', version: APP_VERSION },
       instructions:
-        '本网关提供联网检索、网页抓取与文生图。'
-        + '需要实时信息时优先用 web_search，不要凭记忆回答时效性问题。',
+        '本网关提供联网检索（web_search）、网页抓取（web_fetch）、文生图（generate_image）、'
+        + '异步视频生成（generate_video / get_video_task）与混元 3D 模型生成（generate_3d / get_3d_task）。'
+        + '需要实时信息时优先用 web_search；视频与 3D 默认返回任务 ID，请按原 ID 轮询进度，勿重复提交。',
     })
   }
 
@@ -308,61 +566,29 @@ async function handleOne(msg: RpcRequest, env: Env): Promise<Response | undefine
     const args = (params.arguments ?? {}) as Record<string, unknown>
     if (name === '') return fail(id, RPC.invalidParams, '缺少工具名')
 
-    /**
-     * MCP 工具调用**必须进日志**（2026-11-09 补）。
-     *
-     * ## 之前为什么漏了
-     * `recordLog` 只在 `/v1/chat/completions` 等 OpenAI 兼容入口被调用，
-     * MCP 走的是 `/mcp` 这条独立链路，从来没接过日志 —— 于是面板「日志」Tab
-     * 里只有对话记录，**完全看不到 wb-router 的搜索 / 抓网页 / 生图调用**。
-     * 用户的原话是「wb router 调用什么模型我们也不知道」，根因在此。
-     *
-     * ## 记什么
-     * - `type: 'mcp'`：与对话请求区分开，面板可单独筛
-     * - `model`：工具名（web_search / web_fetch / generate_image）——
-     *   这三个不是 LLM 调用，没有模型概念，用工具名占位最能说明「调了什么」
-     * - `provider: 'wb-router'`
-     * - `durationMs` / `status` / `error`：耗时与成败
-     */
     const startedAt = Date.now()
-    const logToolCall = async (status: number, errorText?: string): Promise<void> => {
-      try {
-        // 与 pickCredential 同一个 DO（realm=global，MCP 三项能力都走国际版）
-        const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
-        recordLog(pool, {
-          type: 'mcp',
-          model: `mcp:${name}`,
-          provider: 'wb-router',
-          uid: 'mcp',
-          status,
-          durationMs: Date.now() - startedAt,
-          ...(errorText === undefined ? {} : { error: errorText.slice(0, 200) }),
-        })
-      } catch (e) {
-        // 日志失败不能影响工具本身返回
-        console.error('[mcp] 写日志失败：', e instanceof Error ? e.message : String(e))
-      }
-    }
-
     try {
-      const result = await callTool(name, args, env)
-      const failed = (result as { isError?: boolean }).isError === true
-      await logToolCall(failed ? 500 : 200, failed
-        ? ((result as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '工具返回错误')
-        : undefined)
+      const { result, auditedByRouter } = await callTool(name, args, env, {
+        ...hooks,
+        ctx,
+        signal,
+      })
+      if (!auditedByRouter && result.isError === true) {
+        const errText = result.content[0]?.text ?? '工具参数校验失败'
+        logEarlyMcpValidationFailure(env, name, startedAt, errText)
+      }
       return ok(id, result)
     } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error)
-      await logToolCall(500, msg)
-      // 兜底：任何未预期异常都变成工具错误（不是协议错误），避免客户端整体断连
+      const errMsg = redactThreeDSecrets(error instanceof Error ? error.message : String(error))
+      logEarlyMcpValidationFailure(env, name, startedAt, errMsg)
       return ok(id, {
-        content: [{ type: 'text', text: `工具执行异常：${msg}` }],
+        content: [{ type: 'text', text: `工具执行异常：${errMsg}` }],
         isError: true,
       })
     }
   }
 
-  // 资源 / 提示词：我们没实现 ⇒ 回空清单（不是错误。回错误会让部分客户端告警）
+  // 资源 / 提示词：回空清单（不是错误，避免客户端告警）
   if (method === 'resources/list') return ok(id, { resources: [] })
   if (method === 'resources/templates/list') return ok(id, { resourceTemplates: [] })
   if (method === 'prompts/list') return ok(id, { prompts: [] })

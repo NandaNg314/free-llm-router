@@ -28,6 +28,7 @@ import { opencodeProvider } from './opencode.js'
 import { raccoonProvider } from './raccoon.js'
 import { zcodeProvider } from './zcode.js'
 import { meooProvider } from './meoo.js'
+import { modelscopeProvider } from './modelscope.js'
 import { parseJsonLenient } from '../upstream/import.js'
 
 /**
@@ -58,6 +59,7 @@ export const PROVIDERS: readonly Provider[] = [
   // ⚠️ **放在最后**：数组第 0 项是默认供应商，不能被新加的挤动。
   loomyProvider,
   geminiProvider,
+  modelscopeProvider,
   meooProvider,
 ]
 
@@ -120,19 +122,6 @@ export function parseCredentialAnywhere(
     }
   }
 
-  // ⚠️ **WorkBuddy 必须最后试**。
-  //
-  // 它的凭据形态是最宽松的（只要 `accessToken` + `uid`），因此会把别的供应商的
-  // 凭据也「认下来」，然后拿去打 WorkBuddy 的端点 → 永远 401。
-  // 而其它供应商的凭据有更强的判别特征（cline 的 `workos:` 前缀、
-  // codearts 的 AK/SK 对）。
-  // 故顺序是：**特征强的先试，最宽松的兜底**。
-  const ordered = [...PROVIDERS].sort((a, b) => {
-    if (a.id === DEFAULT_PROVIDER) return 1
-    if (b.id === DEFAULT_PROVIDER) return -1
-    return 0
-  })
-
   // ⚠️ 裸字符串要按形状**预筛**供应商。
   // 否则「任意非空字符串即收下」的那几家会把任何文本吞掉，产出必然 401 的
   // 假账号（实测 `'str'` 被 minimax 收下），而用户看到的是「导入成功」。
@@ -164,6 +153,25 @@ export function parseCredentialAnywhere(
     effective !== null && typeof effective === 'object' && !Array.isArray(effective)
       ? (effective as Record<string, unknown>)
       : undefined
+
+  // ⚠️ **WorkBuddy 必须最后试**，且通用 `{ apiKey }` 兜底的 `opencode` 排在具象前缀判别之后：
+  // - `gemini` 只认 `AIza...` / `AQ....`、`modelscope` 只认 `ms-...`、`meoo` 只认 `meoo_`；
+  // - 而 `opencode.matchesShape` 对任意非空 `apiKey` / `api_key` 都返回 `true`，
+  //   若排在前面会把 `{ apiKey: "AIzaSy..." }` 或 `{ apiKey: "ms-..." }` 误抢成 OpenCode 账号。
+  // - 若对象自身已显式声明 `provider: "<id>"`，优先尝试该供应商。
+  const declaredProvider =
+    record !== undefined && typeof record['provider'] === 'string'
+      ? record['provider'].trim().toLowerCase()
+      : ''
+  const ordered = [...PROVIDERS].sort((a, b) => {
+    const rank = (id: string): number => {
+      if (declaredProvider !== '' && id === declaredProvider) return -1
+      if (id === DEFAULT_PROVIDER) return 2
+      if (id === 'opencode') return 1
+      return 0
+    }
+    return rank(a.id) - rank(b.id)
+  })
 
   for (const provider of ordered) {
     // ⚠️ 对象形态也按 `matchesShape` 预筛：多家凭据字段高度重叠
@@ -327,5 +335,15 @@ export function getBuiltinModels(): BuiltinModelInfo[] {
     { id: 'meoo/kimi-k2.5', name: 'Kimi K2.5', provider: 'meoo', providerName: 'Meoo (秒悟)', isFree: true, isBuiltin: true },
     { id: 'meoo/glm-5', name: 'GLM-5', provider: 'meoo', providerName: 'Meoo (秒悟)', isFree: true, isBuiltin: true },
     { id: 'meoo/MiniMax-M2.5', name: 'MiniMax M2.5', provider: 'meoo', providerName: 'Meoo (秒悟)', isFree: true, isBuiltin: true },
+
+    // ModelScope 魔搭社区
+    { id: 'modelscope/deepseek-ai/DeepSeek-V4.1-Flash-1017', name: 'DeepSeek V4.1 Flash', provider: 'modelscope', providerName: 'ModelScope (魔搭)', isFree: true, isBuiltin: true },
+    { id: 'modelscope/deepseek-ai/DeepSeek-V4-Pro-0813', name: 'DeepSeek V4 Pro', provider: 'modelscope', providerName: 'ModelScope (魔搭)', isFree: true, isBuiltin: true },
+    { id: 'modelscope/ZhipuAI/GLM-5.3-Flash', name: 'GLM 5.3 Flash', provider: 'modelscope', providerName: 'ModelScope (魔搭)', isFree: true, isBuiltin: true },
+    { id: 'modelscope/ZhipuAI/GLM-5.1', name: 'GLM-5.1', provider: 'modelscope', providerName: 'ModelScope (魔搭)', isFree: true, isBuiltin: true },
+    { id: 'modelscope/Qwen/Qwen3.5-Plus', name: 'Qwen3.5 Plus', provider: 'modelscope', providerName: 'ModelScope (魔搭)', isFree: true, isBuiltin: true },
+    { id: 'modelscope/Qwen/Qwen3-Coder-Plus', name: 'Qwen3 Coder Plus', provider: 'modelscope', providerName: 'ModelScope (魔搭)', isFree: true, isBuiltin: true },
+    { id: 'modelscope/moonshotai/Kimi-K2.5', name: 'Kimi K2.5', provider: 'modelscope', providerName: 'ModelScope (魔搭)', isFree: true, isBuiltin: true },
+    { id: 'modelscope/MiniMax/MiniMax-M2.5', name: 'MiniMax M2.5', provider: 'modelscope', providerName: 'ModelScope (魔搭)', isFree: true, isBuiltin: true },
   ]
 }

@@ -20,6 +20,7 @@ import {
   normalizeToolChoice,
   normalizeTools,
   prepareChatBody,
+  reorderEarlyToolResults,
   repackToolResultBlocks,
   sanitizeChatBody,
   scrubFingerprintText,
@@ -31,6 +32,129 @@ import { clientStatusFor, mapErrorToPunishment, refineModelScoped } from '../src
 
 type M = Record<string, unknown>
 const call = (id: string, name = 'f', args: unknown = '{}'): M => ({ id, type: 'function', function: { name, arguments: args } })
+
+// ─────────────────────── 11148：早到结果前置重排（27b7458 / e14a3d0） ───────────────────────
+
+test('reorderEarlyToolResults：单个早到 tool 结果挪到对应 assistant 之后', () => {
+  const msgs = [
+    { role: 'user', content: 'run' },
+    { role: 'tool', tool_call_id: 'c0', content: 'ok' },
+    { role: 'assistant', content: '', tool_calls: [call('c0', 'shell')] },
+    { role: 'user', content: 'next' },
+  ]
+  const out = reorderEarlyToolResults(msgs) as M[]
+  assert.deepEqual(
+    out.map((m) => (m.role === 'tool' ? `tool:${m.tool_call_id}` : m.role === 'assistant' ? 'assistant:c0' : m.role)),
+    ['user', 'assistant:c0', 'tool:c0', 'user'],
+  )
+  assert.equal(out[2]!.content, 'ok')
+})
+
+test('reorderEarlyToolResults：顺序本就正确与孤儿结果均零改动（返回同一引用）', () => {
+  const ordered = [
+    { role: 'user', content: 'run' },
+    { role: 'assistant', content: '', tool_calls: [call('c0')] },
+    { role: 'tool', tool_call_id: 'c0', content: 'ok' },
+  ]
+  assert.equal(reorderEarlyToolResults(ordered), ordered)
+
+  const orphan = [
+    { role: 'user', content: 'run' },
+    { role: 'tool', tool_call_id: 'zz', content: 'orphan' },
+  ]
+  assert.equal(reorderEarlyToolResults(orphan), orphan)
+})
+
+test('reorderEarlyToolResults：正常结果先出、早到结果保持相对顺序补在同批连续 tool 末尾，末尾声明也能落盘', () => {
+  const mixed = [
+    { role: 'user', content: 'run' },
+    { role: 'tool', tool_call_id: 'c1', content: 'early-1' },
+    { role: 'tool', tool_call_id: 'c2', content: 'early-2' },
+    { role: 'assistant', content: '', tool_calls: [call('c0'), call('c1'), call('c2')] },
+    { role: 'tool', tool_call_id: 'c0', content: 'normal-0' },
+    { role: 'user', content: 'next' },
+  ]
+  const out = reorderEarlyToolResults(mixed) as M[]
+  assert.deepEqual(
+    out.map((m) => (m.role === 'tool' ? `tool:${m.tool_call_id}` : m.role)),
+    ['user', 'assistant', 'tool:c0', 'tool:c1', 'tool:c2', 'user'],
+  )
+
+  const tailDecl = [
+    { role: 'user', content: 'run' },
+    { role: 'tool', tool_call_id: 'c0', content: 'ok' },
+    { role: 'assistant', content: '', tool_calls: [call('c0')] },
+  ]
+  const tailOut = reorderEarlyToolResults(tailDecl) as M[]
+  assert.deepEqual(
+    tailOut.map((m) => (m.role === 'tool' ? `tool:${m.tool_call_id}` : m.role)),
+    ['user', 'assistant', 'tool:c0'],
+  )
+})
+
+test('🔴 reorderEarlyToolResults：跨轮复用同一 call_0 ID 不误挪，早到轮按最近未配对声明归位（e14a3d0）', () => {
+  // 1. 跨轮复用同一 id、顺序本就正确 ⇒ 零改动（同一引用）
+  const cleanReuse = [
+    { role: 'user', content: 'a' },
+    { role: 'assistant', content: '', tool_calls: [call('call_0')] },
+    { role: 'tool', tool_call_id: 'call_0', content: 'r1' },
+    { role: 'user', content: 'b' },
+    { role: 'assistant', content: '', tool_calls: [call('call_0')] },
+    { role: 'tool', tool_call_id: 'call_0', content: 'r2' },
+    { role: 'user', content: 'c' },
+  ]
+  assert.equal(reorderEarlyToolResults(cleanReuse), cleanReuse, '正常跨轮复用不得被搬到最后一轮')
+
+  // 2. 第二轮结果早到 ⇒ 只挪第二轮，第一轮纹丝不动
+  const round2Early = [
+    { role: 'user', content: 'a' },
+    { role: 'assistant', content: '', tool_calls: [call('call_0')] },
+    { role: 'tool', tool_call_id: 'call_0', content: 'r1' },
+    { role: 'user', content: 'b' },
+    { role: 'tool', tool_call_id: 'call_0', content: 'r2' },
+    { role: 'assistant', content: '', tool_calls: [call('call_0')] },
+    { role: 'user', content: 'c' },
+  ]
+  const out2 = reorderEarlyToolResults(round2Early) as M[]
+  assert.deepEqual(
+    out2.map((m) => (m.role === 'tool' ? `tool:${m.content}` : m.role)),
+    ['user', 'assistant', 'tool:r1', 'user', 'assistant', 'tool:r2', 'user'],
+  )
+
+  // 3. 两轮都早到（甚至全排在声明前）⇒ 按槽位容量各归各的声明
+  const bothEarly = [
+    { role: 'tool', tool_call_id: 'call_0', content: 'r1' },
+    { role: 'tool', tool_call_id: 'call_0', content: 'r2' },
+    { role: 'assistant', content: '', tool_calls: [call('call_0')] },
+    { role: 'user', content: 'b' },
+    { role: 'assistant', content: '', tool_calls: [call('call_0')] },
+  ]
+  const out3 = reorderEarlyToolResults(bothEarly) as M[]
+  assert.deepEqual(
+    out3.map((m) => (m.role === 'tool' ? `tool:${m.content}` : m.role)),
+    ['assistant', 'tool:r1', 'user', 'assistant', 'tool:r2'],
+  )
+})
+
+test('prepareChatBody：端到端修复早到 tool 结果且不被孤儿清理误删', () => {
+  const prepared = prepareChatBody({
+    model: 'deepseek-v4.1-flash',
+    messages: [
+      { role: 'user', content: 'run' },
+      { role: 'tool', tool_call_id: 'c0', content: 'ok-output' },
+      { role: 'assistant', content: '', tool_calls: [call('c0', 'shell')] },
+      { role: 'user', content: 'next' },
+    ],
+  })
+  const parsed = JSON.parse(prepared.body) as M
+  const msgs = parsed.messages as M[]
+  assert.deepEqual(
+    msgs.map((m) => (m.role === 'tool' ? `tool:${m.tool_call_id}` : m.role)),
+    ['user', 'assistant', 'tool:c0', 'user'],
+  )
+  assert.equal(msgs[2]!.content, 'ok-output')
+  assert.ok(prepared.applied.includes('tool-pairing'))
+})
 
 // ─────────────────────── 11148：相邻 assistant 合并 ───────────────────────
 

@@ -17,7 +17,7 @@
 
 import { resolveUpstream, type Env } from '../env.js'
 import { callUpstream, classify, UpstreamError } from './client.js'
-import { billingHeaders } from './headers.js'
+import { billingHeaders, type UpstreamRealm } from './headers.js'
 
 /** 签到结果。 */
 export interface CheckinResult {
@@ -189,15 +189,21 @@ export async function dailyCheckin(
 
 /** 查余额（只读）。返回所有包 + 汇总。 */
 export async function fetchBalance(
-  ctx: { uid: string; accessToken: string },
+  ctx: { uid: string; accessToken: string; realm?: UpstreamRealm },
   env: Env,
   now: number,
 ): Promise<{ packages: BalancePackage[]; total: number; expiring: number; earliestExpiry: number }> {
   const bases = resolveUpstream(env)
+  const effectiveRealm: UpstreamRealm | undefined =
+    ctx.realm ?? (bases.billing.includes('workbuddy.ai') ? 'global' : undefined)
   const res = await callUpstream({
     method: 'POST',
     url: `${bases.billing}/v2/billing/meter/get-user-resource`,
-    headers: billingHeaders({ uid: ctx.uid, accessToken: ctx.accessToken }),
+    headers: billingHeaders({
+      uid: ctx.uid,
+      accessToken: ctx.accessToken,
+      ...(effectiveRealm !== undefined ? { realm: effectiveRealm } : {}),
+    }),
     body: '{}',
   })
 

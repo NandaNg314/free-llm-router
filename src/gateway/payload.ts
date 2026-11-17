@@ -208,6 +208,127 @@ function fixToolCalls(calls: unknown[]): unknown[] | undefined {
   return changed ? out : undefined
 }
 
+/** 提取单条 assistant 消息 `tool_calls` 里的非空字符串调用 ID（保持声明顺序）。 */
+function declaredToolCallIds(raw: unknown): string[] {
+  if (!isObj(raw) || raw.role !== 'assistant' || !Array.isArray(raw.tool_calls)) return []
+  const ids: string[] = []
+  for (const tc of raw.tool_calls as unknown[]) {
+    if (isObj(tc) && typeof tc.id === 'string' && tc.id !== '') {
+      ids.push(tc.id)
+    }
+  }
+  return ids
+}
+
+/**
+ * 将早于其 `assistant(tool_calls)` 出现的 `role: 'tool'` 消息移到对应 `assistant`
+ *（及其紧随的连续 `role: 'tool'` 结果批次）之后（同步自 `workbuddy2api-panel` `27b7458`、`e14a3d0`）。
+ *
+ * ## 为什么必须排在配对管线最前面
+ *
+ * 部分客户端（特别是 Codex 经本地代理走 `/v1/responses` 时）会把 `function_call_output`
+ * 排在声明它的 `function_call` 之前。若不先重排：
+ * - `repackToolResultBlocks` 只从 `assistant` 起扫，前面的 `tool` 被原样放过；
+ * - `cleanupOrphanToolCalls` 见两侧 ID 齐全判定「非孤儿」，倒置顺序直通上游触发 `400 code=11148`。
+ *
+ * ## 跨轮同 ID 安全归属（`e14a3d0` + 槽位容量守恒）
+ *
+ * 网关在流式缺 ID 时可能按轮内下标生成 `call_0` / `toolu_0`，多轮历史中同一 ID 会合法重复出现。
+ * 按每个声明槽位追踪是否已配对：
+ * - 若前序已有未配对的同 ID 声明槽位 ⇒ 正常顺序配对，原地不动；
+ * - 否则向后寻找**最近**一个尚未认领的同 ID 声明槽位 ⇒ 归入该声明批次并预占槽位；
+ * - 前后均无可用声明槽位的孤儿结果 ⇒ 原地不动，交由后续 `cleanupOrphanToolCalls` 裁剪；
+ * - 本来有序的历史零改动，直接返回原数组引用。
+ */
+export function reorderEarlyToolResults(messages: unknown[]): unknown[] {
+  if (messages.length < 2) return messages
+
+  interface DeclSlot {
+    declIdx: number
+    claimed: boolean
+  }
+  const slotsById = new Map<string, DeclSlot[]>()
+  for (let i = 0; i < messages.length; i += 1) {
+    for (const id of declaredToolCallIds(messages[i])) {
+      let list = slotsById.get(id)
+      if (list === undefined) {
+        list = []
+        slotsById.set(id, list)
+      }
+      list.push({ declIdx: i, claimed: false })
+    }
+  }
+  if (slotsById.size === 0) return messages
+
+  const early = new Array<boolean>(messages.length).fill(false)
+  const group = new Map<number, unknown[]>()
+  let anyEarly = false
+
+  for (let i = 0; i < messages.length; i += 1) {
+    const raw = messages[i]
+    if (!isObj(raw) || raw.role !== 'tool') continue
+    const id = raw.tool_call_id
+    if (typeof id !== 'string' || id === '') continue
+    const slots = slotsById.get(id)
+    if (slots === undefined) continue
+
+    // 优先匹配前序（declIdx < i）尚未配对的最近/最早声明槽位 ⇒ 顺序正常，不搬移
+    let matchedPrior = false
+    for (const slot of slots) {
+      if (slot.declIdx >= i) break
+      if (!slot.claimed) {
+        slot.claimed = true
+        matchedPrior = true
+        break
+      }
+    }
+    if (matchedPrior) continue
+
+    // 无前序未配对声明：向后找最近（declIdx > i）尚未认领的声明槽位
+    for (const slot of slots) {
+      if (slot.declIdx > i && !slot.claimed) {
+        slot.claimed = true
+        early[i] = true
+        anyEarly = true
+        let bucket = group.get(slot.declIdx)
+        if (bucket === undefined) {
+          bucket = []
+          group.set(slot.declIdx, bucket)
+        }
+        bucket.push(raw)
+        break
+      }
+    }
+  }
+
+  if (!anyEarly) return messages
+
+  const out: unknown[] = []
+  const pending: unknown[] = []
+  const flush = (): void => {
+    if (pending.length === 0) return
+    out.push(...pending)
+    pending.length = 0
+  }
+
+  for (let i = 0; i < messages.length; i += 1) {
+    if (early[i]) continue
+    const raw = messages[i]
+    const role = isObj(raw) && typeof raw.role === 'string' ? raw.role : ''
+    // 紧随所属 assistant 的连续正常 tool 结果先出；遇到非 tool 消息时把同批早到结果补在末尾
+    if (pending.length > 0 && role !== 'tool') {
+      flush()
+    }
+    out.push(raw)
+    const attached = group.get(i)
+    if (attached !== undefined) {
+      pending.push(...attached)
+    }
+  }
+  flush()
+  return out
+}
+
 /**
  * 合并**相邻**的 assistant `tool_calls` 消息（移植自 workbuddy2api-hub `merge_adjacent_tool_calls`）。
  *
@@ -589,8 +710,8 @@ export function cleanupToolPairing(messages: unknown[]): unknown[] {
     out.push(msg)
   }
 
-  // ⚠️ 顺序即语义：先合并拆开的声明（重排才看得到完整的一批），再重排，最后剪孤儿。
-  for (const step of [mergeAdjacentToolCalls, repackToolResultBlocks, cleanupOrphanToolCalls]) {
+  // ⚠️ 顺序即语义：先将早到的 tool 结果挪回所属声明之后，再合并拆开的声明，再重排插队消息，最后剪孤儿。
+  for (const step of [reorderEarlyToolResults, mergeAdjacentToolCalls, repackToolResultBlocks, cleanupOrphanToolCalls]) {
     const next = step(out)
     if (next !== out) {
       changed = true
@@ -718,6 +839,8 @@ export function clampGptMaxTokens(body: Record<string, unknown>): boolean {
   return true
 }
 
+const MAX_SCHEMA_DEPTH = 64
+
 const SCHEMA_TYPE_ALIAS: Record<string, string> = {
   str: 'string',
   text: 'string',
@@ -728,23 +851,199 @@ const SCHEMA_TYPE_ALIAS: Record<string, string> = {
   float: 'number',
 }
 const SCHEMA_VALID_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object', 'null'])
-const SCHEMA_NULLABLE_META = ['description', 'title', 'format', 'pattern', 'items', 'default']
 
 /**
- * 递归修 JSON Schema（就地；调用方传入的是副本）。上游 Go 校验器很严：
- * `null` 的 description/title、`str`/`int` 这类别名类型、缺 `properties` 的 object、
- * 含 null 的 `required`、元组形式的 `items` 都会 400 `code=11129`。
+ * 值本身是**用户数据**而非 JSON Schema 节点的关键字（`workbuddy2api-panel` `d6301fe`）。
  *
- * 只修**不合法**的部分，合规字段原样保留。
+ * - `default` / `const` / `example` 允许直接取值为 `null`（如 `const: null`、`default: null`），不能当缺失元数据删掉；
+ * - 这五个键内部出现的任何对象（哪怕含 `type: "str"`、`items`、`required`、`null`）都是客户端声明的字面取值，
+ *   **严禁递归进去按 Schema 改写**。
  */
-function normalizeSchema(s: Msg, mark: () => void): void {
-  for (const k of SCHEMA_NULLABLE_META) {
-    if (k in s && s[k] === null) {
+const SCHEMA_NULLABLE_DATA_KEYS = new Set(['default', 'const', 'example'])
+const SCHEMA_DATA_KEYS = new Set(['default', 'const', 'enum', 'example', 'examples'])
+
+/** 自身键是用户属性名/定义名的纯子 Schema 映射容器（容器键本身绝不当 Schema 关键字处理，`615dc75`）。 */
+const SCHEMA_MAP_CONTAINERS = ['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas'] as const
+
+/** 组合子 Schema 列表关键字（空数组或非数组会被上游拒 11129，`dsh-connect-workbuddy` `#253`）。 */
+const SCHEMA_COMPOSITION_LISTS = ['allOf', 'anyOf', 'oneOf', 'prefixItems'] as const
+
+/** 单子 Schema 关键字（合法值为 boolean schema 或 plain object schema）。 */
+const SCHEMA_SINGLE_SUBSCHEMAS = [
+  'additionalProperties',
+  'additionalItems',
+  'not',
+  'contains',
+  'if',
+  'then',
+  'else',
+  'propertyNames',
+] as const
+
+const SCHEMA_STRING_KEYWORDS = [
+  'title',
+  'description',
+  'pattern',
+  'format',
+  '$comment',
+  'contentMediaType',
+  'contentEncoding',
+  '$id',
+  '$schema',
+  '$anchor',
+  '$dynamicAnchor',
+  '$dynamicRef',
+] as const
+
+const SCHEMA_NUMBER_KEYWORDS = [
+  'minimum',
+  'maximum',
+  'exclusiveMinimum',
+  'exclusiveMaximum',
+  'multipleOf',
+  'minLength',
+  'maxLength',
+  'minItems',
+  'maxItems',
+  'minProperties',
+  'maxProperties',
+  'minContains',
+  'maxContains',
+] as const
+
+const SCHEMA_BOOLEAN_KEYWORDS = ['uniqueItems', 'readOnly', 'writeOnly', 'deprecated'] as const
+
+/**
+ * UTF-16 代理区码元转义 `\uD800`–`\uDFFF`（十六进制大小写不敏感）。
+ *
+ * 依据 `dingminhua/dsh-connect-workbuddy` 提交 `e5d53ef`（issue #274，REA MCP 260 工具实测）：
+ * 上游 schema 解析器拒绝 `pattern` 中出现的 `\uD800`–`\uDFFF` 转义写法（报 400 `code=11129`），
+ * 而边界外的 `\uD7FF` / `\uE000`、真实 emoji 字符，以及 `description` / `title` / `const` /
+ * `enum` / `default` / `format` 中的同款字面量均返回 200。故仅剥离命中的 `pattern` 注解约束。
+ */
+const SURROGATE_ESCAPE_RE = /\\u[dD][89a-fA-F][0-9a-fA-F]{2}/
+
+/** 当 `enum` 存在但缺 `type` 时，仅在所有元素同属单一标量类型时无损推断 `type`（`615dc75`）。 */
+function inferEnumType(values: unknown[]): string {
+  if (values.length === 0) return ''
+  let kind = ''
+  let allInt = true
+  for (const v of values) {
+    if (typeof v === 'string') {
+      if (kind !== '' && kind !== 'string') return ''
+      kind = 'string'
+    } else if (typeof v === 'boolean') {
+      if (kind !== '' && kind !== 'boolean') return ''
+      kind = 'boolean'
+    } else if (typeof v === 'number' && Number.isFinite(v)) {
+      if (kind !== '' && kind !== 'number') return ''
+      kind = 'number'
+      if (!Number.isInteger(v)) allInt = false
+    } else {
+      // 含 null / 对象 / 数组或混合类型时不猜测
+      return ''
+    }
+  }
+  if (kind === 'number') return allInt ? 'integer' : 'number'
+  return kind
+}
+
+/** 将 draft-4 布尔型 `exclusiveMinimum` / `exclusiveMaximum` 安全转换为现代数值型（`dsh-connect-workbuddy` `#253`）。 */
+function normalizeExclusiveBound(
+  s: Msg,
+  exclusiveKey: 'exclusiveMinimum' | 'exclusiveMaximum',
+  boundKey: 'minimum' | 'maximum',
+  mark: () => void,
+): void {
+  const val = s[exclusiveKey]
+  if (val === false) {
+    delete s[exclusiveKey]
+    mark()
+    return
+  }
+  if (val !== true) return
+  const bound = s[boundKey]
+  if (typeof bound === 'number' && Number.isFinite(bound)) {
+    s[exclusiveKey] = bound
+    delete s[boundKey]
+  } else {
+    delete s[exclusiveKey]
+  }
+  mark()
+}
+
+/**
+ * 递归规整单个 JSON Schema 节点（就地修改副本，合规字段零改动以稳定 prompt cache）。
+ *
+ * 覆盖：
+ * - 剔除值为 `null` 的非数据关键字，保留 `const: null` / `default: null` / `example: null`（`d6301fe`）；
+ * - 剥离 `pattern` 中含 `\uD800`–`\uDFFF` 代理区转义的正则（`e5d53ef`），修复 `\_` 非标转义（`615dc75`）；
+ * - draft-4 布尔 `exclusiveMinimum`/`exclusiveMaximum`、外部 `$ref`、重复/字符串 `required`、元关键字类型纠偏；
+ * - 严格区分 Schema 节点、容器键（`properties` / `dependencies` / `dependentRequired` 等）与数据键
+ *   （`default` / `const` / `enum` / `example` / `examples`），绝不篡改用户参数名或数据字面量。
+ */
+function normalizeSchema(s: Msg, mark: () => void, depth = 0): void {
+  if (depth > MAX_SCHEMA_DEPTH) return
+
+  // 1. 剔除值为 null 的非数据关键字（保留 default:null / const:null / example:null）
+  for (const k of Object.keys(s)) {
+    if (s[k] === null && !SCHEMA_NULLABLE_DATA_KEYS.has(k)) {
       delete s[k]
       mark()
     }
   }
 
+  // 2. Draft-4 布尔型开区间边界迁移（必须在数值类型校验前执行）
+  normalizeExclusiveBound(s, 'exclusiveMinimum', 'minimum', mark)
+  normalizeExclusiveBound(s, 'exclusiveMaximum', 'maximum', mark)
+
+  // 3. 剥离无法被上游解析的外部 $ref（保留 #/... 文档内引用）
+  if ('$ref' in s) {
+    const ref = s.$ref
+    if (typeof ref !== 'string' || ref.trim() === '' || !ref.startsWith('#')) {
+      delete s.$ref
+      mark()
+    }
+  }
+
+  // 4. 元 Schema 标量/数组关键字类型纠偏
+  for (const k of SCHEMA_STRING_KEYWORDS) {
+    if (k in s && typeof s[k] !== 'string') {
+      delete s[k]
+      mark()
+    }
+  }
+  for (const k of SCHEMA_NUMBER_KEYWORDS) {
+    if (k in s && (typeof s[k] !== 'number' || !Number.isFinite(s[k] as number))) {
+      delete s[k]
+      mark()
+    }
+  }
+  for (const k of SCHEMA_BOOLEAN_KEYWORDS) {
+    if (k in s && typeof s[k] !== 'boolean') {
+      delete s[k]
+      mark()
+    }
+  }
+  for (const k of ['enum', 'examples'] as const) {
+    if (k in s && !Array.isArray(s[k])) {
+      delete s[k]
+      mark()
+    }
+  }
+
+  // 5. pattern 规整：剥离 \uD800–\uDFFF 代理区转义（e5d53ef），修复 \_（615dc75）
+  if (typeof s.pattern === 'string') {
+    if (SURROGATE_ESCAPE_RE.test(s.pattern)) {
+      delete s.pattern
+      mark()
+    } else if (s.pattern.includes('\\_')) {
+      s.pattern = s.pattern.replaceAll('\\_', '_')
+      mark()
+    }
+  }
+
+  // 6. type 别名归一化、联合类型数组清洗与 enum 缺 type 推断
   if ('type' in s) {
     const typ = s.type
     if (typeof typ === 'string') {
@@ -761,14 +1060,31 @@ function normalizeSchema(s: Msg, mark: () => void): void {
         mark()
       }
     } else if (Array.isArray(typ)) {
-      const list = typ.filter((t) => t !== null && t !== undefined && t !== '').map((t) => {
-        const lower = String(t).toLowerCase()
-        return SCHEMA_TYPE_ALIAS[lower] ?? lower
-      })
-      if (list.length !== typ.length || list.some((t, i) => t !== typ[i])) {
+      const list: string[] = []
+      for (const t of typ) {
+        if (typeof t !== 'string' || t.trim() === '') continue
+        const lower = t.trim().toLowerCase()
+        const mapped = SCHEMA_TYPE_ALIAS[lower] ?? lower
+        if (SCHEMA_VALID_TYPES.has(mapped) && !list.includes(mapped)) {
+          list.push(mapped)
+        }
+      }
+      if (list.length === 0) {
+        delete s.type
+        mark()
+      } else if (list.length !== typ.length || list.some((t, i) => t !== typ[i])) {
         s.type = list
         mark()
       }
+    } else {
+      delete s.type
+      mark()
+    }
+  } else if (!('properties' in s) && Array.isArray(s.enum) && s.enum.length > 0) {
+    const inferred = inferEnumType(s.enum)
+    if (inferred !== '') {
+      s.type = inferred
+      mark()
     }
   }
 
@@ -783,14 +1099,21 @@ function normalizeSchema(s: Msg, mark: () => void): void {
     }
   }
 
+  // 7. required 规整（去空、去非字符串、去重；空数组删除）
   if ('required' in s) {
     const req = s.required
     if (Array.isArray(req)) {
-      const cleaned = req.filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+      const cleaned: string[] = []
+      for (const x of req) {
+        if (typeof x !== 'string') continue
+        const trimmed = x.trim()
+        if (trimmed === '' || cleaned.includes(trimmed)) continue
+        cleaned.push(trimmed)
+      }
       if (cleaned.length === 0) {
         delete s.required
         mark()
-      } else if (cleaned.length !== req.length) {
+      } else if (cleaned.length !== req.length || cleaned.some((x, i) => x !== req[i])) {
         s.required = cleaned
         mark()
       }
@@ -803,41 +1126,177 @@ function normalizeSchema(s: Msg, mark: () => void): void {
     }
   }
 
+  // 8. items 规整（解包 tuple 数组，递归子 Schema）
   if ('items' in s) {
     const items = s.items
     if (Array.isArray(items)) {
       const first = items.find(isObj)
       s.items = first !== undefined ? { ...first } : { type: 'string' }
       mark()
-      if (isObj(s.items)) normalizeSchema(s.items, mark)
+      if (isObj(s.items)) normalizeSchema(s.items, mark, depth + 1)
     } else if (isObj(items)) {
-      normalizeSchema(items, mark)
+      normalizeSchema(items, mark, depth + 1)
+    } else if (typeof items !== 'boolean') {
+      delete s.items
+      mark()
     }
   }
 
-  if (isObj(s.properties)) {
-    for (const v of Object.values(s.properties)) if (isObj(v)) normalizeSchema(v, mark)
+  // 9. 容器级映射：键名是用户属性名/定义名（绝不当 Schema 关键字改写），仅递归其子 Schema
+  for (const key of SCHEMA_MAP_CONTAINERS) {
+    if (!(key in s)) continue
+    const container = s[key]
+    if (!isObj(container)) {
+      if (key === 'properties' && s.type === 'object') s.properties = {}
+      else delete s[key]
+      mark()
+      continue
+    }
+    if (key === 'patternProperties') {
+      let keyFixed = false
+      const rebuilt: Msg = {}
+      for (const [pk, pv] of Object.entries(container)) {
+        let nextKey = pk
+        if (SURROGATE_ESCAPE_RE.test(nextKey)) {
+          keyFixed = true
+          continue
+        }
+        if (nextKey.includes('\\_')) {
+          nextKey = nextKey.replaceAll('\\_', '_')
+          keyFixed = true
+        }
+        rebuilt[nextKey] = pv
+      }
+      if (keyFixed) {
+        s.patternProperties = rebuilt
+        mark()
+      }
+    }
+    const target = s[key] as Msg
+    for (const [propName, child] of Object.entries(target)) {
+      if (child === null) {
+        delete target[propName]
+        mark()
+        continue
+      }
+      if (isObj(child)) {
+        normalizeSchema(child, mark, depth + 1)
+      } else if (typeof child !== 'boolean') {
+        delete target[propName]
+        mark()
+      }
+    }
   }
-  for (const key of ['$defs', 'definitions']) {
-    const defs = s[key]
-    if (isObj(defs)) for (const v of Object.values(defs)) if (isObj(v)) normalizeSchema(v, mark)
+
+  // 10. 依赖容器：dependentRequired 与 draft-4/7 dependencies（键是用户属性名！）
+  if ('dependentRequired' in s) {
+    const dr = s.dependentRequired
+    if (!isObj(dr)) {
+      delete s.dependentRequired
+      mark()
+    } else {
+      for (const [propName, depList] of Object.entries(dr)) {
+        if (!Array.isArray(depList)) {
+          delete dr[propName]
+          mark()
+          continue
+        }
+        const cleaned = depList.filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+        if (cleaned.length !== depList.length) {
+          dr[propName] = cleaned
+          mark()
+        }
+      }
+    }
   }
-  for (const key of ['anyOf', 'oneOf', 'allOf']) {
-    const list = s[key]
-    if (Array.isArray(list)) for (const v of list) if (isObj(v)) normalizeSchema(v, mark)
+
+  if ('dependencies' in s) {
+    const deps = s.dependencies
+    if (!isObj(deps)) {
+      delete s.dependencies
+      mark()
+    } else {
+      for (const [propName, depVal] of Object.entries(deps)) {
+        if (depVal === null) {
+          delete deps[propName]
+          mark()
+        } else if (Array.isArray(depVal)) {
+          const cleaned = depVal.filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+          if (cleaned.length !== depVal.length) {
+            deps[propName] = cleaned
+            mark()
+          }
+        } else if (isObj(depVal)) {
+          normalizeSchema(depVal, mark, depth + 1)
+        } else if (typeof depVal !== 'boolean') {
+          delete deps[propName]
+          mark()
+        }
+      }
+    }
   }
+
+  // 11. 组合子 Schema 列表（allOf / anyOf / oneOf / prefixItems）
+  for (const key of SCHEMA_COMPOSITION_LISTS) {
+    if (!(key in s)) continue
+    const rawList = s[key]
+    if (!Array.isArray(rawList) || rawList.length === 0) {
+      delete s[key]
+      mark()
+      continue
+    }
+    const kept = rawList.filter((v) => isObj(v) || typeof v === 'boolean')
+    if (kept.length === 0) {
+      delete s[key]
+      mark()
+      continue
+    }
+    if (kept.length !== rawList.length) {
+      s[key] = kept
+      mark()
+    }
+    for (const v of kept) {
+      if (isObj(v)) normalizeSchema(v, mark, depth + 1)
+    }
+  }
+
+  // 12. 单子 Schema 关键字（additionalProperties / not / if / then / else / contains / propertyNames）
+  for (const key of SCHEMA_SINGLE_SUBSCHEMAS) {
+    if (!(key in s)) continue
+    const sub = s[key]
+    if (typeof sub === 'boolean') continue
+    if (isObj(sub)) {
+      normalizeSchema(sub, mark, depth + 1)
+    } else {
+      delete s[key]
+      mark()
+    }
+  }
+
+  void SCHEMA_DATA_KEYS
 }
 
-/** 修一个 function 定义的 `parameters`（返回新对象；无改动返回原对象）。 */
-function normalizeFunctionDef(fn: Msg): Msg {
-  const params = fn.parameters
-  if (!isObj(params)) return { ...fn, parameters: { type: 'object', properties: {} } }
+/**
+ * 归一化单个工具顶层 `parameters` JSON Schema（无改动时返回原对象引用）。
+ */
+export function normalizeToolParameters(params: unknown): Msg {
+  if (!isObj(params)) return { type: 'object', properties: {} }
   let changed = false
   const mark = (): void => {
     changed = true
   }
   const p = structuredClone(params) as Msg
-  if (p.type !== 'object') {
+  if (typeof p.type === 'string') {
+    const lower = p.type.trim().toLowerCase()
+    const mapped = SCHEMA_TYPE_ALIAS[lower] ?? lower
+    if (mapped !== 'object') {
+      p.type = 'object'
+      mark()
+    } else if (p.type !== 'object') {
+      p.type = 'object'
+      mark()
+    }
+  } else {
     p.type = 'object'
     mark()
   }
@@ -845,8 +1304,14 @@ function normalizeFunctionDef(fn: Msg): Msg {
     p.properties = {}
     mark()
   }
-  normalizeSchema(p, mark)
-  return changed ? { ...fn, parameters: p } : fn
+  normalizeSchema(p, mark, 0)
+  return changed ? p : params
+}
+
+/** 修一个 function 定义的 `parameters`（返回新对象；无改动返回原对象）。 */
+function normalizeFunctionDef(fn: Msg): Msg {
+  const nextParams = normalizeToolParameters(fn.parameters)
+  return nextParams === fn.parameters ? fn : { ...fn, parameters: nextParams }
 }
 
 /**

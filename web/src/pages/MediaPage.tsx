@@ -1,5 +1,6 @@
 import {
   AlertTriangle,
+  Box,
   Download,
   ExternalLink,
   Film,
@@ -15,26 +16,34 @@ import { PageHeader } from '@/components/layout/PageHeader'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
-import { Input, Textarea } from '@/components/ui/input'
+import { Input, Switch, Textarea } from '@/components/ui/input'
 import { Empty, Segmented } from '@/components/ui/misc'
 import {
+  checkThreeDTask,
   checkVideoTask,
   fileToDataUrl,
   mediaProxyUrl,
   useEditImage,
   useGenerateImage,
+  useSubmitThreeD,
   useSubmitVideo,
   useWebFetch,
   useWebSearch,
+  type ThreeDTask,
   type VideoTask,
 } from '@/lib/queries'
 import { toast } from 'sonner'
 
-type Tab = 'image' | 'video' | 'search' | 'fetch'
+type Tab = 'image' | 'video' | '3d' | 'search' | 'fetch'
 
 const SIZES = ['1024x1024', '1024x768', '768x1024'] as const
 const ASPECTS = ['16:9', '9:16', '1:1'] as const
 const SECONDS = [4, 5, 8, 10] as const
+const THREE_D_MODELS = [
+  { value: '3.1', label: '混元 3D 3.1' },
+  { value: '3.0', label: '混元 3D 3.0' },
+] as const
+const THREE_D_FORMATS = ['GLB', 'OBJ', 'FBX', 'STL', 'USDZ'] as const
 
 /**
  * 生图可选模型。
@@ -66,7 +75,7 @@ export function MediaPage() {
     <>
       <PageHeader
         title="媒体与检索"
-        description="生成图片、生成视频、联网搜索、抓取网页正文。这些能力由 WorkBuddy 国际版账号提供。"
+        description="生成图片、生成视频、生成混元 3D 模型、联网搜索、抓取网页正文。"
         actions={
           <Segmented
             value={tab}
@@ -74,6 +83,7 @@ export function MediaPage() {
             options={[
               { value: 'image', label: '生图' },
               { value: 'video', label: '视频' },
+              { value: '3d', label: '3D 生成' },
               { value: 'search', label: '联网检索' },
               { value: 'fetch', label: '抓网页' },
             ]}
@@ -82,16 +92,22 @@ export function MediaPage() {
       />
 
       <div className="border-primary/25 bg-primary/[0.05] mb-4 flex items-start gap-2.5 rounded-lg border px-4 py-3 text-[13px] leading-relaxed">
-        <AlertTriangle className="text-primary mt-0.5 size-4 shrink-0" />
-        <span>
-          这四项能力<b>只有国际版账号</b>可用（国内账号实测返回 401，是腾讯网关层直接拒的）。
-          没有国际版账号时请先到「供应商与账号」登录一个，否则会提示
-          <code className="bg-black/[0.06] dark:bg-white/[0.08] mx-1 rounded px-1 py-0.5 font-mono text-[11.5px]">unsupported_realm</code>。
-        </span>
+        <AlertTriangle className="text-primary mt-0.5 size-4 shrink-0" strokeWidth={1.75} />
+        <div className="min-w-0 space-y-1">
+          <span>
+            这四项能力<b>只有国际版账号</b>可用（国内账号实测返回 401，是腾讯网关层直接拒的）。
+            没有国际版账号时请先到「供应商与账号」登录一个，否则会提示
+            <code className="bg-black/[0.06] dark:bg-white/[0.08] mx-1 rounded px-1 py-0.5 font-mono text-[11.5px]">unsupported_realm</code>。
+          </span>
+          <span className="text-muted-foreground block text-xs">
+            混元 3D 生成、联网检索与抓网页还额外支持国内版 OAuth 账号自动容灾选号。
+          </span>
+        </div>
       </div>
 
       {tab === 'image' && <ImageTab />}
       {tab === 'video' && <VideoTab />}
+      {tab === '3d' && <ThreeDTab />}
       {tab === 'search' && <SearchTab />}
       {tab === 'fetch' && <FetchTab />}
     </>
@@ -195,20 +211,22 @@ function ImagePicker({
   onChange,
   label,
   hint,
+  maxBytes = 8 * 1024 * 1024,
 }: {
   value: string
   onChange: (v: string) => void
   label: string
   hint: string
+  maxBytes?: number
 }) {
   const ref = useRef<HTMLInputElement>(null)
   const [reading, setReading] = useState(false)
 
   const pick = async (file: File | undefined) => {
     if (file === undefined) return
-    // ⚠️ 限制 8MB：data URL 会膨胀 ~33%，太大既慢又可能超上游上限
-    if (file.size > 8 * 1024 * 1024) {
-      toast.error('图片太大', { description: '请选 8MB 以内的图片' })
+    if (file.size > maxBytes) {
+      const mb = Math.round(maxBytes / (1024 * 1024))
+      toast.error('图片太大', { description: `请选 ${mb}MB 以内的图片` })
       return
     }
     setReading(true)
@@ -367,10 +385,13 @@ function ImageTab() {
                 </div>
               ))}
             </div>
-            <div className="text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+            <div className="text-muted-foreground flex flex-wrap items-center gap-x-4 gap-y-1 text-xs tabular-nums">
               <span>共 {data.data.length} 张</span>
               {data.usage?.credit !== undefined && <span>消耗 {data.usage.credit} 积分</span>}
-              <span className="text-warning">⚠️ 直链约 24 小时后失效，需要请立即下载</span>
+              <span className="text-warning inline-flex items-center gap-1">
+                <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.75} />
+                直链约 24 小时后失效，需要请立即下载
+              </span>
             </div>
           </div>
         )}
@@ -420,13 +441,19 @@ function VideoTab() {
   const run = async () => {
     if (prompt.trim() === '') return
     setTask(null)
-    const r = await submit.mutateAsync({
-      prompt: prompt.trim(),
-      seconds,
-      aspect_ratio: aspect,
-      ...(model === '' ? {} : { model }),
-      ...(source === '' ? {} : { image: source }),
-    })
+    let r: VideoTask
+    try {
+      r = await submit.mutateAsync({
+        prompt: prompt.trim(),
+        seconds,
+        aspect_ratio: aspect,
+        ...(model === '' ? {} : { model }),
+        ...(source === '' ? {} : { image: source }),
+      })
+    } catch {
+      // 错误提示已由 useAction.onError 弹出 Toast，此处捕获避免触发浏览器 unhandledrejection
+      return
+    }
     toast.success('已提交，正在生成', { description: '通常 60–120 秒' })
     poll(r.id)
   }
@@ -471,8 +498,11 @@ function VideoTab() {
             </Button>
           </div>
         </div>
-        <div className="text-muted-foreground mt-2 text-xs">
-          ⚠️ 成功出片约 <b>29 积分</b>；涉政 / 真实领导人 / 敏感事件等题材会被上游风控拒绝（会明确报原因），<b>失败不扣积分</b>。普通题材（动物、静物、风景）不受影响。
+        <div className="text-muted-foreground mt-2 flex items-start gap-1.5 text-xs leading-relaxed">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.75} />
+          <span>
+            成功出片约 <b className="tabular-nums">29 积分</b>；涉政 / 真实领导人 / 敏感事件等题材会被上游风控拒绝（会明确报原因），<b>失败不扣积分</b>。普通题材（动物、静物、风景）不受影响。
+          </span>
         </div>
       </div>
 
@@ -517,6 +547,244 @@ function VideoTab() {
             {polling && (
               <div className="text-muted-foreground flex items-center gap-2 text-[13px]">
                 <Loader2 className="size-4 animate-spin" /> 正在生成，页面会自动刷新状态…
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </Card>
+  )
+}
+
+function ThreeDTab() {
+  const submit = useSubmitThreeD()
+  const [mode, setMode] = useState<'text' | 'image'>('text')
+  const [prompt, setPrompt] = useState('')
+  const [source, setSource] = useState('')
+  const [model, setModel] = useState<string>('3.1')
+  const [format, setFormat] = useState<string>('GLB')
+  const [enablePbr, setEnablePbr] = useState(true)
+  const [task, setTask] = useState<ThreeDTask | null>(null)
+  const [polling, setPolling] = useState(false)
+  const timer = useRef<number | null>(null)
+
+  useEffect(() => {
+    return () => {
+      if (timer.current !== null) window.clearTimeout(timer.current)
+    }
+  }, [])
+
+  const isDoneStatus = (s: string) => s === 'DONE' || s === 'FAIL'
+
+  const poll = (jobId: string) => {
+    if (timer.current !== null) window.clearTimeout(timer.current)
+    setPolling(true)
+    const tick = async () => {
+      try {
+        const t = await checkThreeDTask(jobId)
+        setTask(t)
+        if (isDoneStatus(t.status)) {
+          setPolling(false)
+          if (t.status === 'DONE') toast.success('3D 模型生成完成')
+          else toast.error('3D 生成失败', { description: t.error?.message ?? '上游未给原因' })
+          return
+        }
+      } catch {
+        // 单次轮询抖动不终止，继续等待下一轮
+      }
+      timer.current = window.setTimeout(() => void tick(), 6000)
+    }
+    void tick()
+  }
+
+  const canSubmit = mode === 'text' ? prompt.trim() !== '' : source !== ''
+
+  const run = async () => {
+    if (!canSubmit) return
+    if (timer.current !== null) window.clearTimeout(timer.current)
+    setTask(null)
+    const payload =
+      mode === 'text'
+        ? {
+            prompt: prompt.trim(),
+            model,
+            result_format: format,
+            enable_pbr: enablePbr,
+          }
+        : {
+            image_base64: source,
+            model,
+            result_format: format,
+            enable_pbr: enablePbr,
+          }
+    let submitted: ThreeDTask
+    try {
+      submitted = await submit.mutateAsync(payload)
+    } catch {
+      // 错误提示已由 useAction.onError 弹出 Toast，此处捕获避免触发浏览器 unhandledrejection
+      return
+    }
+    setTask(submitted)
+    const jobId = submitted.job_id || submitted.id
+    if (isDoneStatus(submitted.status) || !jobId) {
+      setPolling(false)
+      if (submitted.status === 'DONE') toast.success('3D 模型生成完成')
+      else if (submitted.status === 'FAIL') toast.error('3D 生成失败', { description: submitted.error?.message ?? '上游未给原因' })
+      return
+    }
+    toast.success('3D 任务已提交', { description: '通常 1–3 分钟完成建模与贴图' })
+    poll(jobId)
+  }
+
+  const statusTone = (s: string) =>
+    s === 'DONE' ? 'success' : s === 'FAIL' ? 'danger' : 'warning'
+
+  const files =
+    task?.result_files && task.result_files.length > 0
+      ? task.result_files.filter((f) => typeof f.Url === 'string' && f.Url !== '')
+      : task?.result_url
+        ? [{ Type: format, Url: task.result_url }]
+        : []
+
+  return (
+    <Card className="overflow-hidden">
+      <div className="border-b px-5 py-4">
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <Box className="text-muted-foreground size-4 shrink-0" strokeWidth={1.75} />
+          <Segmented
+            value={mode}
+            onChange={(v) => setMode(v as 'text' | 'image')}
+            options={[
+              { value: 'text', label: '文生 3D' },
+              { value: 'image', label: '图生 3D' },
+            ]}
+          />
+          <div className="ml-auto flex items-center gap-2">
+            <span className="text-muted-foreground text-xs">PBR 材质</span>
+            <Switch label="PBR 材质贴图" checked={enablePbr} onCheckedChange={setEnablePbr} />
+          </div>
+        </div>
+
+        {mode === 'text' ? (
+          <Textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            rows={3}
+            placeholder="例如：一把带有金属铆钉与木质纹理的复古蒸汽朋克单手剑，精细PBR材质"
+            className="resize-none text-[13.5px]"
+          />
+        ) : (
+          <div className="max-w-sm">
+            <ImagePicker
+              value={source}
+              onChange={setSource}
+              maxBytes={6 * 1024 * 1024}
+              label="主体参考图（必填，≤6MB）"
+              hint="建议选择背景干净、主体完整的单物体图片，本地读取为 base64 直传"
+            />
+          </div>
+        )}
+
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="text-muted-foreground text-xs">格式</span>
+          <Segmented
+            value={format}
+            onChange={setFormat}
+            options={THREE_D_FORMATS.map((f) => ({ value: f, label: f }))}
+          />
+          <span className="text-muted-foreground ml-1 text-xs">版本</span>
+          <Segmented
+            value={model}
+            onChange={setModel}
+            options={THREE_D_MODELS.map((m) => ({ value: m.value, label: m.label }))}
+          />
+          <div className="ml-auto flex items-center gap-2">
+            {polling && <Badge tone="warning">建模中，约 1–3 分钟</Badge>}
+            <Button onClick={() => void run()} disabled={submit.isPending || polling || !canSubmit}>
+              {submit.isPending ? <Loader2 className="animate-spin" /> : <Box strokeWidth={1.75} />}
+              生成 3D 模型
+            </Button>
+          </div>
+        </div>
+        <div className="text-muted-foreground mt-2 flex items-start gap-1.5 text-xs leading-relaxed">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.75} />
+          <span>
+            混元 3D Pro 自动签发临时云凭证并绑定原提交账号轮询（需 OAuth 登录账号，静态 <code className="font-mono">ck_</code> 密钥不支持签发）。
+          </span>
+        </div>
+      </div>
+
+      <div className="p-5">
+        {!task && !polling && (
+          <Empty icon={<Box strokeWidth={1.75} />} title="还没有 3D 生成记录">
+            <span className="block">支持导出 GLB、OBJ、FBX、STL、USDZ 五种网格格式，提交后自动轮询进度。</span>
+          </Empty>
+        )}
+        {task && (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2 tabular-nums">
+              <Badge tone={statusTone(task.status)}>{task.status}</Badge>
+              {task.model && <span className="text-muted-foreground text-xs">模型 {task.model}</span>}
+              {task.usage?.credit !== undefined && (
+                <span className="text-muted-foreground text-xs">消耗 {task.usage.credit} 积分</span>
+              )}
+              <code
+                className="text-muted-foreground ml-auto max-w-[220px] truncate font-mono text-[11px]"
+                title={task.job_id || task.id}
+              >
+                {task.job_id || task.id}
+              </code>
+            </div>
+
+            {task.status === 'FAIL' && (
+              <div className="border-destructive/30 bg-destructive/5 rounded-lg border px-4 py-3 text-[13px] break-words">
+                <div className="mb-1 font-medium">3D 生成失败</div>
+                <div className="text-muted-foreground">{task.error?.message ?? '上游未返回详细原因'}</div>
+              </div>
+            )}
+
+            {task.status === 'DONE' && files.length > 0 && (
+              <div className="grid gap-3 sm:grid-cols-2">
+                {files.map((file, idx) => {
+                  const ext = (file.Type || format || 'glb').toLowerCase()
+                  const fileUrl = file.Url ?? ''
+                  return (
+                    <div key={`${fileUrl}-${idx}`} className="min-w-0 rounded-xl border p-3.5">
+                      {file.PreviewImageUrl && (
+                        <div className="bg-muted/30 mb-3 overflow-hidden rounded-lg">
+                          <img
+                            src={mediaProxyUrl(file.PreviewImageUrl)}
+                            alt={`3D 预览 ${idx + 1}`}
+                            className="aspect-video w-full object-contain"
+                            loading="lazy"
+                          />
+                        </div>
+                      )}
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <Box className="text-muted-foreground size-4 shrink-0" strokeWidth={1.75} />
+                          <span className="text-[13px] font-medium uppercase">{ext} 模型文件</span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <MediaActions url={fileUrl} filename={`hunyuan3d-${Date.now()}-${idx + 1}.${ext}`} />
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
+            {task.status === 'DONE' && (
+              <div className="text-warning flex items-center gap-1.5 text-xs">
+                <AlertTriangle className="size-3.5 shrink-0" strokeWidth={1.75} />
+                <span>3D 产物为腾讯云 COS 签名直链（约 24 小时有效），请及时下载保存</span>
+              </div>
+            )}
+
+            {polling && (
+              <div className="text-muted-foreground flex items-center gap-2 text-[13px]">
+                <Loader2 className="size-4 animate-spin" /> 正在构建三维网格与材质贴图，页面会自动刷新状态…
               </div>
             )}
           </div>

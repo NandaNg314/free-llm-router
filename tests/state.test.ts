@@ -793,3 +793,136 @@ test('🔴 normalizeAccountState 必须携带**每一个**字段（生成式，�
     '⚠️ createAccountState 的默认 provider 也必须与 normalize 一致',
   )
 })
+
+test('isPaid 可选字段：未观测保持省略，布尔值原样保留，脏类型自动忽略', async () => {
+  const { createAccountState, normalizeAccountState } = await import('../src/pool/state.js')
+
+  const unknownState = createAccountState({ uid: 'u-unk', nickname: 'n', realm: 'cn' })
+  assert.equal('isPaid' in unknownState, false)
+  assert.equal(unknownState.isPaid, undefined)
+
+  const paidState = normalizeAccountState({ uid: 'u-paid', isPaid: true })
+  assert.equal(paidState?.isPaid, true)
+
+  const freeState = normalizeAccountState({ uid: 'u-free', isPaid: false })
+  assert.equal(freeState?.isPaid, false)
+
+  const dirtyState = normalizeAccountState({ uid: 'u-dirty', isPaid: 'yes' })
+  assert.equal(dirtyState !== undefined && 'isPaid' in dirtyState, false)
+  assert.equal(dirtyState?.isPaid, undefined)
+})
+
+test('Pro 专属模型事前过滤：严格遵守三条安全不变式', async () => {
+  const {
+    extractExclusiveModelIds,
+    extractPaidStatusFromSummary,
+    filterCandidatesByPaidTier,
+    isExclusiveProModel,
+  } = await import('../src/pool/state.js')
+
+  // 冷启动兜底与动态同步切换
+  assert.equal(isExclusiveProModel('primary-model'), true)
+  assert.equal(isExclusiveProModel('buddy/primary-model'), true)
+  assert.equal(isExclusiveProModel('expiring/buddy/primary-model'), true)
+  assert.equal(isExclusiveProModel('deepseek-v4.1-flash'), false)
+
+  const dynamic = extractExclusiveModelIds({
+    data: [
+      { id: 'claude-sonnet-4-5', accessMode: 'exclusive' },
+      { id: 'deepseek-v4.1-flash', accessMode: 'public' },
+    ],
+  })
+  assert.deepEqual(dynamic, ['claude-sonnet-4-5'])
+  assert.equal(isExclusiveProModel('claude-sonnet-4-5', dynamic), true)
+  assert.equal(isExclusiveProModel('primary-model', dynamic), false)
+
+  assert.equal(extractPaidStatusFromSummary({ data: { isPaidUser: true } }), true)
+  assert.equal(extractPaidStatusFromSummary({ data: { userType: 'free' } }), false)
+  assert.equal(extractPaidStatusFromSummary({ credits: 100 }), undefined)
+
+  // 不变式 ①：isPaid === undefined 一律放行
+  const mixed = [
+    { uid: 'free-1', isPaid: false as boolean | undefined },
+    { uid: 'unknown-1', isPaid: undefined as boolean | undefined },
+    { uid: 'paid-1', isPaid: true as boolean | undefined },
+  ]
+  const res1 = filterCandidatesByPaidTier(mixed, { requiresPaid: true })
+  assert.deepEqual(
+    res1.pool.map((x) => x.uid),
+    ['unknown-1', 'paid-1'],
+  )
+  assert.equal(res1.skippedFree, 1)
+  assert.equal(res1.fellBackToFree, false)
+
+  // 不变式 ②：全部候选都是 isPaid === false 时兜底放行，绝不滤空
+  const allFree = [
+    { uid: 'free-a', isPaid: false },
+    { uid: 'free-b', isPaid: false },
+  ]
+  const res2 = filterCandidatesByPaidTier(allFree, { requiresPaid: true })
+  assert.deepEqual(
+    res2.pool.map((x) => x.uid),
+    ['free-a', 'free-b'],
+  )
+  assert.equal(res2.fellBackToFree, true)
+
+  // 不变式 ③：既有会话粘性绑定（preferredUid）绝不硬拦
+  const res3 = filterCandidatesByPaidTier(mixed, { requiresPaid: true, preferredUid: 'free-1' })
+  assert.ok(res3.pool.some((x) => x.uid === 'free-1'))
+})
+
+test('11140 波次闸门：随池规模动态缩放阈值 + 指数退避 + 30 分钟平静期清零', async () => {
+  const {
+    RESTRICTION_CALM_RESET_MS,
+    RESTRICTION_HOLD_BASE_MS,
+    RESTRICTION_HOLD_MAX_MS,
+    normalizeRestrictionGate,
+    restrictionThreshold,
+    stepRestrictionGate,
+  } = await import('../src/pool/state.js')
+
+  assert.equal(restrictionThreshold(0), 2)
+  assert.equal(restrictionThreshold(8), 2)
+  assert.equal(restrictionThreshold(25), 2)
+  assert.equal(restrictionThreshold(30), 3)
+  assert.equal(restrictionThreshold(340), 34)
+
+  const t0 = 1_700_000_000_000
+  let gate = normalizeRestrictionGate(undefined, t0)
+
+  // 340 号大池：2 个偶发 11140 绝不能整池封停
+  const big1 = stepRestrictionGate(gate, 'u1', t0, 340)
+  assert.equal(big1.active, false)
+  const big2 = stepRestrictionGate(big1.next, 'u2', t0 + 1_000, 340)
+  assert.equal(big2.active, false)
+  assert.equal(big2.threshold, 34)
+
+  // 小池（5 号，阈值 2）：第 1 波暂停 30s，连续第 2 波退避 60s
+  const s1 = stepRestrictionGate(gate, 'a1', t0, 5)
+  assert.equal(s1.active, false)
+  const s2 = stepRestrictionGate(s1.next, 'a2', t0 + 1_000, 5)
+  assert.equal(s2.active, true)
+  assert.equal(s2.justTriggered, true)
+  assert.equal(s2.holdMs, RESTRICTION_HOLD_BASE_MS)
+  assert.equal(s2.next.streak, 1)
+
+  const afterWave1 = s2.next.until + 1_000
+  const s3 = stepRestrictionGate(s2.next, 'a3', afterWave1, 5)
+  const s4 = stepRestrictionGate(s3.next, 'a4', afterWave1 + 500, 5)
+  assert.equal(s4.justTriggered, true)
+  assert.equal(s4.holdMs, RESTRICTION_HOLD_BASE_MS * 2)
+  assert.equal(s4.next.streak, 2)
+  assert.ok(s4.holdMs <= RESTRICTION_HOLD_MAX_MS)
+
+  // 平静期满 30 分钟后：streak 必须清零，再次触发回到首档 30s
+  const afterCalm = s4.next.lastTriggeredAt + RESTRICTION_CALM_RESET_MS
+  const calmed = normalizeRestrictionGate(s4.next, afterCalm)
+  assert.equal(calmed.streak, 0)
+  assert.deepEqual(calmed.hits, {})
+
+  const fresh1 = stepRestrictionGate(s4.next, 'b1', afterCalm, 5)
+  const fresh2 = stepRestrictionGate(fresh1.next, 'b2', afterCalm + 200, 5)
+  assert.equal(fresh2.justTriggered, true)
+  assert.equal(fresh2.next.streak, 1)
+  assert.equal(fresh2.holdMs, RESTRICTION_HOLD_BASE_MS)
+})

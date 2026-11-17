@@ -64,7 +64,8 @@ writeFileSync(join(OUT, 'README.txt'), `free-llm-router 本地版 v${version}
 
 这是什么
 --------
-把你自己的 WorkBuddy / CodeBuddy 账号，变成一个 OpenAI 兼容的 API 网关，
+把你自己的 WorkBuddy / CodeBuddy 等 16 家供应商账号，变成统一的
+OpenAI + Anthropic（Claude Code /v1/messages）兼容 API 网关，
 附带一个网页控制台。所有数据都留在**你自己的电脑上**，不上传任何地方。
 
 
@@ -129,18 +130,19 @@ writeFileSync(join(OUT, 'README.txt'), `free-llm-router 本地版 v${version}
 
 第一次进来先做什么
 ------------------
-1. 「供应商与账号」→ 添加账号（支持设备码登录 / 扫码 / 粘贴凭据）
+1. 「供应商与账号」→ 添加账号（支持 16 家供应商：设备码登录 / 扫码 / 粘贴凭据或 API Key）
 2. 「模型」→ 看看有哪些模型可用
-3. 「API Key」→ 给客户端签发一把钥匙
-4. 「配置」→ 里面有接入指南（Claude Code / OpenAI SDK / Cherry Studio 等）
+3. 「API Key」→ 给客户端签发一把钥匙（同时支持 Bearer 与 x-api-key）
+4. 「配置」→ 里面有接入指南（Claude Code 原生 /v1/messages、OpenAI SDK、Cherry Studio、MCP 等）
 
 
-怎么用生图和视频
-----------------
-「媒体与检索」页可以直接点按钮生成图片、生成视频、联网搜索、抓网页。
+怎么用生图、视频与 3D 生成
+--------------------------
+「媒体与检索」页可以直接点按钮生成图片、生成视频、生成混元 3D 模型、联网搜索、抓网页。
 
-注意：这几项能力**只有 WorkBuddy 国际版账号**支持，国内账号会提示
-unsupported_realm。
+注意：生图与视频**只有 WorkBuddy 国际版账号**支持（国内账号会提示
+unsupported_realm）；混元 3D 生成、联网检索与抓网页支持 WorkBuddy 国际版
+与国内版 OAuth 账号。
 
 
 【生图】
@@ -160,6 +162,12 @@ unsupported_realm。
      上游会直接拒绝（提示 "Failure to pass the risk control system"），
      不过**不会扣积分**（失败的任务不计费）。
      普通题材（动物、静物、风景、产品）都不受影响。
+
+
+【3D 生成】
+  支持「文生 3D」（输入描述）或「图生 3D」（选一张参考图），可选混元 3D 3.1 / 3.0
+  与 GLB / OBJ / FBX / STL / USDZ 五种导出格式（可开启 PBR 材质）。
+  提交后自动轮询进度，生成完成后可直接下载模型文件。
 
 
 【联网检索 / 抓网页】

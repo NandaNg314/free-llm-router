@@ -1,5 +1,5 @@
 /**
- * 国际服 chat 头（任务 4.2）：**桌面端 5.8.4 身份 + 会话头族**。
+ * 国际服 chat 头（任务 4.2）：**桌面端 5.9.4 身份 + 会话头族 + 零 X-Client-* 泄漏**。
  *
  * ## 为什么这几条断言重要
  *
@@ -8,9 +8,9 @@
  * 「安全策略拦截」（用户以为是封号）。故必须用单测把形状钉死：
  *
  * 1. 5 个会话头一个都不能少，且两两对应关系不能反；
- * 2. UA / `X-IDE-Version` 必须同版本（同一请求两个版本号就是露馅点）；
+ * 2. UA / `X-IDE-Version` 必须同版本（5.9.4 + CLI/2.165.0，绝不混入国内 5.11.3 / CLI/2.176.0）；
  * 3. 会话 ID 必须**可粘**（传了就用传的），且不传时**每次不同**（不能是常量）；
- * 4. **国内服一个字符都不能被污染**（实测国内口径仍 200）。
+ * 4. 国际服绝不携带国内 5.11.3 新增的 `X-Client-*` 三头，国内服不被国际服会话头污染。
  */
 
 import assert from 'node:assert/strict'
@@ -73,19 +73,24 @@ test('🔴 国际服必须带齐 5 个会话头，且两两对应关系正确', 
   assert.match(h['X-Conversation-Message-ID'] ?? '', HEX32, '消息级 ID 必须是 32 位 hex')
 })
 
-test('🔴 国际服身份必须是桌面端 5.8.4，且 UA 中段是**小写** workbuddy-ai', () => {
+test('🔴 国际服身份必须是桌面端 5.9.4 + CLI/2.165.0，且 UA 中段是**小写** workbuddy-ai、无 X-Client-* 三头', () => {
   const h = intl()
-  assert.equal(h['X-IDE-Version'], '5.8.4', 'X-IDE-Version 必须是 5.8.4')
+  assert.equal(h['X-IDE-Version'], '5.9.4', 'X-IDE-Version 必须是 5.9.4')
   assert.equal(h['X-IDE-Version'], INTL_DESKTOP_VERSION, '实现常量与断言口径必须一致')
   assert.equal(
     h['User-Agent'],
-    'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0',
-    'UA 必须逐字对齐抓包（含小写 workbuddy-ai 与 CLI/2.161.0）',
+    'WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0',
+    'UA 必须逐字对齐国际分发包 5.9.4（含小写 workbuddy-ai 与 CLI/2.165.0）',
   )
-  assert.ok(h['User-Agent']?.includes('workbuddy-ai/5.8.4'), '中段必须是小写 workbuddy-ai')
+  assert.ok(h['User-Agent']?.includes('workbuddy-ai/5.9.4'), '中段必须是小写 workbuddy-ai')
+  assert.ok(!h['User-Agent']?.includes('2.176.0'), '国际服不得混入国内包的 CLI/2.176.0')
   // ⚠️ 旧的 `WorkBuddy AI`（带空格大写）已失效，任何残留都说明有人把旧值改回来了
   assert.ok(!h['User-Agent']?.includes('WorkBuddy AI'), '不得残留旧的大写中段')
   assert.equal(h['User-Agent'], INTL_DESKTOP_UA)
+  // ⚠️ 国内 5.11.3 的 X-Client-* 三头绝不能泄漏到国际服
+  for (const name of ['X-Client-Version', 'X-Client-Platform', 'X-Client-Product']) {
+    assert.ok(!(name in h), `国际服不得携带国内专属头：${name}`)
+  }
 
   // 同一请求里 UA 的版本必须与 X-IDE-Version 自洽（两个版本号就是露馅点）
   const versions = (h['User-Agent'] ?? '').match(/\d+\.\d+\.\d+/g) ?? []

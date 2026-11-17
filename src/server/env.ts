@@ -139,6 +139,14 @@ export function createNodeRuntime(databasePath?: string): NodeRuntimeContext {
     RATE_LIMIT_QPS: process.env.RATE_LIMIT_QPS?.trim(),
     RATE_JITTER_MS: process.env.RATE_JITTER_MS?.trim(),
     WORKBUDDY_DAILY_CHAT_MODEL: process.env.WORKBUDDY_DAILY_CHAT_MODEL?.trim(),
+    CORS_ORIGINS: process.env.CORS_ORIGINS?.trim(),
+    AUTO_CONTINUATION: process.env.AUTO_CONTINUATION?.trim(),
+    THREE_D_AUTO_TOKEN: process.env.THREE_D_AUTO_TOKEN?.trim(),
+    THREE_D_TEMP_TOKEN: process.env.THREE_D_TEMP_TOKEN?.trim(),
+    THREE_D_TEMP_TOKENS: process.env.THREE_D_TEMP_TOKENS?.trim(),
+    THREE_D_STS_SECRET_ID: process.env.THREE_D_STS_SECRET_ID?.trim(),
+    THREE_D_STS_SECRET_KEY: process.env.THREE_D_STS_SECRET_KEY?.trim(),
+    THREE_D_STS_TOKEN: process.env.THREE_D_STS_TOKEN?.trim(),
   }
 
   const accountPoolNamespace = new NodeDurableObjectNamespace<AccountPoolDO>(

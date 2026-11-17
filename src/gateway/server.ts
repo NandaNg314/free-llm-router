@@ -25,14 +25,23 @@
  */
 
 import type { UsageRecord } from '../store/usage.js'
-import { resolveUpstream, type Env } from '../env.js'
-import { settleSubkeyUsage } from './authz.js'
+import { resolveAutoContinuation, resolveUpstream, type Env } from '../env.js'
+import { settleSubkeyUsage, subkeyOf } from './authz.js'
 // ⚠️ 判据本体已迁到 `upstream/client.ts`（与 `shouldRotate`/`shouldPunish` 同源，
 // 避免两份实现再次漂移）。这里再导出，保持既有引用路径可用。
 export { mapErrorToPunishment }
-import { classify, mapErrorToPunishment, type ErrorKind } from '../upstream/client.js'
+import {
+  classify,
+  isUpstreamQueueBusy,
+  mapErrorToPunishment,
+  parseQueueRetryAfterSec,
+  upstreamBusyHint,
+  type ErrorKind,
+} from '../upstream/client.js'
 import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
+import { deriveStickySessionKey, extractCallerScope, isGenericCallerUser } from '../providers/conversation.js'
+import { wrapContinuationStream } from './continuation.js'
 import { cleanupToolPairing, prepareChatBody, requestHasImage, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
 import { BodyTooLargeError, readJsonCapped } from './body.js'
 import { resolveSafetyFor, safetyConfigFor } from './safety.js'
@@ -61,8 +70,45 @@ import {
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
 import type { LoginCredential } from '../upstream/auth.js'
 import type { AccountPoolDO, PickResult } from '../pool/AccountPoolDO.js'
-import { healthyForModel } from '../pool/state.js'
+import { healthyForModel, isExclusiveProModel } from '../pool/state.js'
 import type { SafetyOverride } from '../pool/state.js'
+
+/** 单测直注覆盖开关（生产路径以 `AccountPoolDO` 的 `RoutingConfig.autoContinuation` 持久化为准，未设置时回落 `env.AUTO_CONTINUATION`）。 */
+let runtimeAutoContinuationOverride: boolean | undefined
+let autoContinuationCache: { poolNs: unknown; at: number; override: boolean | undefined } | undefined
+const AUTO_CONTINUATION_TTL_MS = 10_000
+
+export function resetAutoContinuationCache(): void {
+  autoContinuationCache = undefined
+}
+
+export function setAutoContinuationOverride(enabled: boolean | undefined): void {
+  runtimeAutoContinuationOverride = enabled
+  autoContinuationCache = undefined
+}
+
+export async function isAutoContinuationEnabled(env: Env, now = Date.now()): Promise<boolean> {
+  if (runtimeAutoContinuationOverride !== undefined) return runtimeAutoContinuationOverride
+  if (
+    autoContinuationCache !== undefined &&
+    autoContinuationCache.poolNs === env.ACCOUNT_POOL &&
+    now - autoContinuationCache.at < AUTO_CONTINUATION_TTL_MS
+  ) {
+    return autoContinuationCache.override ?? resolveAutoContinuation(env)
+  }
+  if (env.ACCOUNT_POOL !== undefined) {
+    try {
+      const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+      const cfg = await cnPool.getRoutingConfig()
+      const override = typeof cfg?.autoContinuation === 'boolean' ? cfg.autoContinuation : undefined
+      autoContinuationCache = { poolNs: env.ACCOUNT_POOL, at: now, override }
+      return override ?? resolveAutoContinuation(env)
+    } catch {
+      // DO 读取异常时安全回落环境变量
+    }
+  }
+  return resolveAutoContinuation(env)
+}
 
 /**
  * 账号池后台写入（处罚 / 记账 / 粘性绑定）的错误处理：不打断主流程，但**必须留日志**。
@@ -127,9 +173,10 @@ export const MAX_ROTATE = 3
 let maxRotateCache: { value: number; at: number } | undefined
 const MAX_ROTATE_TTL_MS = 30_000
 
-/** 保存路由配置后调用：本进程立即生效（Workers 其余 isolate 最多 30 秒后生效）。 */
+/** 保存路由配置后调用：本进程立即生效（Workers 其余 isolate 最多 10-30 秒后生效）。 */
 export function resetMaxRotateCache(): void {
   maxRotateCache = undefined
+  autoContinuationCache = undefined
 }
 
 /**
@@ -443,7 +490,8 @@ export function refineModelScoped(
   bodyText: string,
 ): { dimension: 'soft' | 'model'; code: number | undefined; resetAt: number | undefined } {
   const code = parseBusinessCode(bodyText)
-  const resetAt = parseResetAt(bodyText)
+  const queueSec = parseQueueRetryAfterSec(bodyText)
+  const resetAt = parseResetAt(bodyText) ?? (queueSec === undefined ? undefined : Date.now() + queueSec * 1000)
   if (kind !== 'rate_limited') return { dimension: 'soft', code, resetAt }
   /**
    * ⚠️ 字符串形态的业务码（`{"code":"11-128"}`）解析不出数字，
@@ -619,32 +667,40 @@ interface Candidate {
  * 但真正的 CPU 杀手是**每帧**的净化（见 `stream.ts`），不是这个
  * 每请求只跑一次的函数。
  */
-async function deriveSessionKey(rawBody: unknown): Promise<string> {
-  if (rawBody === null || typeof rawBody !== 'object') return ''
+async function deriveSessionKey(rawBody: unknown, subkeyScope = ''): Promise<string> {
+  if (rawBody === null || typeof rawBody !== 'object' || Array.isArray(rawBody)) return ''
   const body = rawBody as Record<string, unknown>
+  const scope = subkeyScope.trim()
 
   // ① `user` 字段（最可靠，规范里就是干这个的）
   // ⚠️ 排除通用客户端静态占位值：ChatBox、NextChat 等客户端经常全局硬编码
   // 固定的通用名字，若把它们当会话，会把不同对话甚至不同时间的所有流量焊死在同一个账号上。
   const user = body.user
-  if (typeof user === 'string' && user.trim() !== '') {
-    const norm = user.trim().toLowerCase()
-    const isGeneric = ['default', 'default-user', 'default_user', 'user', 'chatbox', 'nextchat', 'admin', 'root', 'anonymous', '1'].includes(norm)
-    if (!isGeneric) {
-      return `u:${(await sha256Hex(user.trim())).slice(0, 32)}`
-    }
+  if (typeof user === 'string' && user.trim() !== '' && !isGenericCallerUser(user)) {
+    const trimmedUser = user.trim()
+    const seed = scope !== '' && scope !== trimmedUser ? `${scope}\u0000${trimmedUser}` : trimmedUser
+    return `u:${(await sha256Hex(seed)).slice(0, 32)}`
   }
+
+  const callerScope = extractCallerScope(body, scope)
 
   // ② 部分客户端显式带的会话 id（snake_case 与 camelCase 都认）
   for (const key of ['conversation_id', 'conversationId']) {
     const v = body[key]
     if (typeof v === 'string' && v.trim() !== '') {
-      return `c:${(await sha256Hex(v.trim())).slice(0, 32)}`
+      const convId = v.trim()
+      const seed = callerScope !== '' ? `${callerScope}\u0000${convId}` : convId
+      return `c:${(await sha256Hex(seed)).slice(0, 32)}`
     }
   }
 
-  // ⚠️ **没有显式会话标识 ⇒ 不做粘性**。
-  // 绝不回落到「内容指纹」—— 那会把独立请求误判成同一会话（见上方说明）。
+  // ③ 携带下游调用方隔离域（如 `metadata.user_id` 或子密钥作用域）时，按作用域分槽派生粘性键
+  if (callerScope !== '') {
+    return await deriveStickySessionKey(body, { callerScope })
+  }
+
+  // ⚠️ **没有显式会话标识与调用方作用域 ⇒ 不做粘性**。
+  // 绝不回落到无作用域内容指纹 —— 那会把独立请求误判成同一会话（见上方说明）。
   return ''
 }
 
@@ -876,8 +932,10 @@ export async function handleChatCompletions(
   }
 
   // 会话粘性 key（空串 = 无法判定会话，此时不做粘性）。
-  // ⚠️ 在这里算一次、两条路径共用 —— 不各算一份（会分叉）。
-  const sessionKey = await deriveSessionKey(rawBody)
+  // ⚠️ 在这里算一次、两条路径共用 —— 不各算一份（会分叉）；子密钥调用自动掺入子密钥作用域隔离。
+  const subkeyRecordForScope = subkeyOf(ctx)
+  const subkeyScope = subkeyRecordForScope !== undefined ? `subkey:${subkeyRecordForScope.id}` : ''
+  const sessionKey = await deriveSessionKey(rawBody, subkeyScope)
 
   // ── 防封配置（面板可改，10 秒 TTL 缓存）──
   // ⚠️ 必须**早于裁剪**：裁剪上限本身来自这份配置。
@@ -1702,8 +1760,8 @@ export async function handleChatCompletions(
         }
       }
 
-      // 记账（按类别落到正确维度）
-      if (mapped.punish) {
+      // 记账（按类别落到正确维度；6020/6021 渠道级准入排队非账号故障，不罚账号）
+      if (mapped.punish && !isUpstreamQueueBusy(text)) {
         const cause = modelCauseFor(kind)
         const punishKind =
           kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension
@@ -1747,10 +1805,13 @@ export async function handleChatCompletions(
         }
       }
 
+      const busyHint = kind === 'rate_limited' ? upstreamBusyHint(text) : undefined
       lastError = {
         // ⚠️ 不原样透传上游状态码：400 会让客户端误以为「是我请求写错了」。
         status: clientStatusFor(upstream.status, kind),
-        message: `${kind}: ${msg || text.slice(0, 160)}${kind === 'channel_blocked' ? CHANNEL_BLOCKED_HINT : ''}`,
+        message:
+          `${kind}: ${msg || text.slice(0, 160)}${kind === 'channel_blocked' ? CHANNEL_BLOCKED_HINT : ''}`
+          + (busyHint !== undefined && !(msg || '').includes(busyHint) ? ` (${busyHint})` : ''),
         kind,
       }
 
@@ -1798,7 +1859,7 @@ export async function handleChatCompletions(
         )
       }
 
-      if (mapped.punish) {
+      if (mapped.punish && !isUpstreamQueueBusy(errText)) {
         const cause = modelCauseFor(kind)
         const punishKind =
           kind === 'rate_limited' ? dimension : mapped.dimension === 'model' ? 'model' : mapped.dimension
@@ -1829,9 +1890,12 @@ export async function handleChatCompletions(
 
       clearSessionBinding(pool, sessionKey, ctx)
 
+      const streamBusyHint = kind === 'rate_limited' ? upstreamBusyHint(errText) : undefined
       lastError = {
         status: clientStatusFor(200, kind),
-        message: `${kind}: ${msg || errText.slice(0, 160)}${kind === 'channel_blocked' ? CHANNEL_BLOCKED_HINT : ''}`,
+        message:
+          `${kind}: ${msg || errText.slice(0, 160)}${kind === 'channel_blocked' ? CHANNEL_BLOCKED_HINT : ''}`
+          + (streamBusyHint !== undefined && !(msg || '').includes(streamBusyHint) ? ` (${streamBusyHint})` : ''),
         kind,
       }
 
@@ -1901,8 +1965,56 @@ export async function handleChatCompletions(
       continue // 改道下一个候选重发（什么都没产出，没有内容可丢）
     }
 
+    const contEnabled =
+      (await isAutoContinuationEnabled(env)) &&
+      upstreamBody !== null &&
+      typeof upstreamBody === 'object' &&
+      !Array.isArray(upstreamBody)
+    const buddyStream = contEnabled
+      ? wrapContinuationStream(screenedBuddy.stream, {
+          enabled: true,
+          requestBody: upstreamBody as Record<string, unknown>,
+          signal: request.signal,
+          onSegmentSwitch: (info) => {
+            console.log(
+              `[continuation:buddy] kind=${info.kind} seg=${info.segmentIndex} reason=${info.reason} bytes=${info.textBytes} model=${model}`,
+            )
+          },
+          openNextSegment: async (nextBody, segSignal) => {
+            const toSerialize: Record<string, unknown> = { ...nextBody, model }
+            const nextPrepared = sanitizeChatBody(prepareChatBody(toSerialize).body)
+            await throttleUpstream(
+              candidate.uid,
+              undefined,
+              undefined,
+              DEFAULT_PROVIDER === 'workbuddy' ? 'workbuddy' : 'buddy',
+              { qps: acctSafety.rateLimitQps, jitterMs: acctSafety.rateJitterMs },
+            )
+            const nextRes = await fetch(`${bases.chat}/v2/chat/completions`, {
+              method: 'POST',
+              headers: referenceChatHeaders({
+                uid: candidate.uid,
+                accessToken: candidate.credential.accessToken,
+                variant: DEFAULT_PROVIDER === 'workbuddy' ? 'workbuddy' : 'buddy',
+                conversationId,
+                turnRequestId: newTurnRequestId(),
+                machineId,
+                sessionId,
+                sessionTrace: acctSafety.sessionTrace,
+              }),
+              body: nextPrepared,
+              signal: segSignal,
+            })
+            if (!nextRes.ok || nextRes.body === null) return null
+            const peekedNext = await peekStreamForError(nextRes.body)
+            if (peekedNext.error !== undefined) return null
+            return peekedNext.stream
+          },
+        })
+      : screenedBuddy.stream
+
     return {
-      response: await streamResponse(screenedBuddy.stream, {
+      response: await streamResponse(buddyStream, {
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
@@ -2120,6 +2232,12 @@ function streamResponse(
           while (nl >= 0) {
             const line = buffer.slice(start, nl)
             start = nl + 1
+            const trimmedComment = line.trim()
+            if (trimmedComment.startsWith(':')) {
+              controller.enqueue(encoder.encode(`${trimmedComment}\n\n`))
+              nl = buffer.indexOf('\n', start)
+              continue
+            }
             const frame = parseSseLine(line)
 
             if (frame.kind === 'done') {
@@ -3405,7 +3523,7 @@ export async function handleProviderChat(input: {
       const retryAfterMs = refined.resetAt === undefined ? parseRetryAfterMs(upstream.headers) : undefined
       const resolvedResetAt = refined.resetAt ?? (retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs)
 
-      if (mapped.punish) {
+      if (mapped.punish && !isUpstreamQueueBusy(errText)) {
         const cause = modelCauseFor(kind)
         await pool
           .applyFailure({
@@ -3496,8 +3614,46 @@ export async function handleProviderChat(input: {
       continue // 改道下一个候选重发（什么都没产出，没有内容可丢）
     }
 
+    const providerContEnabled =
+      (await isAutoContinuationEnabled(env)) &&
+      sendBody !== null &&
+      typeof sendBody === 'object' &&
+      !Array.isArray(sendBody)
+    const providerStream = providerContEnabled
+      ? wrapContinuationStream(screened.stream, {
+          enabled: true,
+          requestBody: sendBody,
+          signal: request.signal,
+          onSegmentSwitch: (info) => {
+            console.log(
+              `[continuation:${providerId}] kind=${info.kind} seg=${info.segmentIndex} reason=${info.reason} bytes=${info.textBytes} model=${model}`,
+            )
+          },
+          openNextSegment: async (nextBody, segSignal) => {
+            const nextSendBody: Record<string, unknown> = { ...nextBody, model }
+            await throttleUpstream(
+              picked.uid,
+              undefined,
+              undefined,
+              providerId,
+              { qps: acctSafety.rateLimitQps, jitterMs: acctSafety.rateJitterMs },
+            )
+            const nextRes = await provider.chat(credential, {
+              model,
+              body: nextSendBody,
+              signal: segSignal,
+              conversation: { conversationId: providerConversationId, turnRequestId: newTurnRequestId() },
+            })
+            if (!nextRes.ok || nextRes.body === null) return null
+            const peekedNext = await peekStreamForError(nextRes.body)
+            if (peekedNext.error !== undefined) return null
+            return peekedNext.stream
+          },
+        })
+      : screened.stream
+
     return {
-      response: await streamResponse(screened.stream, {
+      response: await streamResponse(providerStream, {
         // ⚠️ 诊断 + 记账分界：客户端断开**不得**记成账号失败
         //（否则用户的取消动作会熔断健康账号，见 `nonStreamingResponse` 的说明）。
         clientGone: () => request.signal.aborted,
@@ -3803,6 +3959,16 @@ export async function describeNoAccount(
         .filter((w) => w > 0)
       if (waits.length > 0) {
         const mins = Math.max(1, Math.round(Math.min(...waits) / 60_000))
+        const allTierDenied = accounts.every(
+          (a) =>
+            a.modelCooldowns[model]?.cause === 'denied' ||
+            ((provider === 'buddy' || provider === 'workbuddy') && isExclusiveProModel(model) && a.isPaid === false),
+        )
+        if (allTierDenied) {
+          return `供应商「${provider}」的 ${accounts.length} 个账号对模型「${model}」都在冷却中`
+            + `（该模型为 Pro 付费专属模型，免费档账号不支持调用 11158），最快约 ${mins} 分钟后复查。`
+            + '请导入 Pro 付费账号，或切换至其他模型 —— 账号本身是好的。'
+        }
         return `供应商「${provider}」的 ${accounts.length} 个账号对模型「${model}」都在冷却中`
           + `（上游限流/排队或该后端无此模型），最快约 ${mins} 分钟后恢复。`
           + '换一个模型通常立刻可用 —— 账号本身是好的。'

@@ -32,16 +32,28 @@ import { resolveRateJitterMs, resolveRateLimitQps, resolveSafetyFor } from '../g
 import { appendBalanceSample, detectBurnRate } from './burn-rate.js'
 import {
   type AccountState,
+  type RestrictionGateState,
   type SafetyOverride,
   createAccountState,
+  extractPaidStatusFromSummary,
+  filterCandidatesByPaidTier,
   hardCooldownActive,
   healthy,
   healthyForModel,
   isActive,
+  isExclusiveProModel,
   modelExempt,
   normalizeAccountState,
+  normalizeModelForTierCheck,
+  normalizeRestrictionGate,
   pruneExpired,
   RESTRICTED_HOLD_MS,
+  RESTRICTION_CALM_RESET_MS,
+  RESTRICTION_HOLD_BASE_MS,
+  RESTRICTION_HOLD_MAX_MS,
+  RESTRICTION_WAVE_DIV,
+  restrictionThreshold,
+  stepRestrictionGate,
 } from './state.js'
 import {
   deleteAccount,
@@ -359,6 +371,16 @@ export interface PickRequest {
    * 任一不满足即视为「没有临期额度」。宁可早停，不可误烧永久积分。
    */
   expiringStrict?: boolean
+  /**
+   * 目标模型是否为付费（Pro）专属模型。
+   *
+   * - `true`：优先排除已确认为免费档（`isPaid === false`）的候选，但遵守三条安全不变式：
+   *   ① `isPaid === undefined` 一律放行；
+   *   ② 若候选全为 `isPaid === false`，兜底放行（宁撞 11158 也不报无号可用）；
+   *   ③ 既有粘性绑定（`preferred`）不硬拦，靠 11158 模型冷却自然换号。
+   * - `undefined`：对 `buddy` / `workbuddy` 自动按已同步的 `exclusiveModels` 或冷启动兜底表判定。
+   */
+  requiresPaid?: boolean
 }
 
 /** 选号结果。 */
@@ -470,6 +492,17 @@ export interface RoutingConfig {
   softCooldownSeconds: number
   autoTaskCron: boolean
   autoRefreshCredential: boolean
+  /**
+   * 截断续写与动作预告悬停救援开关覆盖（`undefined` = 未覆盖，跟随 `AUTO_CONTINUATION` 环境变量）。
+   */
+  autoContinuation?: boolean
+}
+
+/** 持久化在 DO 存储中的数据面 CORS 白名单配置（多 isolate 共享、重启不丢）。 */
+export interface PersistedCorsConfig {
+  enabled: boolean
+  origins: string[]
+  maxAge: number
 }
 
 /**
@@ -766,7 +799,7 @@ export class AccountPoolDO extends DurableObject<Env> {
     let pinReason: string | undefined
     let pinLabel = ''
 
-    const candidates: AccountState[] = []
+    let candidates: AccountState[] = []
     for (const raw of raws) {
       const state = normalizeAccountState(JSON.parse(raw))
       // ⚠️ 解析失败（数据损坏）时跳过该条，而不是让整个列表 500
@@ -925,6 +958,20 @@ export class AccountPoolDO extends DurableObject<Env> {
       }
     }
 
+    // ── Pro 专属模型（accessMode = exclusive）事前过滤 ──
+    // ⚠️ 必须放在 `pin` 与 `preferred`（会话粘性）命中之后：
+    //   ① `isPaid === undefined`（未观测过付费状态）一律放行；
+    //   ② 若全部可用候选均为 `isPaid === false`，兜底原样放行（宁撞一次 11158 也不空池报错）；
+    //   ③ 既有粘性绑定已在上方提前返回，绝不硬拦，靠 11158 模型冷却自动换号。
+    const effectiveRequiresPaid =
+      typeof request.requiresPaid === 'boolean'
+        ? request.requiresPaid
+        : (wantProvider === '' || wantProvider === 'buddy' || wantProvider === 'workbuddy') &&
+          isExclusiveProModel(model, await this.getExclusiveModels())
+    candidates = filterCandidatesByPaidTier(candidates, {
+      requiresPaid: effectiveRequiresPaid,
+    }).pool
+
     // ⚠️ **防惊群：并发请求要摊到不同账号**（实测踩到的严重缺陷）。
     //
     // ## 为什么必须做（用户报「思考 78 秒又断了」）
@@ -1018,6 +1065,38 @@ export class AccountPoolDO extends DurableObject<Env> {
    */
   private cachedRoutingConfig?: RoutingConfig
   private cachedSafetyConfig?: SafetyConfig
+  private cachedExclusiveModels?: string[] | null
+  private cachedCorsConfig?: PersistedCorsConfig | null
+
+  /** 读取当前分片已同步的动态 Pro 专属模型列表（未同步过返回 `undefined`，触发冷启动兜底表）。 */
+  async getExclusiveModels(): Promise<string[] | undefined> {
+    if (this.cachedExclusiveModels !== undefined) {
+      return this.cachedExclusiveModels === null ? undefined : this.cachedExclusiveModels
+    }
+    const raw = await this.ctx.storage.get<unknown>('exclusiveModels')
+    if (!Array.isArray(raw)) {
+      this.cachedExclusiveModels = null
+      return undefined
+    }
+    const list = raw
+      .filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+      .map((x) => normalizeModelForTierCheck(x))
+    this.cachedExclusiveModels = list
+    return list
+  }
+
+  /** 更新当前分片从 `/v2/models` 同步到的 `accessMode === 'exclusive'` 模型列表。 */
+  async setExclusiveModels(models: string[]): Promise<void> {
+    const normalized = [
+      ...new Set(
+        models
+          .filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+          .map((x) => normalizeModelForTierCheck(x)),
+      ),
+    ]
+    await this.ctx.storage.put('exclusiveModels', normalized)
+    this.cachedExclusiveModels = normalized
+  }
 
   /**
    * 解密凭据的内存缓存（避免每次对话高频执行 SQLite 读取与 AES-GCM 解密，节约 CPU 预算）。
@@ -1154,23 +1233,87 @@ export class AccountPoolDO extends DurableObject<Env> {
       softCooldownSeconds: typeof raw?.softCooldownSeconds === 'number' && raw.softCooldownSeconds >= 10 && raw.softCooldownSeconds <= 3600 ? raw.softCooldownSeconds : 60,
       autoTaskCron: raw?.autoTaskCron !== false,
       autoRefreshCredential: raw?.autoRefreshCredential !== false,
+      ...(typeof raw?.autoContinuation === 'boolean' ? { autoContinuation: raw.autoContinuation } : {}),
     }
     this.cachedRoutingConfig = config
     return config
   }
 
-  /** 更新系统调度与路由配置。 */
-  async setRoutingConfig(input: Partial<RoutingConfig>): Promise<RoutingConfig> {
+  /** 更新系统调度与路由配置（`autoContinuation: null` 清除覆盖回落环境变量）。 */
+  async setRoutingConfig(
+    input: Omit<Partial<RoutingConfig>, 'autoContinuation'> & { autoContinuation?: boolean | null },
+  ): Promise<RoutingConfig> {
     const cur = await this.getRoutingConfig()
+    const nextAutoCont =
+      input.autoContinuation === null
+        ? undefined
+        : typeof input.autoContinuation === 'boolean'
+          ? input.autoContinuation
+          : cur.autoContinuation
     const next: RoutingConfig = {
       strategy: input.strategy === 'roundrobin' || input.strategy === 'random' || input.strategy === 'expiry' ? input.strategy : cur.strategy,
       maxRetries: typeof input.maxRetries === 'number' && input.maxRetries >= 0 && input.maxRetries <= 10 ? input.maxRetries : cur.maxRetries,
       softCooldownSeconds: typeof input.softCooldownSeconds === 'number' && input.softCooldownSeconds >= 10 && input.softCooldownSeconds <= 3600 ? input.softCooldownSeconds : cur.softCooldownSeconds,
       autoTaskCron: typeof input.autoTaskCron === 'boolean' ? input.autoTaskCron : cur.autoTaskCron,
       autoRefreshCredential: typeof input.autoRefreshCredential === 'boolean' ? input.autoRefreshCredential : cur.autoRefreshCredential,
+      ...(typeof nextAutoCont === 'boolean' ? { autoContinuation: nextAutoCont } : {}),
     }
     await this.ctx.storage.put('systemRoutingConfig', next)
     this.cachedRoutingConfig = next
+    return next
+  }
+
+  /**
+   * 读取持久化的 CORS 配置覆盖（未设置过返回 `undefined`，调用方回落 `CORS_ORIGINS` 环境变量）。
+   */
+  async getCorsConfig(): Promise<PersistedCorsConfig | undefined> {
+    if (this.cachedCorsConfig !== undefined) {
+      return this.cachedCorsConfig === null ? undefined : this.cachedCorsConfig
+    }
+    const raw = await this.ctx.storage.get<Record<string, unknown>>('systemCorsConfig')
+    if (raw === undefined || raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      this.cachedCorsConfig = null
+      return undefined
+    }
+    const origins = Array.isArray(raw['origins'])
+      ? (raw['origins'] as unknown[]).filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+      : []
+    const maxAge =
+      typeof raw['maxAge'] === 'number' && Number.isInteger(raw['maxAge']) && raw['maxAge'] >= 0 && raw['maxAge'] <= 7200
+        ? raw['maxAge']
+        : 600
+    const config: PersistedCorsConfig = {
+      enabled: raw['enabled'] === true && origins.length > 0,
+      origins,
+      maxAge,
+    }
+    this.cachedCorsConfig = config
+    return config
+  }
+
+  /**
+   * 写入或清除持久化的 CORS 配置覆盖（传 `null` 删除覆盖，恢复跟随 `CORS_ORIGINS` 环境变量）。
+   */
+  async setCorsConfig(input: PersistedCorsConfig | null): Promise<PersistedCorsConfig | undefined> {
+    if (input === null) {
+      await this.ctx.storage.delete('systemCorsConfig')
+      this.cachedCorsConfig = null
+      return undefined
+    }
+    const origins = Array.isArray(input.origins)
+      ? input.origins.filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+      : []
+    const maxAge =
+      typeof input.maxAge === 'number' && Number.isInteger(input.maxAge) && input.maxAge >= 0 && input.maxAge <= 7200
+        ? input.maxAge
+        : 600
+    const next: PersistedCorsConfig = {
+      enabled: Boolean(input.enabled) && origins.length > 0,
+      origins,
+      maxAge,
+    }
+    await this.ctx.storage.put('systemCorsConfig', next)
+    this.cachedCorsConfig = next
     return next
   }
 
@@ -1770,24 +1913,42 @@ export class AccountPoolDO extends DurableObject<Env> {
   async updateBalance(
     uid: string,
     now: number,
-    balance: { credits: number; expiring: number; earliestExpiry: number },
+    balance: { credits: number; expiring: number; earliestExpiry: number; isPaid?: boolean },
   ): Promise<boolean> {
     const raw = readAccount(this.ctx.storage.sql, uid, this.realm)
     if (raw === undefined) return false
     const state = normalizeAccountState(JSON.parse(raw))
     if (state === undefined) return false
 
-    // ⚠️ 只改额度与采样。**绝不动** until / breakerUntil / degradeUntil /
+    // ⚠️ 只改额度、采样与可选付费标识。**绝不动** until / breakerUntil / degradeUntil /
     // modelCooldowns / disabled / fails —— 那是惩罚态，与余额无关。
     const credits = Math.max(0, Math.trunc(balance.credits))
     state.credits = credits
     state.creditsExpiring = Math.max(0, Math.trunc(balance.expiring))
     state.creditsEarliestExpiry = Math.max(0, Math.trunc(balance.earliestExpiry))
+    if (typeof balance.isPaid === 'boolean') {
+      state.isPaid = balance.isPaid
+    }
     state.samples = appendBalanceSample(state.samples, now, credits)
 
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
 
     await this.enforceBurnRate(state, now)
+    return true
+  }
+
+  /**
+   * 单独更新账号的付费身份标识（`true` / `false`；传 `undefined` 清除回「未观测」）。
+   */
+  async setAccountPaid(uid: string, isPaid: boolean | undefined, now: number): Promise<boolean> {
+    const state = this.readState(uid)
+    if (state === undefined) return false
+    if (typeof isPaid === 'boolean') {
+      state.isPaid = isPaid
+    } else {
+      delete state.isPaid
+    }
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
     return true
   }
 
@@ -2052,13 +2213,19 @@ export class AccountPoolDO extends DurableObject<Env> {
 
   /** 创建账号（供导入 / 登录流程调用）。已存在则覆盖凭证以外的状态。 */
   async createAccount(
-    input: { uid: string; nickname: string; realm: string; provider?: string },
+    input: { uid: string; nickname: string; realm: string; provider?: string; isPaid?: boolean },
     now: number,
   ): Promise<AccountState> {
     const existing = readAccount(this.ctx.storage.sql, input.uid, this.realm)
     if (existing !== undefined) {
       const parsed = normalizeAccountState(JSON.parse(existing))
-      if (parsed !== undefined) return parsed
+      if (parsed !== undefined) {
+        if (typeof input.isPaid === 'boolean' && parsed.isPaid !== input.isPaid) {
+          parsed.isPaid = input.isPaid
+          writeAccount(this.ctx.storage.sql, parsed.uid, parsed.realm, JSON.stringify(parsed), now)
+        }
+        return parsed
+      }
     }
     const state = createAccountState(input)
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
@@ -2072,12 +2239,22 @@ export class AccountPoolDO extends DurableObject<Env> {
    *
    * ⚠️ 未配置 `CREDENTIAL_KEY` 时**抛错**，不静默明文落盘（AGENTS.md §7.1）。
    * 静默降级是最糟的选择 —— 用户会以为已经加密了。
+   * 若凭据自身携带明确的付费状态（`isPaid` / `extras.isPaid` 等），同步记录到已有账号状态。
    */
   async putCredential(uid: string, credential: unknown, now: number): Promise<void> {
     this.credentialCache.set(uid, credential)
     const key = requireCredentialKey(this.env.CREDENTIAL_KEY)
     const ciphertext = await encryptCredential(key, credential)
     writeCredential(this.ctx.storage.sql, uid, ciphertext, now)
+
+    const inferredPaid = extractPaidStatusFromSummary(credential)
+    if (typeof inferredPaid === 'boolean') {
+      const state = this.readState(uid)
+      if (state !== undefined && state.isPaid !== inferredPaid) {
+        state.isPaid = inferredPaid
+        writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+      }
+    }
   }
 
   /**
@@ -2529,56 +2706,108 @@ export class AccountPoolDO extends DurableObject<Env> {
   }
 
   /**
-   * 记录一个账号被上游 `11140` 限制，判定是否形成**波次**（整池暂停）。
+   * 计算当前分片用于 `11140` 波次阈值缩放的有效池规模。
    *
-   * 判据与 {@link noteWaf} 同一个形状（不同账号数），但窗口/时长按账号级风控取值。
-   * 同号重复命中**覆盖**而不累计 —— 判的是「几个不同的号被打标」，
-   * 一个号反复撞不构成波次（它自己已被 `restrictedUntil` 挡住）。
+   * 统计未禁用、未处于冷却/熔断/降权中的账号数（仅因 `restrictedUntil` 刚被打标的账号仍计入分母，
+   * 防止同一波次内随着受限号增加而把动态阈值越缩越小）。
    */
-  async noteRestriction(uid: string, now: number): Promise<boolean> {
-    const gate = await this.loadRestrictionGate()
-    if (gate.until > now) return true
-
-    gate.hits[uid] = now
-    for (const [u, t] of Object.entries(gate.hits)) {
-      if (now - t > RESTRICTION_WAVE_WINDOW_MS) delete gate.hits[u]
+  private effectivePoolScale(now: number): number {
+    const raws = listAccounts(this.ctx.storage.sql, this.realm)
+    let count = 0
+    for (const raw of raws) {
+      const state = normalizeAccountState(JSON.parse(raw))
+      if (state === undefined) continue
+      if (state.disabled) continue
+      if (isActive(state.until, now)) continue
+      if (isActive(state.breakerUntil, now)) continue
+      if (isActive(state.degradeUntil, now)) continue
+      count += 1
     }
-
-    if (Object.keys(gate.hits).length >= RESTRICTION_WAVE_THRESHOLD) {
-      gate.until = now + RESTRICTION_POOL_HOLD_MS
-      gate.hits = {}
-      await this.saveRestrictionGate(gate)
-      console.warn(
-        `[restriction] 账号级限制波次：${RESTRICTION_WAVE_WINDOW_MS / 60_000} 分钟内 ` +
-          `${RESTRICTION_WAVE_THRESHOLD} 个不同账号被 11140 标记，` +
-          `暂停该区域派发 ${RESTRICTION_POOL_HOLD_MS / 60_000} 分钟`,
-      )
-      return true
-    }
-
-    await this.saveRestrictionGate(gate)
-    return false
+    return count
   }
 
-  /** 账号级限制波次是否仍在暂停期（只读，不记账）。 */
+  /**
+   * 记录一个账号被上游 `11140` 限制，判定是否形成**波次**（整池暂停）。
+   *
+   * - 阈值随有效账号池规模动态缩放：`max(2, floor(poolScale / 10))`（参考 `7dcae8e`）；
+   * - 暂停时长从 `30s` 起按连续波次指数退避，上限 `10m`；
+   * - 平静期（`30m` 无新波次触发）过后，`streak` 与窗口外 `hits` 自动清零（参考 `de24d38`）。
+   */
+  async noteRestriction(uid: string, now: number, poolScaleOverride?: number): Promise<boolean> {
+    const prev = await this.loadRestrictionGate(now)
+    const scale =
+      typeof poolScaleOverride === 'number' && Number.isFinite(poolScaleOverride)
+        ? poolScaleOverride
+        : this.effectivePoolScale(now)
+    const res = stepRestrictionGate(prev, uid, now, scale)
+    await this.saveRestrictionGate(res.next)
+
+    if (res.justTriggered) {
+      console.warn(
+        `[restriction] 账号级限制波次（第 ${res.next.streak} 波）：${RESTRICTION_WAVE_WINDOW_MS / 60_000} 分钟内 ` +
+          `${res.threshold} 个不同账号被 11140 标记（有效池规模=${scale}，比例=1/${RESTRICTION_WAVE_DIV}，` +
+          `基准=${RESTRICTION_HOLD_BASE_MS / 1000}s，上限=${RESTRICTION_HOLD_MAX_MS / 60_000}m，` +
+          `平静期清零=${RESTRICTION_CALM_RESET_MS / 60_000}m），暂停该区域派发 ${Math.round(res.holdMs / 1000)}s`,
+      )
+    }
+    return res.active
+  }
+
+  /** 账号级限制波次是否仍在暂停期（只读；若平静期已满则顺手持久化清零后的 `streak`）。 */
   async restrictionGateActive(now: number): Promise<boolean> {
-    const gate = await this.loadRestrictionGate()
+    const raw = await this.ctx.storage.get<unknown>('restrictionGate')
+    const gate = normalizeRestrictionGate(raw, now)
+    if (
+      raw !== undefined &&
+      raw !== null &&
+      typeof raw === 'object' &&
+      typeof (raw as { streak?: unknown }).streak === 'number' &&
+      (raw as { streak: number }).streak > 0 &&
+      gate.streak === 0
+    ) {
+      await this.saveRestrictionGate(gate)
+    }
     return gate.until > now
   }
 
-  /** 波次暂停的完整状态（面板展示用）。 */
-  async restrictionGateStatus(now: number): Promise<{ active: boolean; until: number; recentUids: number }> {
-    const gate = await this.loadRestrictionGate()
-    let recent = 0
-    for (const t of Object.values(gate.hits)) {
-      if (now - t <= RESTRICTION_WAVE_WINDOW_MS) recent += 1
+  /** 波次暂停的完整状态（面板展示与单测观测用）。 */
+  async restrictionGateStatus(now: number): Promise<{
+    active: boolean
+    until: number
+    recentUids: number
+    threshold: number
+    streak: number
+  }> {
+    const raw = await this.ctx.storage.get<unknown>('restrictionGate')
+    const gate = normalizeRestrictionGate(raw, now)
+    if (
+      raw !== undefined &&
+      raw !== null &&
+      typeof raw === 'object' &&
+      typeof (raw as { streak?: unknown }).streak === 'number' &&
+      (raw as { streak: number }).streak > 0 &&
+      gate.streak === 0
+    ) {
+      await this.saveRestrictionGate(gate)
     }
-    return { active: gate.until > now, until: gate.until, recentUids: recent }
+    const scale = this.effectivePoolScale(now)
+    return {
+      active: gate.until > now,
+      until: gate.until,
+      recentUids: Object.keys(gate.hits).length,
+      threshold: restrictionThreshold(scale),
+      streak: gate.streak,
+    }
   }
 
-  /** 人工解除波次暂停（与 `clearWafGate` 同样的可纠正入口）。 */
+  /** 人工解除波次暂停（连带清零连发退避计数 `streak`）。 */
   async clearRestrictionGate(): Promise<void> {
-    await this.ctx.storage.put('restrictionGate', { until: 0, hits: {} })
+    await this.ctx.storage.put('restrictionGate', {
+      until: 0,
+      hits: {},
+      streak: 0,
+      lastTriggeredAt: 0,
+    } satisfies RestrictionGateState)
   }
 
   /**
@@ -2603,19 +2832,12 @@ export class AccountPoolDO extends DurableObject<Env> {
     return { found: true, cleared: wasRestricted }
   }
 
-  private async loadRestrictionGate(): Promise<{ until: number; hits: Record<string, number> }> {
-    const raw = await this.ctx.storage.get<{ until?: unknown; hits?: unknown }>('restrictionGate')
-    const until = typeof raw?.until === 'number' ? raw.until : 0
-    const hits: Record<string, number> = {}
-    if (raw !== undefined && raw.hits !== null && typeof raw.hits === 'object') {
-      for (const [k, v] of Object.entries(raw.hits as Record<string, unknown>)) {
-        if (typeof v === 'number' && Number.isFinite(v)) hits[k] = v
-      }
-    }
-    return { until, hits }
+  private async loadRestrictionGate(now?: number): Promise<RestrictionGateState> {
+    const raw = await this.ctx.storage.get<unknown>('restrictionGate')
+    return normalizeRestrictionGate(raw, now)
   }
 
-  private async saveRestrictionGate(gate: { until: number; hits: Record<string, number> }): Promise<void> {
+  private async saveRestrictionGate(gate: RestrictionGateState): Promise<void> {
     await this.ctx.storage.put('restrictionGate', gate)
   }
 

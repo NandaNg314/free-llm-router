@@ -414,6 +414,48 @@ export function useSubmitVideo() {
 export const checkVideoTask = (taskId: string) =>
   api<VideoTask>('/v1/videos/tasks', { json: { task_id: taskId }, timeoutMs: 60_000 })
 
+// ── 混元 3D（异步：提交 → 轮询） ──
+
+export interface ThreeDResultFile {
+  Type?: string
+  Url?: string
+  PreviewImageUrl?: string
+}
+
+export interface ThreeDTask {
+  id: string
+  job_id: string
+  object?: string
+  status: string
+  model?: string
+  result_url?: string
+  result_files?: ThreeDResultFile[]
+  usage?: { credit?: number }
+  error?: { message: string }
+  hint?: string
+}
+
+export interface ThreeDSubmitPayload {
+  prompt?: string
+  image_base64?: string
+  image_url?: string
+  model?: string
+  result_format?: string
+  generate_type?: string
+  enable_pbr?: boolean
+}
+
+export function useSubmitThreeD() {
+  return useMutation<ThreeDTask, Error, ThreeDSubmitPayload>({
+    mutationFn: (v) => api<ThreeDTask>('/v1/3d/generations', { json: v, timeoutMs: 120_000 }),
+    onError: (e) => toast.error('3D 任务提交失败', { description: e.message }),
+  })
+}
+
+/** 查询混元 3D 异步任务进度（`POST /v1/3d/tasks`）。 */
+export const checkThreeDTask = (jobId: string) =>
+  api<ThreeDTask>('/v1/3d/tasks', { json: { job_id: jobId }, timeoutMs: 60_000 })
+
 /** 媒体直链的**同源代理**（跨域资源浏览器不让 download，必须走它）。 */
 export function mediaProxyUrl(url: string): string {
   return `/admin/media/proxy?url=${encodeURIComponent(url)}`

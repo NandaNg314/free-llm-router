@@ -280,6 +280,16 @@ export interface AccountState {
    * 就再也影响不到老账号（`setSafetyConfig` 上已踩过这个坑）。
    */
   safetyOverride?: SafetyOverride
+  /**
+   * 账号是否具备付费权益（Pro / VIP 套餐）。
+   *
+   * - `true`：已观测到有效付费套餐；
+   * - `false`：已观测到该账号仅为免费档；
+   * - `undefined`（字段省略）：尚未观测过付费状态 —— 选号对 Pro 专属模型**一律放行**。
+   *
+   * ⚠️ 与 {@link safetyOverride} 同一纪律：未知时不落盘空键，避免将「未观测」误序列化成布尔值。
+   */
+  isPaid?: boolean
 }
 
 /**
@@ -318,6 +328,8 @@ export function createAccountState(input: {
    * 结果是同一批账号按创建时间不同，被当成国内版/国际版两种东西。
    */
   provider?: string
+  /** 可选付费状态（仅在已明确观测为 `boolean` 时写入；未知保持省略）。 */
+  isPaid?: boolean
 }): AccountState {
   return {
     uid: input.uid,
@@ -350,10 +362,10 @@ export function createAccountState(input: {
     creditsExpiring: 0,
     creditsEarliestExpiry: 0,
     samples: [],
-    // ⚠️ 刻意**不**初始化 `safetyOverride: {}`：
-    // `undefined` 与「空对象」在语义上都表示「沿用全局」，但只有 `undefined`
-    // 不会让 `normalizeAccountState` 把「没设置过」和「设置过又清空」区别对待。
-    // 少一个字段就少一处需要解释的状态。
+    // ⚠️ 刻意**不**初始化 `safetyOverride: {}` / `isPaid: undefined`：
+    // `undefined` 在语义上表示「沿用全局 / 尚未观测」，只有省略键才不会让
+    // `normalizeAccountState` 出现值为 `undefined` 的死键。
+    ...(typeof input.isPaid === 'boolean' ? { isPaid: input.isPaid } : {}),
   }
 }
 
@@ -466,6 +478,7 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
     ...(o.safetyOverride !== null && typeof o.safetyOverride === 'object' && !Array.isArray(o.safetyOverride)
       ? { safetyOverride: o.safetyOverride as SafetyOverride }
       : {}),
+    ...(typeof o.isPaid === 'boolean' ? { isPaid: o.isPaid } : {}),
   }
 }
 
@@ -778,5 +791,318 @@ export function diagnoseAccount(state: AccountState, now: number): AccountDiagno
       lastErr: state.lastErr,
     },
     reason: state.reason,
+    ...(typeof state.isPaid === 'boolean' ? { isPaid: state.isPaid } : {}),
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pro 专属模型（accessMode = exclusive）事前选号过滤
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * `/v2/models` 尚未同步完成时的冷启动兜底 Pro 专属模型表（参考 `workbuddy2api-panel` `7a48d72`）。
+ *
+ * ⚠️ 只放已确认在免费号上 100% 返回 `11158 model not allowed for user type` 的专属模型；
+ * 一旦 `/v2/models` 拉取到动态 `accessMode === 'exclusive'` 列表，即以动态列表为准。
+ */
+export const PRO_ONLY_FALLBACK_MODELS: ReadonlySet<string> = new Set(['primary-model'])
+
+/** 归一模型 id：剥除路由前缀（`expiring/`、`expiringonly/`、`buddy/`、`workbuddy/`）并转小写。 */
+export function normalizeModelForTierCheck(model: string): string {
+  let s = model.trim().toLowerCase()
+  for (let i = 0; i < 3; i += 1) {
+    if (s.startsWith('expiringonly/')) s = s.slice('expiringonly/'.length)
+    else if (s.startsWith('expiring/')) s = s.slice('expiring/'.length)
+    else if (s.startsWith('buddy/')) s = s.slice('buddy/'.length)
+    else if (s.startsWith('workbuddy/')) s = s.slice('workbuddy/'.length)
+    else break
+  }
+  return s.trim()
+}
+
+/**
+ * 从 `/v2/models` 响应体提取 `accessMode === 'exclusive'` 的 Pro 专属模型 id 列表。
+ *
+ * 兼容 `{ data: [...] }`、`{ data: { list: [...] } }`、`{ models: [...] }` 及裸数组。
+ */
+export function extractExclusiveModelIds(modelsPayload: unknown): string[] {
+  let items: unknown[] = []
+  if (Array.isArray(modelsPayload)) {
+    items = modelsPayload
+  } else if (modelsPayload !== null && typeof modelsPayload === 'object') {
+    const obj = modelsPayload as Record<string, unknown>
+    if (Array.isArray(obj.data)) {
+      items = obj.data
+    } else if (obj.data !== null && typeof obj.data === 'object') {
+      const dataObj = obj.data as Record<string, unknown>
+      if (Array.isArray(dataObj.list)) items = dataObj.list
+      else if (Array.isArray(dataObj.models)) items = dataObj.models
+    } else if (Array.isArray(obj.models)) {
+      items = obj.models
+    } else if (Array.isArray(obj.list)) {
+      items = obj.list
+    }
+  }
+
+  const out = new Set<string>()
+  for (const item of items) {
+    if (item === null || typeof item !== 'object') continue
+    const m = item as Record<string, unknown>
+    const accessMode =
+      typeof m.accessMode === 'string'
+        ? m.accessMode.trim().toLowerCase()
+        : typeof m.access_mode === 'string'
+          ? m.access_mode.trim().toLowerCase()
+          : ''
+    const explicitPaid = m.proOnly === true || m.paidOnly === true || m.exclusive === true
+    if (accessMode !== 'exclusive' && !explicitPaid) continue
+    for (const key of ['id', 'modelName', 'model_name', 'name'] as const) {
+      const rawId = m[key]
+      if (typeof rawId === 'string' && rawId.trim() !== '') {
+        out.add(normalizeModelForTierCheck(rawId))
+      }
+    }
+  }
+  return [...out]
+}
+
+/**
+ * 从余额摘要或凭据扩展字段中提取付费身份（`true` / `false`；无法判断时返回 `undefined`）。
+ *
+ * ⚠️ 严格遵循「不确定就返回 `undefined`」：未观测过付费状态的账号绝不能被误标成 `false`。
+ */
+export function extractPaidStatusFromSummary(payload: unknown): boolean | undefined {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return undefined
+  const root = payload as Record<string, unknown>
+  const targets: Array<Record<string, unknown>> = [root]
+  if (root.data !== null && typeof root.data === 'object' && !Array.isArray(root.data)) {
+    targets.unshift(root.data as Record<string, unknown>)
+  }
+  if (root.extras !== null && typeof root.extras === 'object' && !Array.isArray(root.extras)) {
+    targets.push(root.extras as Record<string, unknown>)
+  }
+
+  for (const obj of targets) {
+    for (const key of ['isPaid', 'isPaidUser', 'is_paid_user', 'is_paid', 'paidUser'] as const) {
+      if (typeof obj[key] === 'boolean') return obj[key] as boolean
+    }
+    const tier =
+      typeof obj.userType === 'string'
+        ? obj.userType.trim().toLowerCase()
+        : typeof obj.user_type === 'string'
+          ? obj.user_type.trim().toLowerCase()
+          : typeof obj.planType === 'string'
+            ? obj.planType.trim().toLowerCase()
+            : ''
+    if (tier === 'pro' || tier === 'paid' || tier === 'vip' || tier === 'plus' || tier === 'enterprise') {
+      return true
+    }
+    if (tier === 'free' || tier === 'trial') {
+      return false
+    }
+  }
+  return undefined
+}
+
+/**
+ * 判断目标模型是否为 Pro 专属模型（`accessMode === 'exclusive'`）。
+ *
+ * - 若已同步过动态列表（`dynamicExclusiveModels !== undefined`），以动态列表为准；
+ * - 若尚未同步（`dynamicExclusiveModels === undefined`），使用 {@link PRO_ONLY_FALLBACK_MODELS} 冷启动兜底。
+ */
+export function isExclusiveProModel(
+  model: string,
+  dynamicExclusiveModels?: Iterable<string>,
+): boolean {
+  const norm = normalizeModelForTierCheck(model)
+  if (norm === '') return false
+  if (dynamicExclusiveModels !== undefined) {
+    for (const item of dynamicExclusiveModels) {
+      if (normalizeModelForTierCheck(item) === norm) return true
+    }
+    return false
+  }
+  return PRO_ONLY_FALLBACK_MODELS.has(norm)
+}
+
+/**
+ * 按付费档位对健康候选集做事前过滤，严格满足三条安全不变式：
+ *
+ * 1. `isPaid === undefined`（未观测过付费状态）一律放行；
+ * 2. 若过滤后无候选（即全部健康候选都是 `isPaid === false`），兜底原样放行（宁撞一次 11158 也不空池报错）；
+ * 3. 既有会话粘性绑定（`preferredUid`）绝不硬拦，靠 11158 模型冷却自然触发换号。
+ */
+export function filterCandidatesByPaidTier<T extends { uid: string; isPaid?: boolean }>(
+  candidates: readonly T[],
+  options: { requiresPaid?: boolean; preferredUid?: string },
+): { pool: T[]; skippedFree: number; fellBackToFree: boolean } {
+  if (options.requiresPaid !== true || candidates.length === 0) {
+    return { pool: [...candidates], skippedFree: 0, fellBackToFree: false }
+  }
+  const preferredUid = options.preferredUid ?? ''
+  const paidOrUnknown: T[] = []
+  let skippedFree = 0
+
+  for (const item of candidates) {
+    // 不变式 ③：既有会话粘性目标不硬拦；不变式 ①：isPaid === undefined 一律放行
+    if (item.isPaid === false && (preferredUid === '' || item.uid !== preferredUid)) {
+      skippedFree += 1
+      continue
+    }
+    paidOrUnknown.push(item)
+  }
+
+  // 不变式 ②：全部候选都是已确认免费号时，兜底全部放行
+  if (paidOrUnknown.length === 0) {
+    return { pool: [...candidates], skippedFree: 0, fellBackToFree: true }
+  }
+  return { pool: paidOrUnknown, skippedFree, fellBackToFree: false }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// `11140` 区域限制波次闸门（随池规模动态阈值 + 指数退避 + 平静期清零）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** `11140` 波次观测时间窗（15 分钟）。 */
+export const RESTRICTION_WAVE_WINDOW_MS = 15 * 60 * 1000
+/** 小池/未知规模的波次最小触发阈值（至少 2 个不同账号）。 */
+export const RESTRICTION_WAVE_THRESHOLD = 2
+/** 大号池动态缩放分母：按有效池规模的 `1 / 10`（10%）计算触发阈值。 */
+export const RESTRICTION_WAVE_DIV = 10
+/** 首次触发波次暂停的基础时长（30 秒，连发波次按 2x 退避）。 */
+export const RESTRICTION_HOLD_BASE_MS = 30 * 1000
+/** 动态退避单次暂停上限（10 分钟，参考 `7dcae8e`）。 */
+export const RESTRICTION_HOLD_MAX_MS = 10 * 60 * 1000
+/** 区域限制历史兼容硬上限常量（30 分钟）。 */
+export const RESTRICTION_POOL_HOLD_MS = 30 * 60 * 1000
+/** 平静期时长（30 分钟内未再次触发波次，连发退避档位 `streak` 归零，参考 `de24d38`）。 */
+export const RESTRICTION_CALM_RESET_MS = 30 * 60 * 1000
+
+export interface RestrictionGateState {
+  until: number
+  hits: Record<string, number>
+  /** 连续触发波次数（用于指数退避，平静期过后清零）。 */
+  streak: number
+  /** 最近一次触发整池暂停的时刻（epoch ms）。 */
+  lastTriggeredAt: number
+}
+
+/**
+ * 计算触发 `11140` 区域波次暂停所需的不同账号数阈值。
+ *
+ * 规则：`max(minThreshold, floor(poolScale / div))`（`poolScale <= 0` 或非有限数时回落 `minThreshold = 2`）。
+ * 例如 340 号池需 `34` 个不同账号在窗口内命中才触发暂停，避免 2 个偶发受限号把整池封停。
+ */
+export function restrictionThreshold(
+  poolScale: number,
+  div: number = RESTRICTION_WAVE_DIV,
+  minThreshold: number = RESTRICTION_WAVE_THRESHOLD,
+): number {
+  const safeMin = Math.max(1, Math.trunc(minThreshold))
+  const safeDiv = div > 0 && Number.isFinite(div) ? Math.trunc(div) : RESTRICTION_WAVE_DIV
+  if (!Number.isFinite(poolScale) || poolScale <= 0) return safeMin
+  const scaled = Math.floor(poolScale / safeDiv)
+  return scaled > safeMin ? scaled : safeMin
+}
+
+/** 计算第 `streak`（>=1）次波次触发的暂停时长：`min(HOLD_MAX, HOLD_BASE * 2^(streak - 1))`。 */
+export function restrictionHoldDurationMs(streak: number): number {
+  const exp = Math.max(0, Math.min(16, Math.trunc(streak) - 1))
+  const hold = RESTRICTION_HOLD_BASE_MS * 2 ** exp
+  return Math.min(RESTRICTION_HOLD_MAX_MS, RESTRICTION_POOL_HOLD_MS, hold)
+}
+
+/** 归一持久化的 `restrictionGate` 记录，并在平静期过后自动清零过期的 `hits` 与 `streak`。 */
+export function normalizeRestrictionGate(raw: unknown, now?: number): RestrictionGateState {
+  const o = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+  const until = typeof o.until === 'number' && Number.isFinite(o.until) ? o.until : 0
+  const hits: Record<string, number> = {}
+  if (o.hits !== null && typeof o.hits === 'object' && !Array.isArray(o.hits)) {
+    for (const [k, v] of Object.entries(o.hits as Record<string, unknown>)) {
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        if (now === undefined || now - v <= RESTRICTION_WAVE_WINDOW_MS) {
+          hits[k] = v
+        }
+      }
+    }
+  }
+  let streak =
+    typeof o.streak === 'number' && Number.isFinite(o.streak) && o.streak > 0 ? Math.trunc(o.streak) : 0
+  let lastTriggeredAt =
+    typeof o.lastTriggeredAt === 'number' && Number.isFinite(o.lastTriggeredAt) && o.lastTriggeredAt > 0
+      ? o.lastTriggeredAt
+      : 0
+
+  // 平静期清零：已不在暂停期内，且距上次触发已满 RESTRICTION_CALM_RESET_MS（30 分钟）
+  if (
+    now !== undefined &&
+    until <= now &&
+    lastTriggeredAt > 0 &&
+    now - lastTriggeredAt >= RESTRICTION_CALM_RESET_MS
+  ) {
+    streak = 0
+    lastTriggeredAt = 0
+  }
+
+  return { until, hits, streak, lastTriggeredAt }
+}
+
+/**
+ * 推进一次 `11140` 命中状态机（纯函数，供 `AccountPoolDO.noteRestriction` 与单测共用）。
+ */
+export function stepRestrictionGate(
+  prev: RestrictionGateState,
+  uid: string,
+  now: number,
+  poolScale: number,
+): {
+  next: RestrictionGateState
+  active: boolean
+  justTriggered: boolean
+  threshold: number
+  holdMs: number
+} {
+  const gate = normalizeRestrictionGate(prev, now)
+  const threshold = restrictionThreshold(poolScale)
+
+  if (gate.until > now) {
+    return {
+      next: gate,
+      active: true,
+      justTriggered: false,
+      threshold,
+      holdMs: gate.until - now,
+    }
+  }
+
+  gate.hits[uid] = now
+  for (const [u, t] of Object.entries(gate.hits)) {
+    if (now - t > RESTRICTION_WAVE_WINDOW_MS) delete gate.hits[u]
+  }
+
+  if (Object.keys(gate.hits).length >= threshold) {
+    const nextStreak = gate.streak + 1
+    const holdMs = restrictionHoldDurationMs(nextStreak)
+    const next: RestrictionGateState = {
+      until: now + holdMs,
+      hits: {},
+      streak: nextStreak,
+      lastTriggeredAt: now,
+    }
+    return {
+      next,
+      active: true,
+      justTriggered: true,
+      threshold,
+      holdMs,
+    }
+  }
+
+  return {
+    next: gate,
+    active: false,
+    justTriggered: false,
+    threshold,
+    holdMs: 0,
   }
 }

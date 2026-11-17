@@ -22,7 +22,15 @@
 
 import { resolveUpstream, type Env } from '../env.js'
 import { callUpstream, classify, UpstreamError } from './client.js'
-import { deriveDeviceId, desktopHeaders, desktopUserAgent } from './headers.js'
+import {
+  clientIdentityHeaders,
+  deriveDeviceId,
+  DESKTOP_VERSION,
+  desktopHeaders,
+  desktopUserAgent,
+  INTL_DESKTOP_VERSION,
+  type UpstreamRealm,
+} from './headers.js'
 import {
   desktopChatSequence,
   desktopExpertActualUseEvent,
@@ -221,22 +229,25 @@ export async function realChat(
     stream_options: { include_usage: true },
   }
 
+  const realm: UpstreamRealm = ctx.uid.startsWith('workbuddy:') ? 'global' : 'cn'
+  const rawUid = realm === 'global' ? ctx.uid.replace(/^workbuddy:/, '') : ctx.uid
   const headers: Record<string, string> = {
     Authorization: `Bearer ${ctx.accessToken}`,
     'Content-Type': 'application/json',
     Accept: 'text/event-stream',
-    'User-Agent': desktopUserAgent(),
+    'User-Agent': desktopUserAgent(realm),
     'X-Domain': bases.chat,
     'X-Product': 'SaaS',
-    'X-User-Id': ctx.uid,
+    'X-User-Id': rawUid,
     'X-Conversation-ID': conversationId,
     'X-Request-ID': `${Date.now()}`,
     'X-Agent-Intent': 'craft',
     'X-Agent-Type': 'main',
     'X-IDE-Name': 'WorkBuddy',
     'X-IDE-Type': 'WorkBuddy',
-    'X-IDE-Version': '5.5.6',
+    'X-IDE-Version': realm === 'global' ? INTL_DESKTOP_VERSION : DESKTOP_VERSION,
     'x-codebuddy-request': '1',
+    ...clientIdentityHeaders(realm),
   }
   if (expertId !== '') headers['X-Expert-Id'] = expertId
 

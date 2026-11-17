@@ -20,7 +20,7 @@
  * | mp | `chat_request_send` | `ideType:"WorkBuddy_MP"`, `platform:"mini_program"` |
  */
 
-import { DESKTOP_VERSION } from './headers.js'
+import { desktopVersionTriple } from './headers.js'
 
 /** 事件是一个宽松的 map（上游字段多且会变，强类型反而碍事）。 */
 export type Event = Record<string, unknown>
@@ -30,6 +30,12 @@ export type Event = Record<string, unknown>
  *
  * ⚠️ `machineId` 必须是**由 uid 稳定派生**的 36 位 hex，不能每次随机 ——
  * 同账号每次生成不同设备标识本身就是风控信号。
+ *
+ * ⚠️ 版本三元组（`ideVersion` / `extVersion` / `commit` / `releaseDate`）必须通过
+ * `desktopVersionTriple(realm)` 与请求头 UA 同源对齐（`2fa6876`：CN `5.11.3`，国际 `5.9.4`）。
+ *
+ * ⚠️ `reportDelay` 与 `timestamp` 必须同时存在且为数值类型（参考 `xu20060420fan-cell` `188fee0`：
+ * 国际服桌面 `/v2/report` 缺任一字段即回 HTTP 400 `code=10001 event missing both reportDelay and timestamp fields`）。
  */
 export function desktopFingerprint(input: {
   uid: string
@@ -37,23 +43,27 @@ export function desktopFingerprint(input: {
   machineId: string
   sessionId: string
   now: number
+  realm?: string
+  reportDelay?: number
 }): Event {
+  const isGlobal = input.realm === 'global' || input.realm === 'intl' || input.realm === 'workbuddy'
+  const triple = desktopVersionTriple(isGlobal ? 'global' : 'cn')
   return {
     timezone: 'Asia/Shanghai',
-    reportDelay: 2000,
+    reportDelay: input.reportDelay ?? 2000,
     userId: input.uid,
     username: input.nickname,
     userNickname: input.nickname,
     product: 'SaaS',
-    releaseDate: 1789036585355,
-    commit: '5f9692923c93033111c51ad7b003eb80204a9b75',
+    releaseDate: triple.releaseDate,
+    commit: triple.commit,
     ideName: 'WorkBuddy',
     ideType: 'WorkBuddy',
-    ideVersion: DESKTOP_VERSION,
+    ideVersion: triple.version,
     machineId: input.machineId,
     sessionId: input.sessionId,
     extName: 'workbuddy-desktop',
-    extVersion: DESKTOP_VERSION,
+    extVersion: triple.version,
     os: 'win32',
     arch: 'x64',
     osVersion: '10.0.26220',
@@ -83,6 +93,8 @@ export function webFingerprint(input: { uid: string; machineId: string; now: num
  */
 export function mpFingerprint(input: { uid: string; nickname: string; now: number; machineId: string }): Event {
   return {
+    timezone: 'Asia/Shanghai',
+    reportDelay: 0,
     userId: input.uid,
     username: input.nickname,
     userNickname: input.nickname,
@@ -92,6 +104,9 @@ export function mpFingerprint(input: { uid: string; nickname: string; now: numbe
     machineId: input.machineId,
     extName: 'workbuddy-mp',
     extVersion: '2.2.8',
+    os: 'android',
+    osVersion: '14',
+    arch: 'arm64',
     product: 'SaaS',
     source: 'mini_program',
     timestamp: input.now,
@@ -472,10 +487,12 @@ export function webElementClickEvent(input: {
  *
  * ⚠️ 光名字对还不够，**载荷字段**也是判据的一部分：
  * - `buddyapp_show` / `buddyapp_enter_click` 要带 `elementId` / `elementName` / `position`
- * - `buddyapp_enter_click` 还要 `isFirstPage: '1'`
+ * - `buddyapp_enter_click` 的 `isFirstPage` **必须是布尔值 `true`**（严禁字符串 `'1'`！
+ *   参考 `misakano7545/workbuddy2api-panel` 提交 `8818458`、`L0NE-6/WorkBuddy-Daily` 提交 `0342041`：
+ *   上游计分器强校验布尔类型，传字符串 `'1'` 会返回 HTTP 200 `{code:0}` 但进度永远卡在 `0/1`）
  * - 全部带 `mode: 'LOCAL'` + `buddyId` / `buddyName`
  *
- * ⇒ **不要凭直觉拼事件名**。这类判据只能靠真机抓包或社区实测样本对齐，
+ * ⇒ **不要凭直觉拼事件名与字段类型**。这类判据只能靠真机抓包或社区实测样本对齐，
  *    拼错不会报错，只会「上报成功但永远不涨进度」。
  */
 export function desktopBuddyAppSequence(input: {
@@ -503,7 +520,7 @@ export function desktopBuddyAppSequence(input: {
       elementId: buddyId,
       elementName: buddyName,
       position: 2,
-      isFirstPage: '1',
+      isFirstPage: true,
     }),
     mk('buddyapp_auth_confirm_click', { elementId: buddyId, elementName: buddyName }),
     mk('buddyapp_bindaccount_skip_click', { elementId: buddyId, elementName: buddyName }),
@@ -625,7 +642,13 @@ export function desktopDesignCanvasEvents(input: { conversationId: string; now: 
 }
 
 /** 外观主题设置事件（`Hp_Appearance`）。 */
-export function desktopAppearanceSkinApplyEvent(input: { uid: string; machineId: string; sessionId: string; now: number }): Event {
+export function desktopAppearanceSkinApplyEvent(input: {
+  uid: string
+  machineId: string
+  sessionId: string
+  now: number
+  realm?: string
+}): Event {
   return {
     ...desktopFingerprint({
       uid: input.uid,
@@ -633,9 +656,151 @@ export function desktopAppearanceSkinApplyEvent(input: { uid: string; machineId:
       machineId: input.machineId,
       sessionId: input.sessionId,
       now: input.now,
+      ...(input.realm === undefined ? {} : { realm: input.realm }),
     }),
     eventCode: 'appearance_skin_apply',
     resourceKey: 'theme-tkmw7j',
+  }
+}
+
+// ─────────────────── 市场技能分享（skill_share）与小程序事件（Sequential_Tasks_*） ───────────────────
+
+/**
+ * 平台市场里的真实技能（`POST /portal/operation-platform/market/skill/list`）。
+ *
+ * ⚠️ `skillId` 必须取自市场真实条目，绝不能硬编码或随机编造（参考 `xu20060420fan-cell` `4271a8a`）。
+ */
+export interface MarketSkill {
+  skillId: string
+  name: string
+  displayNameZh: string
+  version: string
+  source: string
+}
+
+/**
+ * 国服 `skill_share`（「分享技能」+50 积分 +5 能量）的计分埋点事件。
+ *
+ * ## 实测四步判据链（对齐 `xu20060420fan-cell` `4271a8a` 与 `L0NE-6/WorkBuddy-Daily` `68cbb25`）
+ *
+ * 1. 先 `accept` 任务 `skill_share`（未 accept 时 `target=0`，发了事件也不计分）；
+ * 2. 拉市场真实技能列表取 `MarketSkill`；
+ * 3. `POST /api/v2/open-platform/asset-shares/c2c/channels` 创建 C2C 分享通道拿到真实 `channelId`；
+ * 4. 上报本事件 `skill_share_channel_action`：
+ *    - `action` 必须为 `'wechat'`（`'copy_link'` 不计分）；
+ *    - `panelAction` 必须为 `'success'`；
+ *    - `id` 必须填第 3 步返回的真实 `channel_id`（客户端源码 `renderer/assets/index-*.js` 的 `share_id` 校验）。
+ */
+export function desktopSkillShareChannelActionEvent(input: {
+  skill: MarketSkill
+  channelId: string
+  now: number
+}): Event {
+  const skillName = input.skill.displayNameZh || input.skill.name || input.skill.skillId
+  const skillType = input.skill.source !== '' ? input.skill.source : 'market'
+  return {
+    eventCode: 'skill_share_channel_action',
+    action: 'wechat',
+    panelAction: 'success',
+    panelType: 'mini_program_card',
+    entry: 'skill_detail',
+    id: input.channelId,
+    skillId: input.skill.skillId,
+    skillName,
+    skillType,
+    skillSource: skillType,
+    status: 'safe',
+    isSuccessful: true,
+    actionSuccessful: true,
+    cost: 0,
+    actionAt: input.now,
+    timestamp: input.now,
+    presentAt: input.now,
+  }
+}
+
+/**
+ * 小程序 `Sequential_Tasks_1`（「小程序首对话」+100 积分 +5 能量）零消耗事件。
+ *
+ * 对齐 `misakano7545/workbuddy2api-panel` `school.go:MpChatRequestEvent` 与 `L0NE-6/WorkBuddy-Daily` `t_mp_seq1`：
+ * 通过 `mpFingerprint` + `reportMp`（`www.codebuddy.cn/v2/report`）上报即可点亮，零模型配额消耗。
+ */
+export function mpChatRequestEvent(input: {
+  conversationId: string
+  requestId: string
+  now: number
+  modelId?: string
+  modelName?: string
+}): Event {
+  const modelId = input.modelId !== undefined && input.modelId !== '' ? input.modelId : 'deepseek-v4-flash'
+  const modelName = input.modelName !== undefined && input.modelName !== '' ? input.modelName : modelId
+  const requestId = input.requestId !== '' ? input.requestId : input.conversationId
+  return {
+    eventCode: 'chat_request_send',
+    mode: 'chat',
+    conversationId: input.conversationId,
+    requestId,
+    messageId: `msg-${requestId.slice(-8)}`,
+    inputLength: 12,
+    requestModelId: modelId,
+    requestModelName: modelName,
+    isPlan: false,
+    isAutoExecuteTerminal: false,
+    isAutoModify: false,
+    codebaseEnable: false,
+    maxToken: 0,
+    maxSteps: 500,
+    temperature: 0,
+    maxRetries: 0,
+    mentionContexts: [],
+    knowledgeId: [],
+    knowledgeName: [],
+    codebaseId: '',
+    mentionContextCount: 0,
+    command: '',
+    expertId: '',
+    recommendId: '',
+    skillId: '',
+    skillCount: 0,
+    totalCount: 0,
+    fileUri: '',
+    traceId: requestId,
+    rootRequestId: requestId,
+    parentConversationId: input.conversationId,
+    agentName: 'mp',
+    agentType: 'main',
+    'codebuddy.session_id': input.conversationId,
+    'codebuddy.conversation_request_id': requestId,
+    reportDelay: 0,
+    timestamp: input.now,
+    presentAt: input.now,
+  }
+}
+
+/**
+ * 小程序 `Sequential_Tasks_2`（「小程序使用专家」+200 积分 +5 能量）零消耗事件。
+ *
+ * 对齐 `school.go:MpExpertActualUseEvent` 与 `workbuddy_daily.py:t_mp_seq2`：
+ * 需先从市场取真实 `expertId`（不需发真实对话），以 `mpFingerprint` + `reportMp` 上报即可点亮。
+ */
+export function mpExpertActualUseEvent(input: {
+  expertId: string
+  expertTitle: string
+  expertType?: string
+  now: number
+}): Event {
+  return {
+    eventCode: 'expert_actual_use',
+    id: input.expertId,
+    name: input.expertId,
+    expertTitle: input.expertTitle,
+    type: 'send_message',
+    characterCount: 12,
+    expertType: input.expertType !== undefined && input.expertType !== '' ? input.expertType : 'agent',
+    extVersion: '2.2.8',
+    reportDelay: 0,
+    timestamp: input.now,
+    presentAt: input.now,
   }
 }
 

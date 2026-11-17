@@ -14,6 +14,7 @@ export interface RoutingConfig {
   softCooldownSeconds: number
   autoTaskCron: boolean
   autoRefreshCredential: boolean
+  autoContinuation?: boolean
 }
 
 export function useRoutingConfig() {
@@ -77,6 +78,40 @@ export function useSaveSafety() {
       })
     },
     onError: (e) => toast.error('保存失败', { description: e.message }),
+  })
+}
+
+export interface CorsConfig {
+  enabled: boolean
+  origins: string[]
+  maxAge: number
+  source: 'runtime' | 'env'
+  envOrigins: string[]
+}
+
+export function useCorsConfig() {
+  return useQuery({
+    queryKey: ['cors-config'],
+    queryFn: () => api<{ config: CorsConfig }>('/admin/config/cors').then((r) => r.config),
+    staleTime: 60_000,
+  })
+}
+
+export function useSaveCorsConfig() {
+  const qc = useQueryClient()
+  return useMutation<
+    CorsConfig,
+    Error,
+    { enabled?: boolean; origins?: string[] | string; maxAge?: number; resetToEnv?: boolean }
+  >({
+    mutationFn: (v) => api<{ config: CorsConfig }>('/admin/config/cors', { json: v }).then((r) => r.config),
+    onSuccess: (cfg) => {
+      qc.setQueryData(['cors-config'], cfg)
+      toast.success('数据面跨域配置已生效', {
+        description: cfg.enabled ? `当前放行 ${cfg.origins.join(', ')}` : '当前已关闭浏览器跨域访问。',
+      })
+    },
+    onError: (e) => toast.error('保存跨域配置失败', { description: e.message }),
   })
 }
 

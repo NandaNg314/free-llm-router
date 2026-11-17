@@ -10,7 +10,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isChallengePage } from '../src/upstream/client.ts'
-import { htmlToMarkdown, rankByRelevance, tokenize } from '../src/upstream/media.ts'
+import { CARD_SEARCH_BASE, htmlToMarkdown, normalizeSearchPayload, rankByRelevance, tokenize } from '../src/upstream/media.ts'
 
 // ─────────────────────── 反爬盾识别 ───────────────────────
 
@@ -119,4 +119,69 @@ test('tokenize：英文停用词与单个中文虚词不参与打分', () => {
   assert.ok(!tokens.includes('the'), '英文停用词应剔除')
   assert.ok(!tokens.includes('的'), '中文虚词单字应剔除')
   assert.ok(tokens.includes('router'))
+})
+
+// ─────────────────────── 答案卡片占位链接去重 (d2708ca) 与 total_results 修正 (3fd3680) ───────────────────────
+
+test('🔴 搜索卡片改写（d2708ca）：单张卡片不加后缀，多张卡片追加 #card-N 防止按 URL 去重误吞', () => {
+  // 1. 单张空 URL 卡片：链接保持干净，不带 #card-1
+  const single = normalizeSearchPayload(
+    {
+      query: '宁德时代 股价',
+      results: [
+        { title: 'A股行情指标', url: '', snippet: '185.00 CNY' },
+        { title: '财经新闻', url: 'https://finance.example.com/1', snippet: '宁德时代最新动态' },
+      ],
+      total_results: 2,
+    },
+    '宁德时代 股价',
+    false,
+  )
+  const expectedBase = `${CARD_SEARCH_BASE}${encodeURIComponent('宁德时代 股价')}`
+  assert.equal(single.results.length, 2)
+  assert.equal(single.results[0]?.url, expectedBase, '单张卡片不应带 #card-1 后缀')
+  assert.equal(single.results[1]?.url, 'https://finance.example.com/1')
+
+  // 2. 同一响应含两张空 URL 卡片：必须追加 #card-1 / #card-2 保证 URL 互不相同
+  const multi = normalizeSearchPayload(
+    {
+      query: '宁德时代 股价 比亚迪 股价',
+      results: [
+        { title: 'A股行情指标', url: '', snippet: 'A股数据' },
+        { title: '港股行情指标', url: '', snippet: '港股数据' },
+        { title: '网页报道', url: 'https://x.example/1', snippet: '对比分析' },
+      ],
+      total_results: 3,
+    },
+    '宁德时代 股价 比亚迪 股价',
+    false,
+  )
+  const multiBase = `${CARD_SEARCH_BASE}${encodeURIComponent('宁德时代 股价 比亚迪 股价')}`
+  assert.equal(multi.results.length, 3)
+  assert.equal(multi.results[0]?.url, `${multiBase}#card-1`)
+  assert.equal(multi.results[1]?.url, `${multiBase}#card-2`)
+  assert.notEqual(multi.results[0]?.url, multi.results[1]?.url)
+  assert.equal(multi.results[2]?.url, 'https://x.example/1', '正常网页条目 URL 不得被篡改')
+})
+
+test('🔴 total_results 差值修正（3fd3680）：丢弃坏卡片时只扣减丢弃数并取下限，未给时不凭空捏造', () => {
+  const rawResults = [
+    { title: '', url: '', snippet: '无词可改写的脏卡片' },
+    { title: '正常条目', url: 'https://x.example/ok', snippet: '有效正文' },
+  ]
+
+  // 1. total_results (5) > 本页剩余条数 (1)：扣掉丢弃的 1 条得 4，绝不覆盖成 1
+  const gt = normalizeSearchPayload({ query: '', results: rawResults, total_results: 5 }, 'q', false)
+  assert.equal(gt.results.length, 1)
+  assert.equal(gt.total, 4)
+
+  // 2. total_results (0) 扣减后小于剩余条数 (1)：取剩余条数作为下限 1
+  const floor = normalizeSearchPayload({ query: '', results: rawResults, total_results: 0 }, 'q', false)
+  assert.equal(floor.results.length, 1)
+  assert.equal(floor.total, 1)
+
+  // 3. 上游未提供 total_results：保持 undefined，绝不凭空编造
+  const absent = normalizeSearchPayload({ query: '', results: rawResults }, 'q', false)
+  assert.equal(absent.results.length, 1)
+  assert.equal(absent.total, undefined)
 })

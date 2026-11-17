@@ -9,7 +9,14 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseCredential, qoderProvider, qodercnProvider } from '../src/providers/qoder.ts'
+import {
+  encodeQoderHeaderValue,
+  parseCredential,
+  qoderProvider,
+  qodercnProvider,
+  qoderRuntimeInfoEnv,
+  sanitizeQoderHeaders,
+} from '../src/providers/qoder.ts'
 
 interface Call { url: string; method: string; headers: Record<string, string>; body: unknown }
 
@@ -113,4 +120,57 @@ test('claim 回 replayed / 409 / ALREADY_CLAIMED → 已领；status 非 CLAIMED
       else await assert.rejects(p, /PENDING/)
     } finally { m.restore() }
   }
+})
+
+function decodeLatin1Utf8(byteString: string): string {
+  const bytes = Uint8Array.from(byteString, (ch) => ch.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
+}
+
+test('🔴 Unicode 中文/重音计算机名（Cosy-MachineHostname）不会使 fetch/Headers 抛 ByteString TypeError，且原样承载 UTF-8 字节', async () => {
+  const unicodeHostname = '小林的电脑-café'
+  const cred = parseCredential({
+    access_token: 'tok',
+    uid: 'u1',
+    machineToken: 'mt-real',
+    machineType: 'win32',
+    machineCode: 'mc-1',
+    machineHostname: unicodeHostname,
+  })
+  const m = mockFetch((c) =>
+    c.method === 'GET'
+      ? json(claimable)
+      : json({ status: 'CLAIMED', benefit: { amount: 100 } }),
+  )
+  try {
+    const r = await qoderProvider.checkin!(cred, AbortSignal.timeout(5_000))
+    assert.equal(r.alreadyDone, false)
+    assert.equal(r.gained, 100)
+    assert.equal(m.calls.length, 2)
+    for (const call of m.calls) {
+      const rawHeader = call.headers['cosy-machinehostname']
+      assert.ok(rawHeader !== undefined && rawHeader !== '', '应携带 Cosy-MachineHostname')
+      assert.equal(decodeLatin1Utf8(rawHeader!), unicodeHostname, 'UTF-8 字节解码后必须与原中文主机名完全一致')
+    }
+  } finally {
+    m.restore()
+  }
+})
+
+test('🔴 请求头 CR/LF/NUL 注入仍被严格拦截（防头行注入），且编码幂等', () => {
+  const once = encodeQoderHeaderValue('电脑-café')
+  const twice = encodeQoderHeaderValue(once)
+  assert.equal(once, twice, '已编码为 Latin-1 ByteString 的值再次编码必须幂等，不得二次编码')
+  assert.equal(decodeLatin1Utf8(once), '电脑-café')
+
+  assert.throws(() => encodeQoderHeaderValue('PC\r\nInjected: yes'), /控制字符/)
+  assert.throws(() => sanitizeQoderHeaders({ 'Cosy-MachineHostname': 'PC\nBad: 1' }), /控制字符/)
+  assert.throws(() => sanitizeQoderHeaders({ 'Bad\rKey': 'ok' }), /控制字符/)
+})
+
+test('runtime-info 环境码：国际版固定 3，国内版固定 0（对齐 f46a277）', () => {
+  assert.equal(qoderRuntimeInfoEnv('qoder'), '3')
+  assert.equal(qoderRuntimeInfoEnv('intl'), '3')
+  assert.equal(qoderRuntimeInfoEnv('qodercn'), '0')
+  assert.equal(qoderRuntimeInfoEnv('cn'), '0')
 })

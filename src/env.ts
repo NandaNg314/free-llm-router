@@ -74,6 +74,35 @@ export interface Env {
    * ⚠️ `0` 或负数 = **关闭**该检测（见 `resolveBurnRate`）。
    */
   BURN_RATE_THRESHOLD_PCT?: string
+
+  /** 单账号出站 QPS 上限与随机抖动（见 `gateway/safety.ts`）。 */
+  RATE_LIMIT_QPS?: string
+  RATE_JITTER_MS?: string
+
+  /**
+   * 数据面（`/v1/*`、`/mcp`）允许跨域访问的浏览器来源白名单。
+   *
+   * - 未设置或空串：默认关闭跨域（同源或非浏览器直连不受影响）；
+   * - `*`：允许任意来源（数据面仅用 Bearer / `x-api-key`，绝不附带 `Access-Control-Allow-Credentials`）；
+   * - 逗号分隔的来源列表：如 `https://app.example.com, http://localhost:3000`。
+   *
+   * ⚠️ 管理面 `/admin/*` 与面板 `/panel/*` **永不**受此项放开。
+   */
+  CORS_ORIGINS?: string
+
+  /**
+   * 流式截断自动续写与预告句悬停救援开关（默认 `false` 保守关闭，避免意外多耗配额；
+   * 显式设为 `1` / `true` / `on` 开启，也可通过路由配置覆盖）。
+   */
+  AUTO_CONTINUATION?: string
+
+  /** 混元 3D 临时云凭证自动签发与手工 STS / Token 覆盖（见 `upstream/three-d.ts`）。 */
+  THREE_D_AUTO_TOKEN?: string
+  THREE_D_TEMP_TOKEN?: string
+  THREE_D_TEMP_TOKENS?: string
+  THREE_D_STS_SECRET_ID?: string
+  THREE_D_STS_SECRET_KEY?: string
+  THREE_D_STS_TOKEN?: string
 }
 
 /** CN 域默认上游（与 Go 侧 `internal/upstream/client.go:693-695` 一致）。 */
@@ -269,4 +298,57 @@ export function resolveUpstream(env: Env): UpstreamBases {
     billing: parseString(env.UPSTREAM_BILLING_BASE, DEFAULT_UPSTREAM.billing),
     web: parseString(env.UPSTREAM_WEB_BASE, DEFAULT_UPSTREAM.web),
   }
+}
+
+/**
+ * 归一化并校验单个 CORS 来源条目。
+ *
+ * - `'*'` 原样保留；
+ * - 合法 `http://` / `https://` 来源归一为标准 ASCII origin（小写 scheme/host、削尾斜杠、去默认端口）；
+ * - 拒绝 `'null'`、超长串、含凭据/路径/查询串/锚点/空白/引号的非法值，返回 `''`。
+ */
+export function normalizeCorsOrigin(raw: string): string {
+  const text = raw.trim()
+  if (text === '') return ''
+  if (text === '*') return '*'
+  if (text.toLowerCase() === 'null' || text.length > 256) return ''
+  if (/[\s"'<>,;\\]/.test(text)) return ''
+  const stripped = text.replace(/\/+$/, '')
+  try {
+    const u = new URL(stripped)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return ''
+    if (u.username !== '' || u.password !== '') return ''
+    if (u.pathname !== '/' || u.search !== '' || u.hash !== '') return ''
+    return u.origin
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 解析逗号或换行分隔的 CORS 来源白名单（去重保序，忽略空项与非法项）。
+ */
+export function parseCorsOrigins(raw: string | readonly string[] | undefined): string[] {
+  if (raw === undefined) return []
+  const items = typeof raw === 'string' ? raw.split(/[,\r\n]+/) : raw
+  const out: string[] = []
+  for (const item of items) {
+    if (typeof item !== 'string') continue
+    const clean = normalizeCorsOrigin(item)
+    if (clean !== '' && !out.includes(clean)) {
+      out.push(clean)
+      if (out.length >= 64) break
+    }
+  }
+  return out
+}
+
+/** 从 `Env` 解析数据面 CORS 来源白名单（默认空数组 = 不开启跨域）。 */
+export function resolveCorsOrigins(env: Env): string[] {
+  return parseCorsOrigins(env.CORS_ORIGINS)
+}
+
+/** 从 `Env` 解析流式自动续写默认开关（默认 `false` 保守策略）。 */
+export function resolveAutoContinuation(env: Env): boolean {
+  return parseEnabled(env.AUTO_CONTINUATION, false)
 }

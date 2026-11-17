@@ -184,7 +184,7 @@ function SheetBody({ provider, accounts, initialTab }: { provider: Provider; acc
               )
             )}
             <section>
-              <h3 className="mb-3 text-[13px] font-medium">{provider.capabilities.login ? '或者：导入凭据 JSON' : '导入凭据 JSON'}</h3>
+              <h3 className="mb-3 text-[13px] font-medium">{provider.capabilities.login ? '或者：导入凭据 / 令牌' : '导入凭据 / 令牌'}</h3>
               <ImportForm provider={provider.id} onDone={() => setTab('accounts')} />
             </section>
           </div>

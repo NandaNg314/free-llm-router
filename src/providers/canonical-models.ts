@@ -147,6 +147,15 @@ export const CANONICAL_OVERRIDES: Readonly<Record<string, Readonly<Record<string
   // 它的展示名 `DeepSeek-Flash` 归一后是 `deepseek-flash`，与 `deepseek-v4-1-flash`
   // 是两个键 ⇒ 必须在这里并掉。
   qoder: { dfmodel: 'deepseek-v4-1-flash' },
+
+  // ModelScope 在役版本带渠道日期后缀（如 `-1017` / `-0813`），显式归并到通用规范键，
+  // 使 `aggregate/deepseek-v4-1-flash` 等聚合路由自动纳入魔搭免费池。
+  modelscope: {
+    'deepseek-ai/DeepSeek-V4.1-Flash-1017': 'deepseek-v4-1-flash',
+    'deepseek-v4-1-flash-1017': 'deepseek-v4-1-flash',
+    'deepseek-ai/DeepSeek-V4-Pro-0813': 'deepseek-v4-pro',
+    'deepseek-v4-pro-0813': 'deepseek-v4-pro',
+  },
 }
 
 /**
@@ -160,6 +169,8 @@ export const CANONICAL_NAMES: Readonly<Record<string, string>> = {
   'deepseek-v4-flash': 'DeepSeek V4 Flash',
   'deepseek-v4-flash-0731': 'DeepSeek V4 Flash 0731',
   'deepseek-v4-pro': 'DeepSeek V4 Pro',
+  'deepseek-v3-2': 'DeepSeek V3.2',
+  'deepseek-r1-0528': 'DeepSeek R1 0528',
   'deepseek-flash': 'DeepSeek Flash',
   'deepseek-v4-flash-official': 'DeepSeek V4 Flash Official',
   'glm-5-3': 'GLM-5.3',
@@ -182,6 +193,7 @@ export const CANONICAL_NAMES: Readonly<Record<string, string>> = {
   'minimax-m3-1-flash-preview': 'MiniMax M3.1 Flash Preview',
   'minimax-m2-7': 'MiniMax M2.7',
   'minimax-m2-7-highspeed': 'MiniMax M2.7 HighSpeed',
+  'minimax-m2-5': 'MiniMax M2.5',
   'qwen-3-8-max': 'Qwen 3.8 Max',
   'qwen3-8-flash': 'Qwen3.8 Flash',
   'qwen3-8-max': 'Qwen3.8 Max',
@@ -190,6 +202,9 @@ export const CANONICAL_NAMES: Readonly<Record<string, string>> = {
   'qwen3-7-plus': 'Qwen3.7 Plus',
   'qwen3-7-flash': 'Qwen3.7 Flash',
   'qwen3-6-plus': 'Qwen3.6 Plus',
+  'qwen3-5-plus': 'Qwen3.5 Plus',
+  'qwen3-coder-plus': 'Qwen3 Coder Plus',
+  'qwen3-5-vl-72b-instruct': 'Qwen3.5 VL 72B Instruct',
   'gemini-3-8-flash': 'Gemini 3.8 Flash',
   'gemini-3-5-flash': 'Gemini 3.5 Flash',
   'hy4-preview': 'Hy4 Preview',
@@ -246,8 +261,8 @@ export function canonicalKeyFor(
   const patch = Object.hasOwn(CANONICAL_OVERRIDES, provider)
     ? CANONICAL_OVERRIDES[provider]
     : undefined
-  if (patch !== undefined && Object.hasOwn(patch, realId)) {
-    const patched = patch[realId] as string
+  if (patch !== undefined && (Object.hasOwn(patch, realId) || Object.hasOwn(patch, idKey))) {
+    const patched = (Object.hasOwn(patch, realId) ? patch[realId] : patch[idKey]) as string
     if (EXCLUDED_ALIASES.has(patched)) return undefined
     return { key: patched, via: 'patch' }
   }

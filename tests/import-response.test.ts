@@ -61,3 +61,60 @@ test('🔴 导入全失败必须回非 2xx（否则面板照弹「账号已导�
     for (const f of [tmp, `${tmp}-wal`, `${tmp}-shm`]) fs.rmSync(f, { force: true })
   }
 })
+
+test('POST /admin/import：支持直接粘贴裸访问令牌 / API Key（如 ModelScope ms-... 与 Gemini AIzaSy...）', async () => {
+  const tmp = path.join(os.tmpdir(), `import-bare-${Date.now()}.db`)
+  const originalApiKey = process.env.API_KEY
+  const originalCredKey = process.env.CREDENTIAL_KEY
+  process.env.API_KEY = 'import-bare-key'
+  process.env.CREDENTIAL_KEY = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+  const originalLog = console.log
+  console.log = () => {}
+  const { server, runtime } = startServer({ port: 0, host: '127.0.0.1', databasePath: tmp, autoCron: false })
+  await new Promise<void>((resolve) => {
+    if (server.listening) resolve()
+    else server.once('listening', () => resolve())
+  })
+  const addr = server.address()
+  assert.ok(addr && typeof addr === 'object')
+  const base = `http://127.0.0.1:${addr.port}`
+  try {
+    // 1. 面板转换后的 { accounts: [bareLine1, bareLine2] } 形态
+    const res1 = await fetch(`${base}/admin/import`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer import-bare-key', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        accounts: [
+          'ms-1234567890abcdef1234567890abcdef',
+          'AIzaSyD-1234567890abcdefABCDEF123456789',
+        ],
+      }),
+    })
+    assert.equal(res1.status, 200)
+    const body1 = (await res1.json()) as { imported: Array<{ provider: string }> }
+    assert.deepEqual(
+      body1.imported.map((item) => item.provider),
+      ['modelscope', 'gemini'],
+    )
+
+    // 2. 直接传裸字符串 JSON 字面量（多行）也能兼容解析
+    const res2 = await fetch(`${base}/admin/import`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer import-bare-key', 'content-type': 'application/json' },
+      body: JSON.stringify('ms-abcdef1234567890abcdef1234567890\n# comment\n'),
+    })
+    assert.equal(res2.status, 200)
+    const body2 = (await res2.json()) as { imported: Array<{ provider: string }> }
+    assert.equal(body2.imported.length, 1)
+    assert.equal(body2.imported[0]?.provider, 'modelscope')
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    runtime.db.close()
+    console.log = originalLog
+    if (originalApiKey === undefined) delete process.env.API_KEY
+    else process.env.API_KEY = originalApiKey
+    if (originalCredKey === undefined) delete process.env.CREDENTIAL_KEY
+    else process.env.CREDENTIAL_KEY = originalCredKey
+    for (const f of [tmp, `${tmp}-wal`, `${tmp}-shm`]) fs.rmSync(f, { force: true })
+  }
+})

@@ -24,7 +24,10 @@ import {
   desktopDesignCanvasEvents,
   desktopFingerprint,
   desktopPlaybookEvents,
+  desktopSkillShareChannelActionEvent,
   desktopTemplateUseEvents,
+  mpChatRequestEvent,
+  mpExpertActualUseEvent,
   mpFingerprint,
   newIds,
   webElementClickEvent,
@@ -136,14 +139,30 @@ test('桌面事件链：三键贯穿（服务端靠它 join）', () => {
   assert.equal(response?.parentConversationId, 'conv-x')
 })
 
-test('桌面指纹：ideName/ideType/extName 是判别字段', () => {
-  const fp = desktopFingerprint({ uid: 'u1', nickname: 'n', machineId: 'm36', sessionId: 's36', now: NOW })
-  assert.equal(fp.ideName, 'WorkBuddy')
-  assert.equal(fp.ideType, 'WorkBuddy')
-  assert.equal(fp.extName, 'workbuddy-desktop')
-  assert.equal(fp.machineId, 'm36')
-  assert.equal(fp.userId, 'u1')
-  assert.equal(fp.product, 'SaaS')
+test('桌面指纹：ideName/ideType/extName 是判别字段，且按 realm 对齐版本三元组与数值 reportDelay', () => {
+  const fpCn = desktopFingerprint({ uid: 'u1', nickname: 'n', machineId: 'm36', sessionId: 's36', now: NOW })
+  assert.equal(fpCn.ideName, 'WorkBuddy')
+  assert.equal(fpCn.ideType, 'WorkBuddy')
+  assert.equal(fpCn.extName, 'workbuddy-desktop')
+  assert.equal(fpCn.machineId, 'm36')
+  assert.equal(fpCn.userId, 'u1')
+  assert.equal(fpCn.product, 'SaaS')
+  assert.equal(fpCn.ideVersion, '5.11.3')
+  assert.equal(fpCn.extVersion, '5.11.3')
+  assert.equal(fpCn.commit, 'ecace0f7028166695994300182295329b8b95449')
+  assert.equal(fpCn.releaseDate, 1794502169764)
+  assert.equal(typeof fpCn.reportDelay, 'number')
+  assert.equal(fpCn.timestamp, NOW)
+
+  const fpGl = desktopFingerprint({
+    uid: 'u1', nickname: 'n', machineId: 'm36', sessionId: 's36', now: NOW, realm: 'global',
+  })
+  assert.equal(fpGl.ideVersion, '5.9.4')
+  assert.equal(fpGl.extVersion, '5.9.4')
+  assert.equal(fpGl.commit, 'fa0a0901906addaa1a4259f6df347388a5563ded')
+  assert.equal(fpGl.releaseDate, 1793288804029)
+  assert.equal(typeof fpGl.reportDelay, 'number')
+  assert.equal(fpGl.timestamp, NOW)
 })
 
 test('⚠️ mp 指纹：ideType / platform / source 是判别字段', () => {
@@ -173,13 +192,56 @@ test('web 指纹：machineId 与 userId 存在', () => {
   assert.equal(fp.userId, 'u1')
 })
 
-test('Buddy 应用链：5 个事件，mode=LOCAL', () => {
+test('🔴 Buddy 应用链：5 个事件，mode=LOCAL，且 buddyapp_enter_click.isFirstPage 必须是布尔值 true', () => {
+  // 参考 misakano7545/workbuddy2api-panel@8818458 与 L0NE-6/WorkBuddy-Daily@0342041：
+  // 上游计分器强校验布尔类型，传字符串 '1' 返回 200 但进度永远卡在 0/1。
   const chain = desktopBuddyAppSequence({ conversationId: 'c1', buddyId: 'b1', now: NOW })
   assert.equal(chain.length, 5)
   for (const ev of chain) {
     assert.equal(ev.mode, 'LOCAL')
     assert.equal(ev.buddyId, 'b1')
   }
+  const enter = chain.find((e) => e.eventCode === 'buddyapp_enter_click')
+  assert.notEqual(enter, undefined)
+  assert.equal(typeof enter?.isFirstPage, 'boolean', 'isFirstPage 绝不能是字符串 "1"')
+  assert.equal(enter?.isFirstPage, true)
+})
+
+test('🔴 skill_share 埋点事件：action="wechat"、panelAction="success"、id=channelId', () => {
+  const ev = desktopSkillShareChannelActionEvent({
+    skill: {
+      skillId: 'skill_real_123',
+      name: 'daily-writer',
+      displayNameZh: '日报助手',
+      version: '1.2.0',
+      source: 'market',
+    },
+    channelId: 'ch_real_999',
+    now: NOW,
+  })
+  assert.equal(ev.eventCode, 'skill_share_channel_action')
+  assert.equal(ev.action, 'wechat')
+  assert.equal(ev.panelAction, 'success')
+  assert.equal(ev.panelType, 'mini_program_card')
+  assert.equal(ev.id, 'ch_real_999')
+  assert.equal(ev.skillId, 'skill_real_123')
+  assert.equal(ev.skillName, '日报助手')
+  assert.equal(ev.isSuccessful, true)
+  assert.equal(ev.actionSuccessful, true)
+})
+
+test('小程序顺序任务事件：Sequential_Tasks_1 / Sequential_Tasks_2 形状锁死', () => {
+  const seq1 = mpChatRequestEvent({ conversationId: 'mp-c1', requestId: 'r12345678', now: NOW })
+  assert.equal(seq1.eventCode, 'chat_request_send')
+  assert.equal(seq1.mode, 'chat')
+  assert.equal(seq1.agentName, 'mp')
+  assert.equal(seq1.agentType, 'main')
+
+  const seq2 = mpExpertActualUseEvent({ expertId: 'ex_1', expertTitle: '运营专家', now: NOW })
+  assert.equal(seq2.eventCode, 'expert_actual_use')
+  assert.equal(seq2.id, 'ex_1')
+  assert.equal(seq2.type, 'send_message')
+  assert.equal(seq2.extVersion, '2.2.8')
 })
 
 test('模板使用：chat 链 + 2 个任务事件（缺链上游不计分）', () => {

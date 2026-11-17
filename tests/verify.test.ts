@@ -17,8 +17,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { CLAIM_POLL_ATTEMPTS, CLAIM_POLL_GAP_MS } from '../src/taskrunner/verify.ts'
-import { planByName, planGrowth, zeroCostActions } from '../src/taskrunner/plans.ts'
-import { registeredActions } from '../src/taskrunner/actions.ts'
+import { planByName, planGrowth, REAL_CHAT_ACTIONS, zeroCostActions } from '../src/taskrunner/plans.ts'
 import { NEEDS_REAL_CHAT, registeredActions } from '../src/taskrunner/actions.ts'
 import { effectiveAccessToken, needsCredentialFetch } from '../src/taskrunner/steps.ts'
 import type { Env } from '../src/env.ts'
@@ -404,4 +403,18 @@ test('🔴 计划里必须有 acceptPending（上游只给「已接受」的任�
   const registered = registeredActions()
   assert.ok(registered.includes('acceptPending'),
     `⚠️ actions.ts 的 ACTIONS 表里必须有 acceptPending，实际有：${registered.join(', ')}`)
+})
+
+test('🔴 skill_share 与小程序零消耗任务已入队 ZERO_COST_ACTIONS，过期任务 WorkBuddy_Valorant 已从默认执行表移除', () => {
+  const zeroCodes = zeroCostActions().map((a) => a.code)
+  assert.ok(zeroCodes.includes('skill_share'), 'skill_share 必须在 ZERO_COST_ACTIONS 中')
+  assert.ok(zeroCodes.includes('Sequential_Tasks_1'), 'Sequential_Tasks_1 必须在 ZERO_COST_ACTIONS 中')
+  assert.ok(zeroCodes.includes('Sequential_Tasks_2'), 'Sequential_Tasks_2 必须在 ZERO_COST_ACTIONS 中')
+
+  const realCodes = REAL_CHAT_ACTIONS.map((a) => a.code)
+  assert.equal(realCodes.includes('WorkBuddy_Valorant'), false, '已截止的 WorkBuddy_Valorant 不应再默认每轮空跳')
+  const fullSteps = planGrowth({ includeRealChat: true })
+  assert.equal(fullSteps.some((s) => s.code === 'WorkBuddy_Valorant'), false)
+  // 但保留 action 注册以防未来返场
+  assert.ok(registeredActions().includes('valorantExpert'), 'valorantExpert 仍保留注册以防返场')
 })

@@ -27,7 +27,7 @@
  */
 import type { Env } from '../env.js'
 import { callUpstream, classify, isChallengePage, UpstreamError } from './client.js'
-import { desktopHeaders } from './headers.js'
+import { clientIdentityHeaders, DESKTOP_VERSION, desktopHeaders } from './headers.js'
 
 /** 国际版 web 域（**固定**，不跟随 `UPSTREAM_WEB_BASE`）。 */
 export const INTl_WEB_BASE = 'https://www.workbuddy.ai'
@@ -64,9 +64,12 @@ export interface ImageGenResult {
 /** 联网检索结果（满足 DSH Search API 契约）。 */
 export interface SearchResult {
   query: string
-  results: Array<{ title: string; url: string; snippet: string; date: null }>
+  results: Array<{ title: string; url: string; snippet: string; date: string | null }>
   total: number | undefined
 }
+
+/** 空 URL 答案卡片改写的基础检索地址（对齐 workbuddy2api-panel d2708ca）。 */
+export const CARD_SEARCH_BASE = 'https://cn.bing.com/search?q='
 
 /** 网页抓取结果（满足 DSH Fetch API 契约）。 */
 export interface FetchResult {
@@ -91,7 +94,8 @@ function buildCnAgentToolHeaders(uid: string, accessToken: string, enterpriseId?
     'X-Requested-With': 'XMLHttpRequest',
     'X-IDE-Type': 'WorkBuddy',
     'X-IDE-Name': 'WorkBuddy',
-    'X-IDE-Version': '5.8.3',
+    'X-IDE-Version': DESKTOP_VERSION,
+    ...clientIdentityHeaders('cn'),
     'X-Private-Data': 'true',
     'X-Codebuddy-Request': '1',
     'X-Agent-Intent': 'craft',
@@ -123,7 +127,7 @@ async function mediaCall<T = unknown>(
   const endpointBase = isCn ? CN_AGENT_TOOL_BASE : base
   const headers = isCn
     ? buildCnAgentToolHeaders(ctx.uid, ctx.accessToken, ctx.enterpriseId)
-    : desktopHeaders({ uid: ctx.uid.replace(/^workbuddy:/, ''), accessToken: ctx.accessToken })
+    : desktopHeaders({ uid: ctx.uid.replace(/^workbuddy:/, ''), accessToken: ctx.accessToken, realm: 'global' })
   const res = await callUpstream({
     method: 'POST',
     url: `${endpointBase}${path}`,
@@ -409,6 +413,87 @@ export function rankByRelevance<T extends { title: string; url: string; snippet:
 }
 
 /**
+ * 归一化上游 `/agenttool/v1/search` 载荷（纯函数，便于单测）。
+ *
+ * 对齐 `workbuddy2api-panel` 提交 `d2708ca` 与 `3fd3680`：
+ * 1. **空 URL 答案卡片改写与多卡片去重（`d2708ca`）**：
+ *    上游结构化卡片（如股价/天气表）`url` 为空，优先按检索词 `query`（空则回退 `title`，再空回退 `site`）
+ *    改写为等价检索链接；当同一响应存在 **≥2 张卡片** 时依次追加 `#card-1`、`#card-2`…，
+ *    避免客户端（如 `dsh-free-search`）按 URL 去重误吞后续卡片；仅 1 张卡片时不加后缀。
+ * 2. **`total_results` 差值修正（`3fd3680`）**：
+ *    当无法改写的坏卡片被丢弃时，`total_results` 只扣减实际丢弃条数并取 `results.length` 下限
+ *    （`Math.max(total - dropped, results.length)`），不直接覆盖成当页条数；上游未给 `total_results` 时保持 `undefined`。
+ */
+export function normalizeSearchPayload(
+  data: { query?: unknown; results?: unknown; total_results?: unknown },
+  fallbackQuery: string,
+  rerank = true,
+): SearchResult {
+  // 若上游显式返回了字符串 query（含空串 ""），优先采用上游值；仅在字段缺失时回退请求词
+  const cardQuery = typeof data.query === 'string' ? data.query.trim() : fallbackQuery.trim()
+  const outQuery = typeof data.query === 'string' && data.query !== '' ? data.query : fallbackQuery
+
+  const rawItems: Array<Record<string, unknown>> = []
+  if (Array.isArray(data.results)) {
+    for (const item of data.results) {
+      if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
+        rawItems.push(item as Record<string, unknown>)
+      }
+    }
+  }
+
+  const resolveCardBaseUrl = (rec: Record<string, unknown>): string => {
+    const title = typeof rec.title === 'string' ? rec.title.trim() : ''
+    const term = cardQuery !== '' ? cardQuery : title
+    if (term !== '') {
+      return `${CARD_SEARCH_BASE}${encodeURIComponent(term)}`
+    }
+    return siteFallbackUrl(rec.site)
+  }
+
+  let totalCards = 0
+  for (const rec of rawItems) {
+    const rawUrl = typeof rec.url === 'string' ? rec.url.trim() : ''
+    if (rawUrl === '' && resolveCardBaseUrl(rec) !== '') {
+      totalCards += 1
+    }
+  }
+
+  const results: SearchResult['results'] = []
+  let cardNo = 0
+  for (const rec of rawItems) {
+    let url = typeof rec.url === 'string' ? rec.url.trim() : ''
+    if (url === '') {
+      const cardBase = resolveCardBaseUrl(rec)
+      if (cardBase === '') continue // query / title / site 皆空，无从改写则丢弃
+      cardNo += 1
+      url = totalCards > 1 ? `${cardBase}#card-${cardNo}` : cardBase
+    }
+    results.push({
+      title: typeof rec.title === 'string' ? rec.title : '',
+      url,
+      snippet: typeof rec.snippet === 'string' ? rec.snippet : '',
+      date: typeof rec.date === 'string' ? rec.date : null,
+    })
+  }
+
+  const dropped = rawItems.length - results.length
+  let total: number | undefined
+  if (typeof data.total_results === 'number' && Number.isFinite(data.total_results)) {
+    const rawTotal = Math.trunc(data.total_results)
+    total = dropped > 0 ? Math.max(rawTotal - dropped, results.length) : rawTotal
+  }
+
+  // 默认开启重排；`rerank: false` 可关掉（调试 / 需要上游原序时）
+  const ranked = rerank === false ? results : rankByRelevance(fallbackQuery, results)
+  return {
+    query: outQuery,
+    results: ranked,
+    total,
+  }
+}
+
+/**
  * 联网检索（`POST /agenttool/v1/search`）。
  * 支持国内版（带 IDE 桌面头）与国际版，结果适配 DSH Search API 形状，
  * 并做一层**相关性重排**（压制同名不同物的噪声结果）。
@@ -432,31 +517,7 @@ export async function webSearch(
     max_results: maxResults,
   }, 20_000)
 
-  const results: SearchResult['results'] = []
-  if (Array.isArray(data.results)) {
-    for (const item of data.results) {
-      if (item === null || typeof item !== 'object') continue
-      const rec = item as Record<string, unknown>
-      let url = typeof rec.url === 'string' ? rec.url.trim() : ''
-      if (url === '') {
-        url = siteFallbackUrl(rec.site)
-      }
-      if (url === '') continue // DSH 解码器要求非空 URL
-      results.push({
-        title: typeof rec.title === 'string' ? rec.title : '',
-        url,
-        snippet: typeof rec.snippet === 'string' ? rec.snippet : '',
-        date: null,
-      })
-    }
-  }
-  // 默认开启重排；`rerank: false` 可关掉（调试 / 需要上游原序时）
-  const ranked = input.rerank === false ? results : rankByRelevance(input.query, results)
-  return {
-    query: typeof data.query === 'string' ? data.query : input.query,
-    results: ranked,
-    total: typeof data.total_results === 'number' ? data.total_results : undefined,
-  }
+  return normalizeSearchPayload(data, input.query, input.rerank !== false)
 }
 
 /**

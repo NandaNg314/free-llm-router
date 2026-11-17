@@ -5,6 +5,7 @@
  */
 
 import { resolveUpstream, type Env } from '../env.js'
+import { isActive, type AccountState } from '../pool/state.js'
 import { DEFAULT_PROVIDER } from '../providers/index.js'
 import { cliChatHeaders, deriveDeviceId } from '../upstream/headers.js'
 
@@ -58,7 +59,35 @@ export interface OpenAiModel {
   credits?: string
 }
 
-/** 从账号池取第一个可用账号（1–3 账号场景下够用）。 */
+function creditTierOf(account: AccountState): number {
+  const raw = account as unknown as Record<string, unknown>
+  const credits = typeof raw.credits === 'number' && Number.isFinite(raw.credits) ? raw.credits : undefined
+  if (credits !== undefined && credits > 0) return 0
+  if (credits === undefined) return 1
+  const samples = Array.isArray(raw.samples) ? raw.samples : []
+  if (credits === 0 && samples.length === 0) return 2
+  return 3
+}
+
+function isAccountSelectable(account: AccountState, now: number): boolean {
+  if (account.disabled) return false
+  const raw = account as unknown as Record<string, unknown>
+  const deadlines = [
+    account.until,
+    typeof raw.hardUntil === 'number' ? raw.hardUntil : 0,
+    account.breakerUntil,
+    account.degradeUntil,
+    account.restrictedUntil,
+  ]
+  for (const d of deadlines) {
+    if (typeof d === 'number' && isActive(d, now)) return false
+  }
+  return true
+}
+
+/**
+ * 从账号池挑选最优健康账号凭据（跳过停用、冷却、熔断、受限与降权账号，并优先选有积分或未知积分账号）。
+ */
 export async function pickCredential(
   env: Env,
   realm: string,
@@ -71,11 +100,25 @@ export async function pickCredential(
    */
   providerId = DEFAULT_PROVIDER,
 ): Promise<{ uid: string; credential: { accessToken: string; extras?: Record<string, string> } } | undefined> {
+  const now = Date.now()
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-  const accounts = await pool.listAccounts(realm, Date.now())
-  for (const account of accounts) {
-    if (account.disabled) continue
-    if ((account.provider ?? DEFAULT_PROVIDER) !== providerId) continue
+  const accounts = await pool.listAccounts(realm, now)
+
+  const candidates = accounts
+    .map((account, index) => ({ account, index, tier: creditTierOf(account) }))
+    .filter(({ account }) => (account.provider ?? DEFAULT_PROVIDER) === providerId && isAccountSelectable(account, now))
+    .sort((a, b) => {
+      if (a.tier !== b.tier) return a.tier - b.tier
+      if (a.tier === 0) {
+        const expDiff = (b.account.creditsExpiring ?? 0) - (a.account.creditsExpiring ?? 0)
+        if (expDiff !== 0) return expDiff
+        const credDiff = (b.account.credits ?? 0) - (a.account.credits ?? 0)
+        if (credDiff !== 0) return credDiff
+      }
+      return a.index - b.index
+    })
+
+  for (const { account } of candidates) {
     const credential = (await pool.getCredential(account.uid)) as { accessToken?: string; extras?: Record<string, string> } | undefined
     if (credential !== undefined && typeof credential.accessToken === 'string' && credential.accessToken !== '') {
       return { uid: account.uid, credential: { accessToken: credential.accessToken, extras: credential.extras } }

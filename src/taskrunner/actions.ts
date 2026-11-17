@@ -25,7 +25,14 @@ import { billingHeaders, desktopHeaders, mpHeaders, webHeaders, deriveDeviceId, 
 import { callUpstream, UpstreamError } from '../upstream/client.js'
 import { dailyCheckin, fetchBalance } from '../upstream/checkin.js'
 import { runWebDailyChat } from '../upstream/webagent.js'
-import { acceptTasks, isMpTask, listTasks, mergeTaskLists } from '../upstream/tasks.js'
+import {
+  acceptTasks,
+  createSkillShareChannel,
+  isCnRealm,
+  isMpTask,
+  listTasks,
+  marketSkillList,
+} from '../upstream/tasks.js'
 import {
   drawAllLottery,
   lotteryDraw,
@@ -42,7 +49,7 @@ import {
   readStreakLaunchDate,
   useMakeupCard,
 } from '../upstream/travel.js'
-import { reportCli, reportDesktop, reportWeb, sanitizeEvents, withFingerprint } from '../upstream/report.js'
+import { reportCli, reportDesktop, reportMp, reportWeb, sanitizeEvents, withFingerprint } from '../upstream/report.js'
 import {
   cliChatRequestEvent,
   desktopAppearanceSkinApplyEvent,
@@ -52,7 +59,11 @@ import {
   desktopDesignCanvasEvents,
   desktopFingerprint,
   desktopPlaybookEvents,
+  desktopSkillShareChannelActionEvent,
   desktopTemplateUseEvents,
+  mpChatRequestEvent,
+  mpExpertActualUseEvent,
+  mpFingerprint,
   newIds,
   webElementClickEvent,
   webFingerprint,
@@ -209,27 +220,24 @@ const ACTIONS: Record<string, ActionHandler> = {
    */
   async acceptPending(ctx, _step, env): Promise<ActionResult> {
     try {
-      // 取两份口径（桌面 + mp）的并集 —— 与 `listTasks` 动作同口径，
-      // 否则 mp 任务永远不会被接受。
-      const base = await listTasks(ctx, env)
-      let all = base
-      try {
-        const mp = await listTasks(ctx, env, { mp: true })
-        all = mergeTaskLists(base, mp)
-      } catch {
-        // mp 口径失败不致命（与 listTasks 动作一致）
-      }
-      const need = all.filter((t) => !t.claimed && t.acceptStatus === 'not_accepted')
+      // `listTasks(ctx, env)` 对国内版（cn）自动合并「桌面默认口径 + 小程序 mp 口径」，
+      // 对国际版（global）仅拉默认口径（绝不发 mp 头）。
+      const all = await listTasks(ctx, env)
+      const need = all.filter((t) => !t.claimed && !t.locked && t.acceptStatus === 'not_accepted')
       if (need.length === 0) return { ok: true, detail: '没有待接受的任务（全部已接受或已领）' }
       // ⚠️ 一次提交多个：上游接受的是 `task_codes` 数组。
-      // 但要**逐个分类**：桌面与 mp 走不同指纹，混在一起会有一半被拒。
+      // 但要**逐个分类**：桌面与 mp（含 `wb_wechat_oa_subscribe_task`）走不同指纹，混在一起会有一半被拒；
+      // 国际版绝不发 mp accept。
+      const cn = isCnRealm(ctx.realm)
       const desktopCodes = need.filter((t) => !isMpTask(t.taskCode)).map((t) => t.taskCode)
-      const mpCodes = need.filter((t) => isMpTask(t.taskCode)).map((t) => t.taskCode)
+      const mpCodes = cn ? need.filter((t) => isMpTask(t.taskCode)).map((t) => t.taskCode) : []
       if (desktopCodes.length > 0) await acceptTasks(ctx, env, desktopCodes)
       if (mpCodes.length > 0) await acceptTasks(ctx, env, mpCodes, { mp: true })
+      const acceptedCount = desktopCodes.length + mpCodes.length
+      if (acceptedCount === 0) return { ok: true, detail: '没有当前地区可接受的任务' }
       return {
         ok: true,
-        detail: `已接受 ${need.length} 个任务`
+        detail: `已接受 ${acceptedCount} 个任务`
           + (mpCodes.length > 0 ? `（其中 mp ${mpCodes.length} 个）` : ''),
       }
     } catch (error) {
@@ -261,14 +269,8 @@ const ACTIONS: Record<string, ActionHandler> = {
 
   async listTasks(ctx, _step, env): Promise<ActionResult> {
     try {
-      const base = await listTasks(ctx, env)
-      let all = base
-      try {
-        const mp = await listTasks(ctx, env, { mp: true })
-        all = mergeTaskLists(base, mp)
-      } catch {
-        // mp 口径失败不致命
-      }
+      // 国内版自动合并默认列表与 mp 列表去重，国际版仅拉默认列表（不发 mp 头）
+      const all = await listTasks(ctx, env)
       const pending = all.filter((t) => !t.claimed)
       const claimable = all.filter((t) => t.claimable)
       // 列出未领任务的进度明细：这是面板判断「还差什么」的唯一依据，
@@ -353,7 +355,11 @@ const ACTIONS: Record<string, ActionHandler> = {
       await new Promise<void>((r) => setTimeout(r, REPORT_GAP_MS))
 
       const bases = resolveUpstream(env)
-      const headers = desktopHeaders({ uid: ctx.uid, accessToken: ctx.accessToken })
+      const headers = desktopHeaders({
+        uid: ctx.uid,
+        accessToken: ctx.accessToken,
+        realm: isCnRealm(ctx.realm) ? 'cn' : 'global',
+      })
 
       // ② 同意协议（幂等）
       const agree = await callUpstream({
@@ -410,6 +416,7 @@ const ACTIONS: Record<string, ActionHandler> = {
         machineId,
         sessionId,
         now: Date.now(),
+        realm: ctx.realm,
       })
       const result = await reportDesktop(
         { uid: ctx.uid, accessToken: ctx.accessToken },
@@ -441,6 +448,7 @@ const ACTIONS: Record<string, ActionHandler> = {
         machineId,
         sessionId,
         now: Date.now(),
+        realm: ctx.realm,
       })
       const result = await reportDesktop(
         { uid: ctx.uid, accessToken: ctx.accessToken },
@@ -461,7 +469,7 @@ const ACTIONS: Record<string, ActionHandler> = {
       const { machineId, sessionId } = await deviceIds(ctx.uid)
       const ids = newIds()
       const fingerprint = desktopFingerprint({
-        uid: ctx.uid, nickname: ctx.nickname, machineId, sessionId, now: Date.now(),
+        uid: ctx.uid, nickname: ctx.nickname, machineId, sessionId, now: Date.now(), realm: ctx.realm,
       })
       const event = desktopAutomationCreatedEvent({ conversationId: ids.conversationId, now: Date.now() })
       const result = await reportDesktop(
@@ -517,7 +525,7 @@ const ACTIONS: Record<string, ActionHandler> = {
 
       const { machineId, sessionId } = await deviceIds(ctx.uid)
       const fingerprint = desktopFingerprint({
-        uid: ctx.uid, nickname: ctx.nickname, machineId, sessionId, now: Date.now(),
+        uid: ctx.uid, nickname: ctx.nickname, machineId, sessionId, now: Date.now(), realm: ctx.realm,
       })
       /**
        * ⚠️ 模板 id 用 `"1"`~`"5"`，**不是**编造的 `wb2api-template-N`。
@@ -571,7 +579,7 @@ const ACTIONS: Record<string, ActionHandler> = {
         now: Date.now(),
       })
       const fingerprint = desktopFingerprint({
-        uid: ctx.uid, nickname: ctx.nickname, machineId, sessionId, now: Date.now(),
+        uid: ctx.uid, nickname: ctx.nickname, machineId, sessionId, now: Date.now(), realm: ctx.realm,
       })
       const result = await reportDesktop(
         { uid: ctx.uid, accessToken: ctx.accessToken },
@@ -593,7 +601,7 @@ const ACTIONS: Record<string, ActionHandler> = {
       const ids = newIds()
       const events = desktopDesignCanvasEvents({ conversationId: ids.conversationId, now: Date.now() })
       const fingerprint = desktopFingerprint({
-        uid: ctx.uid, nickname: ctx.nickname, machineId, sessionId, now: Date.now(),
+        uid: ctx.uid, nickname: ctx.nickname, machineId, sessionId, now: Date.now(), realm: ctx.realm,
       })
       const result = await reportDesktop(
         { uid: ctx.uid, accessToken: ctx.accessToken },
@@ -616,7 +624,11 @@ const ACTIONS: Record<string, ActionHandler> = {
       const set = await callUpstream({
         method: 'POST',
         url: `${bases.chat}/v2/user-asset/appearance/set`,
-        headers: desktopHeaders({ uid: ctx.uid, accessToken: ctx.accessToken }),
+        headers: desktopHeaders({
+          uid: ctx.uid,
+          accessToken: ctx.accessToken,
+          realm: isCnRealm(ctx.realm) ? 'cn' : 'global',
+        }),
         body: JSON.stringify({ kind: 'theme', resource_key: 'theme-tkmw7j' }),
       })
       if (!set.ok) {
@@ -626,7 +638,7 @@ const ACTIONS: Record<string, ActionHandler> = {
       // ② 上报皮肤生效事件
       const { machineId, sessionId } = await deviceIds(ctx.uid)
       const event = desktopAppearanceSkinApplyEvent({
-        uid: ctx.uid, machineId, sessionId, now: Date.now(),
+        uid: ctx.uid, machineId, sessionId, now: Date.now(), realm: ctx.realm,
       })
       const result = await reportDesktop(
         { uid: ctx.uid, accessToken: ctx.accessToken },
@@ -638,6 +650,201 @@ const ACTIONS: Record<string, ActionHandler> = {
         : { ok: false, detail: `事件上报失败：${result.detail}` }
     } catch (error) {
       return { ok: false, detail: describeError(error, 'Hp_Appearance') }
+    }
+  },
+
+  /**
+   * `skill_share`：国服零消耗全自动任务（「分享技能」，+50 积分 +5 能量）。
+   *
+   * ## 社区实测四步判据链（`xu20060420fan-cell` `4271a8a`、`L0NE-6/WorkBuddy-Daily` `68cbb25`）
+   *
+   * ① 确保任务已 `accept`（未 accept 时 `target=0` 且事件不计分）；
+   * ② `POST /portal/operation-platform/market/skill/list` 取真实市场技能（绝不编造 ID）；
+   * ③ `POST /api/v2/open-platform/asset-shares/c2c/channels` 建分享通道拿真实 `channel_id`
+   *    （`asset_ref` 必须是二次序列化的 JSON 字符串 `"{\"asset_id\":\"...\"}"`）；
+   * ④ `POST /v2/report` 桌面指纹上报 `skill_share_channel_action`
+   *    （`action: 'wechat'`, `panelAction: 'success'`, `id: channel_id`）。
+   */
+  async skillShare(ctx, _step, env): Promise<ActionResult> {
+    try {
+      if (!isCnRealm(ctx.realm)) {
+        return { ok: true, detail: '国际版无 skill_share 任务，跳过' }
+      }
+
+      const tasks = await listTasks(ctx, env)
+      const task = tasks.find((t) => t.taskCode === 'skill_share')
+      if (tasks.length > 0 && task === undefined) {
+        return { ok: true, detail: '当前未下发 skill_share 任务，跳过' }
+      }
+      if (task?.claimed) {
+        return { ok: true, detail: 'skill_share 已领取，跳过' }
+      }
+      if (task?.claimable) {
+        return { ok: true, detail: `skill_share 进度已达标（${task.current}/${task.target}），等待领奖` }
+      }
+
+      // ① 必须先确保任务已 accept（幂等）
+      if (task === undefined || task.acceptStatus === 'not_accepted' || task.target <= 0) {
+        await acceptTasks(ctx, env, ['skill_share'])
+        await new Promise<void>((r) => setTimeout(r, REPORT_GAP_MS))
+      }
+
+      // ② 拉取真实市场技能（不编造 ID）
+      const skills = await marketSkillList({ uid: ctx.uid, accessToken: ctx.accessToken }, env, 5)
+      const skill = skills[0]
+      if (skill === undefined) {
+        return { ok: false, detail: '技能市场列表为空，无法取得真实 skill_id' }
+      }
+
+      // ③ 创建 C2C 分享通道拿真实 channel_id
+      const { channelId } = await createSkillShareChannel(
+        { uid: ctx.uid, accessToken: ctx.accessToken },
+        env,
+        skill,
+      )
+
+      // ④ 桌面端指纹上报 skill_share_channel_action
+      const { machineId, sessionId } = await deviceIds(ctx.uid)
+      const now = Date.now()
+      const fingerprint = desktopFingerprint({
+        uid: ctx.uid,
+        nickname: ctx.nickname,
+        machineId,
+        sessionId,
+        now,
+        realm: ctx.realm,
+      })
+      const event = desktopSkillShareChannelActionEvent({ skill, channelId, now })
+      const result = await reportDesktop(
+        { uid: ctx.uid, accessToken: ctx.accessToken },
+        env,
+        sanitizeEvents(withFingerprint([event], fingerprint)),
+      )
+      return result.ok
+        ? { ok: true, detail: `已完成技能分享（${skill.displayNameZh || skill.skillId}，channel=${channelId}）` }
+        : { ok: false, detail: `技能分享埋点上报失败：${result.detail}` }
+    } catch (error) {
+      return { ok: false, detail: describeError(error, 'skill_share') }
+    }
+  },
+
+  /**
+   * `Sequential_Tasks_1`：小程序首对话（+100 积分 +5 能量，纯 HTTP 零对话消耗）。
+   *
+   * 对齐 `misakano7545/workbuddy2api-panel` `autotask.go:runSequentialTask1` 与 `L0NE-6/WorkBuddy-Daily` `t_mp_seq1`：
+   * 仅国服生效，按 `mp` 头拉列表校验解锁态并 accept，随后以 `mpFingerprint` + `reportMp` 上报 `chat_request_send`。
+   */
+  async sequentialTask1(ctx, _step, env): Promise<ActionResult> {
+    try {
+      if (!isCnRealm(ctx.realm)) {
+        return { ok: true, detail: '国际版无小程序顺序任务，跳过' }
+      }
+      const mpTasks = await listTasks(ctx, env, { mp: true })
+      const task = mpTasks.find((t) => t.taskCode === 'Sequential_Tasks_1')
+      if (task === undefined) {
+        return { ok: true, detail: '当前未下发 Sequential_Tasks_1，跳过' }
+      }
+      if (task.locked) {
+        return { ok: true, detail: 'Sequential_Tasks_1 尚未解锁，跳过' }
+      }
+      if (task.claimed) {
+        return { ok: true, detail: 'Sequential_Tasks_1 已领取，跳过' }
+      }
+      if (task.claimable) {
+        return { ok: true, detail: `Sequential_Tasks_1 进度已达标（${task.current}/${task.target}），等待领奖` }
+      }
+
+      if (task.acceptStatus === 'not_accepted' || task.target <= 0) {
+        await acceptTasks(ctx, env, ['Sequential_Tasks_1'], { mp: true })
+        await new Promise<void>((r) => setTimeout(r, REPORT_GAP_MS))
+      }
+
+      const ids = newIds()
+      const now = Date.now()
+      const fp = mpFingerprint({
+        uid: ctx.uid,
+        nickname: ctx.nickname,
+        now,
+        machineId: MP_MACHINE_ID,
+      })
+      const ev = mpChatRequestEvent({
+        conversationId: `mp-${ids.conversationId}`,
+        requestId: ids.requestId,
+        now,
+      })
+      const result = await reportMp(
+        { uid: ctx.uid, accessToken: ctx.accessToken },
+        env,
+        sanitizeEvents(withFingerprint([ev], fp)),
+      )
+      return result.ok
+        ? { ok: true, detail: '已上报小程序首对话事件（Sequential_Tasks_1）' }
+        : { ok: false, detail: `Sequential_Tasks_1 上报失败：${result.detail}` }
+    } catch (error) {
+      return { ok: false, detail: describeError(error, 'Sequential_Tasks_1') }
+    }
+  },
+
+  /**
+   * `Sequential_Tasks_2`：小程序使用专家（+200 积分 +5 能量，纯 HTTP 零对话消耗）。
+   *
+   * 对齐 `autotask.go:runSequentialTask2` 与 `workbuddy_daily.py:t_mp_seq2`：
+   * 先从专家市场取真实专家（避免市场异常时把任务留在已 accept 半截状态），再带 `mp` 头 accept 并上报 `expert_actual_use`。
+   */
+  async sequentialTask2(ctx, _step, env): Promise<ActionResult> {
+    try {
+      if (!isCnRealm(ctx.realm)) {
+        return { ok: true, detail: '国际版无小程序顺序任务，跳过' }
+      }
+      const mpTasks = await listTasks(ctx, env, { mp: true })
+      const task = mpTasks.find((t) => t.taskCode === 'Sequential_Tasks_2')
+      if (task === undefined) {
+        return { ok: true, detail: '当前未下发 Sequential_Tasks_2，跳过' }
+      }
+      if (task.locked) {
+        return { ok: true, detail: 'Sequential_Tasks_2 尚未到解锁日（每日 00:00 解锁一阶段），跳过' }
+      }
+      if (task.claimed) {
+        return { ok: true, detail: 'Sequential_Tasks_2 已领取，跳过' }
+      }
+      if (task.claimable) {
+        return { ok: true, detail: `Sequential_Tasks_2 进度已达标（${task.current}/${task.target}），等待领奖` }
+      }
+
+      const experts = await marketExpertList({ uid: ctx.uid, accessToken: ctx.accessToken }, env, 'agent')
+      const expert = experts[0]
+      if (expert === undefined) {
+        return { ok: false, detail: 'Sequential_Tasks_2：专家市场列表为空，无法取真实专家 ID' }
+      }
+
+      if (task.acceptStatus === 'not_accepted' || task.target <= 0) {
+        await acceptTasks(ctx, env, ['Sequential_Tasks_2'], { mp: true })
+        await new Promise<void>((r) => setTimeout(r, REPORT_GAP_MS))
+      }
+
+      const now = Date.now()
+      const fp = mpFingerprint({
+        uid: ctx.uid,
+        nickname: ctx.nickname,
+        now,
+        machineId: MP_MACHINE_ID,
+      })
+      const ev = mpExpertActualUseEvent({
+        expertId: expert.expertId,
+        expertTitle: expert.displayNameZh || expert.professionZh || expert.expertId,
+        expertType: expert.expertType,
+        now,
+      })
+      const result = await reportMp(
+        { uid: ctx.uid, accessToken: ctx.accessToken },
+        env,
+        sanitizeEvents(withFingerprint([ev], fp)),
+      )
+      return result.ok
+        ? { ok: true, detail: `已上报小程序专家使用事件（${expert.displayNameZh || expert.expertId}）` }
+        : { ok: false, detail: `Sequential_Tasks_2 上报失败：${result.detail}` }
+    } catch (error) {
+      return { ok: false, detail: describeError(error, 'Sequential_Tasks_2') }
     }
   },
 
@@ -807,7 +1014,7 @@ const ACTIONS: Record<string, ActionHandler> = {
       }
 
       if (before.state === 'arrived') {
-        const claimed = await travelClaim({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
+        const claimed = await travelClaim({ uid: ctx.uid, accessToken: ctx.accessToken }, env, before.recordId)
         parts.push(claimed.claimed ? `已领取（${claimed.detail}）` : `无可领取（${claimed.detail}）`)
       } else if (before.state === 'traveling') {
         parts.push('正在旅行中，等待归来')
@@ -946,6 +1153,25 @@ const ACTIONS: Record<string, ActionHandler> = {
       const quota = await buddyQuota({ uid: ctx.uid, accessToken: ctx.accessToken }, env)
       if (quota.remaining <= 0) return { ok: true, detail: '没有可开的盲盒' }
 
+      // ⚠️ 对齐 `L0NE-6/WorkBuddy-Daily` `db08e48` 状态机保护：
+      // 开盲盒会覆盖当前伙伴的旅行记录！若上一趟旅行已归来（`arrived`），必须先带 `record_id` 领奖；
+      // 仅当状态确认处于 `idle`（或状态接口未返回明确非 idle 态）时才允许开盒。
+      let ts = await travelStatus({ uid: ctx.uid, accessToken: ctx.accessToken }, env).catch(
+        () => ({ state: 'idle', dailyLimitReached: false, destination: '' }) as Awaited<ReturnType<typeof travelStatus>>,
+      )
+      if (ts.state === 'arrived') {
+        await travelClaim({ uid: ctx.uid, accessToken: ctx.accessToken }, env, ts.recordId).catch(() => {})
+        ts = await travelStatus({ uid: ctx.uid, accessToken: ctx.accessToken }, env).catch(
+          () => ({ state: 'idle', dailyLimitReached: false, destination: '' }) as Awaited<ReturnType<typeof travelStatus>>,
+        )
+      }
+      if (ts.state !== '' && ts.state !== 'idle') {
+        return {
+          ok: true,
+          detail: `伙伴当前处于 ${ts.state} 状态，跳过开盲盒以免覆盖旅行记录`,
+        }
+      }
+
       const limit = Math.min(quota.remaining, 5)
       let opened = 0
       for (let i = 0; i < limit; i += 1) {
@@ -965,6 +1191,23 @@ const ACTIONS: Record<string, ActionHandler> = {
 
   async verifyAndClaim(ctx, step, env): Promise<ActionResult> {
     try {
+      if (isMpTask(step.code)) {
+        if (!isCnRealm(ctx.realm)) {
+          return { ok: true, detail: `${step.code} 属国服小程序任务，国际版跳过` }
+        }
+        // 小程序顺序任务若未下发或未到解锁日（`locked: true`），直接跳过，避免无谓的 12s 回读轮询
+        const mpTasks = await listTasks(ctx, env, { mp: true }).catch(() => undefined)
+        if (mpTasks !== undefined) {
+          const found = mpTasks.find((t) => t.taskCode === step.code)
+          if (found === undefined) {
+            return { ok: true, detail: `${step.code} 当前未下发，跳过回读` }
+          }
+          if (found.locked) {
+            return { ok: true, detail: `${step.code} 尚未解锁，跳过回读` }
+          }
+        }
+      }
+
       const outcome = await verifyAndClaim(
         {
           uid: ctx.uid,
@@ -1159,10 +1402,14 @@ async function runNamedExpert(
 ): Promise<ActionResult> {
   if (named === undefined) return { ok: false, detail: `${taskCode}：任务表里没有这个专家 id` }
   try {
-    // 先看这个任务是否已经达标/领过 —— 已完成的账号不必再烧一次对话
+    // 先看这个任务是否已经下发 / 达标 / 领过 —— 未下发（如活动已过期）或已完成的账号绝不再白烧一次真实对话
     const tasks = await listTasks({ uid: ctx.uid, accessToken: ctx.accessToken, realm: ctx.realm }, env)
     const task = tasks.find((t) => t.taskCode === taskCode)
+    if (tasks.length > 0 && task === undefined) {
+      return { ok: true, detail: `${taskCode} 当前未下发（活动可能已结束），跳过` }
+    }
     if (task !== undefined && task.claimed) return { ok: true, detail: `${taskCode} 已完成并领取，跳过` }
+    if (task !== undefined && task.claimable) return { ok: true, detail: `${taskCode} 进度已达标，跳过对话` }
 
     /**
      * 🔴 **必须按关键词搜，不能直接用默认列表**

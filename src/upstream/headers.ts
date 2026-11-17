@@ -19,31 +19,83 @@
  */
 
 /**
- * 客户端版本号（写进 UA 与 `X-IDE-Version`）。
+ * 客户端版本号与包指纹三元组（写进 UA、`X-IDE-Version`、`X-Client-Version` 与 `/v2/report`）。
  *
- * ## ⚠️ 为什么从 `5.5.4` 改成 `5.5.6`（实测依据）
+ * ## 来源与实测依据（同步自 `misakano7545/workbuddy2api-panel` 提交 `2fa6876`、`96265d7`）
  *
- * 原值 5.5.4 是照抄 Go 侧 `headers.go:61-67` 的**默认值**，而那个默认值是**旧的**：
- *
- * 1. AGENTS.md §6.1 记录的**桌面端实测 UA** 是 `WorkBuddy/5.5.6`；
- * 2. 本仓库自己的 `realtime.ts:222` 在**同一个端点**
- *    （`/v2/chat/completions`）上写的是 `'X-IDE-Version': '5.5.6'`
- *    —— 同一个仓库里两个版本号本身就是不一致。
- *
- * ⚠️ 版本号是上游判定**渠道是否被认可**的输入之一（`11128
- * "Illegal API invocation from an unapproved channel"`）。
- * 旧版本可能被划入「不认可的渠道」，而这与账号本身是否有效**无关**。
- *
- * ⚠️ 这里**不编造**更新的版本号：只对齐到**本仓库内已有依据**的那个值
- * （桌面端实测 + realtime 一致）。若上游继续升版，应重新实测后再改。
+ * - **国内分发包 `5.11.3`**（2026-11-16 拆包 `5.11.3.43806934` + 2026-11-18 真机抓包 155 条请求）：
+ *   - 客户端版本：`5.11.3`（`cli/product.json` `genieVersion`）
+ *   - 内置 CLI：`2.176.0`（`cli/package.json` `@genie/agent-cli`）
+ *   - 桌面三元组：`commit = ecace0f7028166695994300182295329b8b95449`，`releaseDate = 1794502169764`
+ *   - 共享 HTTP 层（`proxy-env2` `registerOutboundHeaderProvider`）全链路追加
+ *     `X-Client-Version: 5.11.3` / `X-Client-Platform: windows` / `X-Client-Product: WorkBuddy`
+ * - **国际分发包 `5.9.4`**（2026-10-30 拆包 `5.9.4.42593613` + 真机复核）：
+ *   - 客户端版本：`5.9.4`
+ *   - 内置 CLI：`2.165.0`（随分发包走，**绝不能**与国内 `2.176.0` 混拼出官方不存在的 `5.9.4 + CLI/2.176.0`）
+ *   - 桌面三元组：`commit = fa0a0901906addaa1a4259f6df347388a5563ded`，`releaseDate = 1793288804029`
+ *   - 国际版 `app.asar` 无 `registerOutboundHeaderProvider`，**绝不发送** `X-Client-*` 三头。
  */
-export const CLIENT_VERSION = '5.5.6'
-export const CLI_VERSION = '2.137.1'
-/** 桌面端实测 UA（`desktop.go:43`）。 */
-export const DESKTOP_VERSION = '5.5.6'
-export const DESKTOP_CLI_VERSION = '2.137.1'
+export type UpstreamRealm = 'cn' | 'global'
 
-/** CN CLI 三段式 UA（`headers.go:61-67`）。 */
+export const CLIENT_VERSION = '5.11.3'
+export const CLI_VERSION = '2.176.0'
+/** 国内桌面端版本与内置 CLI（与 `CLIENT_VERSION` / `CLI_VERSION` 同源）。 */
+export const DESKTOP_VERSION = '5.11.3'
+export const DESKTOP_CLI_VERSION = '2.176.0'
+export const DESKTOP_COMMIT_CN = 'ecace0f7028166695994300182295329b8b95449'
+export const DESKTOP_RELEASE_DATE_CN = 1794502169764
+
+/** 国内 5.11.3 桌面端 `X-Client-*` 身份三头的固定字段（2026-11-18 真机抓包 130/130 恒定）。 */
+export const CLIENT_IDENTITY_PLATFORM = 'windows'
+export const CLIENT_IDENTITY_PRODUCT = 'WorkBuddy'
+
+/** 桌面端 `/v2/report` 版本三元组（按 realm 与 UA 同源对齐，消除版本自相矛盾）。 */
+export interface DesktopVersionTriple {
+  version: string
+  commit: string
+  releaseDate: number
+  cliVersion: string
+}
+
+/**
+ * 按 realm 获取同源的桌面端版本三元组与内置 CLI 版本（`2fa6876`）。
+ *
+ * ⚠️ `commit` / `releaseDate` 是打包期常量，必须与 `ideVersion` / `extVersion` 及请求头 UA 同源：
+ * 给国内 `5.11.3` 盖旧版或国际版的 `commit` 会造成安装清单自相矛盾。
+ */
+export function desktopVersionTriple(realm: UpstreamRealm = 'cn'): DesktopVersionTriple {
+  if (realm === 'global') {
+    return {
+      version: INTL_DESKTOP_VERSION,
+      commit: DESKTOP_COMMIT_GL,
+      releaseDate: DESKTOP_RELEASE_DATE_GL,
+      cliVersion: INTL_CLI_VERSION,
+    }
+  }
+  return {
+    version: DESKTOP_VERSION,
+    commit: DESKTOP_COMMIT_CN,
+    releaseDate: DESKTOP_RELEASE_DATE_CN,
+    cliVersion: DESKTOP_CLI_VERSION,
+  }
+}
+
+/**
+ * 按 realm 隔离注入国内 `5.11.3` 新增的 `X-Client-*` 身份三头（`96265d7`，issue #257）。
+ *
+ * ⚠️ **只对国内版（`cn`）注入，国际版（`global`）一律返回空对象**：
+ * 国际分发包停在 `5.9.4`，客户端不存在该拦截器；向国际链路注入这三头会暴露非官方代理特征。
+ */
+export function clientIdentityHeaders(realm: UpstreamRealm = 'cn', clientVersion = CLIENT_VERSION): HeaderMap {
+  if (realm === 'global') return {}
+  return {
+    'X-Client-Version': clientVersion,
+    'X-Client-Platform': CLIENT_IDENTITY_PLATFORM,
+    'X-Client-Product': CLIENT_IDENTITY_PRODUCT,
+  }
+}
+
+/** CN CLI / 桌面三段式 UA（`WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0`）。 */
 export function cliUserAgent(): string {
   return `WorkBuddy/${CLIENT_VERSION} WorkBuddy/${CLIENT_VERSION} CLI/${CLI_VERSION}`
 }
@@ -51,79 +103,40 @@ export function cliUserAgent(): string {
 /**
  * **国际版**（workbuddy.ai）的三段式 UA。
  *
- * ## 🔴 与国内版的差别只在中间那段：`WorkBuddy AI`
- *
- * ```
- * 国内版: WorkBuddy/5.5.2 WorkBuddy/5.5.2    CLI/5.5.2
- * 国际版: WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2
- *                         ^^^^^^^^^^^ 多了 " AI"
- * ```
- *
- * ⚠️ 这不是装饰：**上游据此判定「渠道是否被认可」**，用错形态会回
- * `11128 Illegal API invocation from an unapproved channel`
- *（而 `displayMsg` 把它**伪装成「安全策略拦截」**，极易误判成账号被封）。
- *
- * 依据：参考实现 `src/product.ts:70` 的 `WORKBUDDY_UA_INTL`
- *（`deepseek-harness-codearts`）。
+ * 对齐国际分发包 `5.9.4` + 内置 `CLI/2.165.0`（中段为小写 `workbuddy-ai`，与 `INTL_DESKTOP_UA` 同源）。
+ * ⚠️ 绝不能把国内版的 `CLI/2.176.0` 混进国际版拼出 `5.9.4 + CLI/2.176.0`。
  */
 export function cliUserAgentIntl(): string {
-  // ⚠️ **三段都用国际版自己的版本号 5.5.2**（与 `X-IDE-Version` 一致）。
-  //
-  // 参考实现逐字是 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`
-  //（`product.ts:70`），三段**同值**。
-  // 我一度写成 `WorkBuddy/5.5.6 … CLI/2.137.1`（混了国内版段），
-  // 那与 `X-IDE-Version: 5.5.2` **自相矛盾** —— 同一请求里两个版本号，
-  // 正是「渠道指纹」最容易露馅的地方。
-  return `WorkBuddy/${CLIENT_VERSION_INTL} WorkBuddy AI/${CLIENT_VERSION_INTL} CLI/${CLIENT_VERSION_INTL}`
+  return INTL_DESKTOP_UA
 }
 
 /**
- * **国内版**（CodeBuddy，`copilot.tencent.com`）的 UA。
+ * **国内版**（CodeBuddy，`copilot.tencent.com`）的 IDE 形态 UA。
  *
- * ## 🔴 与国际版是**完全不同的格式**（实测缺陷：我一度把国际版的值套到国内版）
- *
- * ```
- * 国内版: CodeBuddyIDE/1.106.1
- * 国际版: WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2
- * ```
- *
- * ⚠️ 国内版**不是**三段式、也**不含 `WorkBuddy`** —— 它是 IDE 客户端的形态。
- * 依据：参考实现 `src/product.ts:309` / `src/buddy.ts:89` 的
- * `userAgent: 'CodeBuddyIDE/1.106.1'`。
- *
- * ⚠️ 三个归属头（`X-IDE-Name` / `X-IDE-Type` / `X-Product`）在国内版也要发
- * **`CodeBuddy`**（`product.ts:311` 的 `attributionName`），不是 `WorkBuddy`。
- * 发错会让后台「使用端」归因错误（参考实现对此有专门注释：
- * 早年误发 `SaaS` 导致后台归因不到产品）。
+ * ⚠️ 与国际版 WorkBuddy 桌面形态是两套独立客户端身份：
+ * - 国内 CodeBuddy IDE：`CodeBuddyIDE/1.106.1`，归属三头发 `CodeBuddy`；
+ * - 国际 WorkBuddy 桌面：`WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0`。
  */
 export const CODEBUDDY_USER_AGENT = 'CodeBuddyIDE/1.106.1'
 
-/** 国内版的客户端版本号（`X-IDE-Version`）。 */
+/** 国内版 CodeBuddy IDE 的客户端版本号（`X-IDE-Version`）。 */
 export const CODEBUDDY_CLIENT_VERSION = '1.106.1'
 
 /**
- * 国际版的客户端版本号。
+ * 国际服**桌面端** `5.9.4` 分发包版本、内置 CLI 与三元组（2026-10-30 拆包 + 真机抓包，`2fa6876`）。
  *
- * ⚠️ 参考实现国际版用 **5.5.2**（`src/product.ts:484`），而国内版 CodeBuddy 用
- * `clientVersion: '1.106.1'` / `cliVersion: '2.137.1'`。
- * 我们此前对两个变体都用同一组国内版版本号 —— 那也是渠道指纹不匹配的来源之一。
+ * ## ⚠️ 中段必须是小写 `workbuddy-ai`，内置 CLI 随国际包固定为 `2.165.0`
+ *
+ * 旧的大写 `WorkBuddy AI` 已失效（回 `11-128 request illegal`）；
+ * 且国际包停在 `5.9.4`（带 `CLI/2.165.0`），与 `X-IDE-Version: 5.9.4` 完全同源。
  */
-export const CLIENT_VERSION_INTL = '5.5.2'
-
-/**
- * 国际服**桌面端** 5.8.4 的 UA（2026-10-16 抓包 + 2026-10-20 本机实测 200）。
- *
- * ## ⚠️ 中段是小写 `workbuddy-ai`，不再是旧的 `WorkBuddy AI`
- *
- * 旧值 `WorkBuddy/… WorkBuddy AI/…` 是 v0.1.1 时代照抄参考实现的形态，**已失效**：
- * 上游 2026-10-20 起把国际服的渠道指纹判据换成了桌面端 5.8.4 的那一套，
- * 用旧 UA 一律回 `11-128 request illegal`。UA 是这套判据的输入之一，
- * 与账号是否有效无关（5 个账号用同一套头全部 11-128 已证实），
- * 故这里逐字对齐抓包，连大小写都不能改。
- */
-export const INTL_DESKTOP_UA = 'WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0'
-/** 国际服桌面端版本号，必须与 `INTL_DESKTOP_UA` 自洽（同一请求里两个版本号就是露馅点）。 */
-export const INTL_DESKTOP_VERSION = '5.8.4'
+export const INTL_DESKTOP_VERSION = '5.9.4'
+export const INTL_CLI_VERSION = '2.165.0'
+export const CLIENT_VERSION_INTL = INTL_DESKTOP_VERSION
+export const DESKTOP_VERSION_GL = INTL_DESKTOP_VERSION
+export const DESKTOP_COMMIT_GL = 'fa0a0901906addaa1a4259f6df347388a5563ded'
+export const DESKTOP_RELEASE_DATE_GL = 1793288804029
+export const INTL_DESKTOP_UA = `WorkBuddy/${INTL_DESKTOP_VERSION} workbuddy-ai/${INTL_DESKTOP_VERSION} CLI/${INTL_CLI_VERSION}`
 
 /**
  * 国际服的**会话头族**（5 个）。
@@ -364,14 +377,21 @@ export function deriveUuidLike(seed: string, salt = ''): string {
   return [v.slice(0, 8), v.slice(8, 12), v.slice(12, 16), v.slice(16, 20), v.slice(20)].join('-')
 }
 
-/** 桌面端 UA（`desktop.go:43`）。 */
-export function desktopUserAgent(): string {
-  return `WorkBuddy/${DESKTOP_VERSION} WorkBuddy/${DESKTOP_VERSION} CLI/${DESKTOP_CLI_VERSION}`
+/**
+ * 桌面端 RPC/上报 UA（`desktop.go:80-89`，与 `desktopVersionTriple` 同源）。
+ *
+ * - `cn`：`WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0`
+ * - `global`：`workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0`
+ */
+export function desktopUserAgent(realm: UpstreamRealm = 'cn'): string {
+  const { version, cliVersion } = desktopVersionTriple(realm)
+  const brand = realm === 'global' ? 'workbuddy-ai' : 'WorkBuddy'
+  return `${brand}/${version} ${brand}/${version} CLI/${cliVersion}`
 }
 
 /** billing 域的单段 UA（`headers.go:88`）。 */
-export function billingUserAgent(): string {
-  return `WorkBuddy/${CLIENT_VERSION}`
+export function billingUserAgent(realm: UpstreamRealm = 'cn'): string {
+  return `WorkBuddy/${realm === 'global' ? INTL_DESKTOP_VERSION : CLIENT_VERSION}`
 }
 
 /** Web 域的 Chrome UA（Go 侧 web 事件用）。 */
@@ -447,16 +467,16 @@ export function cliCommonHeaders(input: {
     'X-Requested-With': 'XMLHttpRequest',
     Origin: webOrigin,
     Referer: `${webOrigin}/`,
-    // ⚠️ UA 按变体切换（中段 `WorkBuddy AI` 只在国际版出现）
+    // ⚠️ UA 按变体切换（国际版用小写 `workbuddy-ai` + `5.9.4/2.165.0`，国内版用 `5.11.3/2.176.0`）
     'User-Agent': intl ? cliUserAgentIntl() : cliUserAgent(),
     'X-CodeBuddy-Request': '1',
     'Accept-Language': 'zh-CN',
     'X-Machine-ID': input.machineId,
     'X-Session-ID': input.sessionId,
-    // ⚠️ 以下三个头**原先完全缺失**（实测缺陷），而参考实现必发：
-    // 它们共同构成「渠道归属」指纹。
+    // ⚠️ 以下头共同构成「渠道归属」指纹；国内 5.11.3 额外注入 X-Client-* 三头，国际版绝不注入。
     'X-Domain': domain,
     'X-Product-Code': intl ? 'workbuddy' : 'codebuddy',
+    ...clientIdentityHeaders(intl ? 'global' : 'cn'),
   }
 }
 
@@ -702,46 +722,61 @@ export function cliChatHeaders(input: {
  * billing 域头（`headers.go:375-400`）—— 签到/余额/CLI 活跃上报用。
  *
  * ⚠️ 与 chat 头的差异：**没有 `X-IDE-*` 归因头**，UA 是单段式。
- * Go 侧记录过「billing 单段 UA 形态」是并发修复的一部分。
+ * 国内 `5.11.3` 按 realm 注入 `X-Client-*` 身份三头（真机 3/3 命中），国际版绝不注入。
  */
-export function billingHeaders(input: { uid: string; accessToken: string }): HeaderMap {
+export function billingHeaders(input: { uid: string; accessToken: string; realm?: UpstreamRealm }): HeaderMap {
+  const realm: UpstreamRealm =
+    input.realm ?? (input.uid.startsWith('workbuddy:') ? 'global' : 'cn')
+  const isGlobal = realm === 'global'
+  const origin = isGlobal ? 'https://www.workbuddy.ai' : 'https://www.codebuddy.cn'
+  const domain = isGlobal ? 'www.workbuddy.ai' : 'www.codebuddy.cn'
   const headers: HeaderMap = {
     'Content-Type': 'application/json',
     Accept: 'application/json',
     'X-Requested-With': 'XMLHttpRequest',
-    Origin: 'https://www.codebuddy.cn',
-    Referer: 'https://www.codebuddy.cn/',
-    'User-Agent': billingUserAgent(),
+    Origin: origin,
+    Referer: `${origin}/`,
+    'User-Agent': billingUserAgent(realm),
     'X-CodeBuddy-Request': '1',
     'Accept-Language': 'zh-CN',
-    'X-Domain': 'www.codebuddy.cn',
+    'X-Domain': domain,
     'X-Product': 'SaaS',
+    ...clientIdentityHeaders(realm),
   }
   if (input.accessToken !== '') {
     headers.Authorization = `Bearer ${input.accessToken}`
-    headers['X-User-Id'] = input.uid
+    const uid = isGlobal ? input.uid.replace(/^workbuddy:/, '') : input.uid
+    if (uid !== '') headers['X-User-Id'] = uid
   }
   return headers
 }
 
 /**
- * 桌面指纹头（`desktop.go`，用于 `RichMeow_Chat` / 模板 / 画布 / 专家类任务）。
+ * 桌面指纹头（`desktop.go`，用于 `RichMeow_Chat` / 模板 / 画布 / 专家类任务 / `/v2/report`）。
  *
  * ⚠️ 关键差异：`X-Product: SaaS`（**不是** WorkBuddy）。桌面端上报认这个值。
+ * 国内版注入 `5.11.3` 的 `X-Client-*` 三头（真机 `/v2/report` 7/7 全带）；国际版严格隔离绝不注入。
  */
-export function desktopHeaders(input: { uid: string; accessToken: string }): HeaderMap {
+export function desktopHeaders(input: { uid: string; accessToken: string; realm?: UpstreamRealm }): HeaderMap {
+  const realm: UpstreamRealm =
+    input.realm ?? (input.uid.startsWith('workbuddy:') ? 'global' : 'cn')
+  const isGlobal = realm === 'global'
+  const origin = isGlobal ? 'https://www.workbuddy.ai' : 'https://copilot.tencent.com'
+  const domain = isGlobal ? 'www.workbuddy.ai' : 'copilot.tencent.com'
+  const uid = isGlobal ? input.uid.replace(/^workbuddy:/, '') : input.uid
   return {
     'Content-Type': 'application/json',
     Accept: 'application/json',
     'X-Requested-With': 'XMLHttpRequest',
-    Origin: 'https://copilot.tencent.com',
-    Referer: 'https://copilot.tencent.com/',
-    'User-Agent': desktopUserAgent(),
+    Origin: origin,
+    Referer: `${origin}/`,
+    'User-Agent': desktopUserAgent(realm),
     'X-CodeBuddy-Request': '1',
-    'X-Domain': 'copilot.tencent.com',
+    'X-Domain': domain,
     'X-Product': 'SaaS',
-    'X-User-Id': input.uid,
+    'X-User-Id': uid,
     'X-No-Enterprise-Id': '1',
+    ...clientIdentityHeaders(realm),
     ...(input.accessToken === '' ? {} : { Authorization: `Bearer ${input.accessToken}` }),
   }
 }
