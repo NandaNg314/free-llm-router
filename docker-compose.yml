@@ -1,12 +1,12 @@
-# free-llm-router —— AMD VPS 1 生产部署（Docker）
+# free-llm-router —— VPS 生产部署（Docker）
 #
-# ⚠️ 这份文件是**线上实际运行的唯一权威定义**，与 `/home/ubuntu/free-llm-router/run.sh` 一致。
+# ⚠️ 这份文件是**线上实际运行的唯一权威定义**，与 `run.sh` 一致。
 #    曾经它和 run.sh 互相矛盾（这里写 `11451:11451` 对公网，run.sh 写 `127.0.0.1:11452`），
 #    误用其中一份就会把面板直接暴露到公网 —— 那种「两份配置各说各话」正是要消除的。
 #
 # ## 端口为什么是 127.0.0.1:11452 而不是 0.0.0.0:11451
 #
-# 前面有 Caddy 做 TLS 反代（`router.enking.org`），容器**只允许本机访问**。
+# 前面有 Caddy 做 TLS 反代（`router.example.com`），容器**只允许本机访问**。
 # 对外暴露端口等于绕开 Caddy 的 TLS 与鉴权边界。
 #
 # ## 为什么挂载 dist/server.mjs 而不是在镜像里构建
@@ -20,6 +20,8 @@ services:
     image: free-llm-router:latest
     container_name: free-llm-router
     restart: unless-stopped
+    mem_limit: 512m
+    memswap_limit: 768m
     # ⚠️ 只绑本机回环：外部访问一律走 Caddy
     ports:
       - "127.0.0.1:11452:11451"

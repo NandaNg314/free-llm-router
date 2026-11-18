@@ -1,5 +1,5 @@
 #!/bin/bash
-# free-llm-router —— 生产启动 / 重启脚本（AMD VPS 1）
+# free-llm-router —— 生产启动 / 重启脚本（VPS / Docker）
 #
 # ⚠️ 与 docker-compose.yml **必须保持一致**。两份配置各写一份就会分叉：
 #    线上真实发生过「compose 写 0.0.0.0:11451 对公网、本脚本写 127.0.0.1:11452」，
@@ -11,7 +11,7 @@
 #
 # 更新流程（完整）：
 #   本地   npm run build:node
-#   上传   scp dist/server.mjs ubuntu@129.153.72.82:/home/ubuntu/free-llm-router/dist/
+#   上传   scp dist/server.mjs user@<YOUR_VPS_IP>:/opt/free-llm-router/dist/
 #   服务器 在 dist/ 里先备份旧产物，再 bash ../run.sh
 set -euo pipefail
 
@@ -38,6 +38,8 @@ echo "🚀 启动..."
 sudo docker run -d \
   --name free-llm-router \
   --restart unless-stopped \
+  --memory 512m \
+  --memory-swap 768m \
   -p 127.0.0.1:11452:11451 \
   --env-file "$PWD/.env" \
   -v "$PWD/data:/app/data" \
