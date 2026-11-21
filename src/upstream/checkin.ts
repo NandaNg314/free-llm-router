@@ -125,6 +125,41 @@ export async function checkinStatus(
   return res.envelope?.data?.today_checked_in === true
 }
 
+/** 签到活动状态（含今日/每日积分与连签天数，供面板与巡检展示）。 */
+export interface CheckinActivity {
+  checkedIn: boolean
+  dailyCredit: number
+  todayCredit: number
+  streakDays: number
+}
+
+export async function checkinActivity(
+  ctx: { uid: string; accessToken: string },
+  env: Env,
+): Promise<CheckinActivity> {
+  const bases = resolveUpstream(env)
+  const res = await callUpstream<Record<string, unknown>>({
+    method: 'POST',
+    url: `${bases.billing}/v2/billing/meter/checkin-activity-status`,
+    headers: billingHeaders({ uid: ctx.uid, accessToken: ctx.accessToken }),
+    body: '{}',
+  })
+  const data = res.envelope?.data
+  const num = (...keys: string[]): number => {
+    for (const key of keys) {
+      const value = data?.[key]
+      if (typeof value === 'number' && Number.isFinite(value)) return value
+    }
+    return 0
+  }
+  return {
+    checkedIn: data?.today_checked_in === true,
+    dailyCredit: num('daily_credit', 'dailyCredit'),
+    todayCredit: num('today_credit', 'todayCredit', 'credit'),
+    streakDays: num('streak_days', 'streakDays'),
+  }
+}
+
 /**
  * 执行每日签到。
  *

@@ -131,7 +131,7 @@ import {
 } from './gateway/authz.js'
 import { authBlocked, noteAuthFailure, noteAuthSuccess } from './gateway/inbound-limit.js'
 import { BodyTooLargeError, MAX_IMPORT_BYTES, MAX_REQUEST_BYTES, readJsonCapped } from './gateway/body.js'
-import { fetchBalance } from './upstream/checkin.js'
+import { checkinActivity, fetchBalance } from './upstream/checkin.js'
 import { claimCompensation, fetchCompensationStatus } from './upstream/compensation.js'
 import {
   CampaignError,
@@ -3918,6 +3918,11 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       try {
         const tasks = await listTasks({ uid: a.uid, accessToken: credential.accessToken, realm }, env)
         const pending = tasks.filter((t) => !t.claimed)
+        const claimed = tasks.filter((t) => t.claimed)
+        const sumCredit = (list: typeof tasks): number => list.reduce((acc, t) => acc + t.credit, 0)
+        const checkin = realm === 'cn'
+          ? await checkinActivity({ uid: a.uid, accessToken: credential.accessToken }, env).catch(() => undefined)
+          : undefined
         out.push({
           uid: a.uid,
           nickname: a.nickname,
@@ -3925,6 +3930,23 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           pendingCount: pending.length,
           claimable: tasks.filter((t) => t.claimable).map((t) => t.taskCode),
           pending: pending.map((t) => `${t.taskCode}(${t.current}/${t.target})`),
+          // 每日积分明细：已领任务 + 未领任务（含奖励额度），供面板/巡检核对。
+          claimedCredit: sumCredit(claimed),
+          pendingCredit: sumCredit(pending),
+          checkin,
+          tasks: tasks.map((t) => ({
+            code: t.taskCode,
+            title: t.title,
+            description: t.description,
+            credit: t.credit,
+            energy: t.energy,
+            current: t.current,
+            target: t.target,
+            claimed: t.claimed,
+            claimable: t.claimable,
+            acceptStatus: t.acceptStatus,
+            status: t.status,
+          })),
         })
       } catch (error) {
         out.push({ uid: a.uid, error: error instanceof Error ? error.message : String(error) })
@@ -5465,8 +5487,10 @@ interface ScheduleJob {
 
 const SCHEDULE_UTC8: Record<number, ScheduleJob> = {
   1: { plan: 'growth', includeRealChat: true }, // 北京时间凌晨 1 点：完整的 Buddy 每日任务（签到 + 活动 + 全部成长任务 + 真实对话 + 自动领奖）
+  // 03:00 补偿：只重跑 01:00 失败/未完成的账号（成功后去重会跳过）。
+  3: { plan: 'growth', includeRealChat: true },
   9: { plan: 'daily' }, // 签到
-  21: { plan: 'daily' }, // 签到（第二趟）
+  21: { plan: 'daily' }, // 签到（第二趟，09:00 失败时重试）
 }
 
 /** 取当前 UTC+8 小时。用固定偏移，不依赖 `Intl`/本机时区（Workers 恒 UTC）。 */
