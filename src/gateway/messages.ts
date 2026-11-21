@@ -39,6 +39,7 @@ import {
   type AggregatedCompletion,
 } from './stream.js'
 import { handleChatCompletions } from './server.js'
+import { buildWebToolContext, detectServerWebTools, lastUserText } from './web-tools.js'
 import type { Env } from '../env.js'
 
 // ─────────────────────────── 类型与基础工具 ───────────────────────────
@@ -633,7 +634,11 @@ function convertOutputFormat(body: MessagesRequest): Record<string, unknown> | u
 /**
  * 将入站 Anthropic Messages 请求体转换为内部 Chat Completions 请求体。
  */
-export function messagesToChatBody(body: MessagesRequest, model: string): Record<string, unknown> {
+export function messagesToChatBody(
+  body: MessagesRequest,
+  model: string,
+  serverToolContext?: string,
+): Record<string, unknown> {
   if (!Array.isArray(body.messages)) {
     throw new MessagesError('messages must be an array')
   }
@@ -648,7 +653,8 @@ export function messagesToChatBody(body: MessagesRequest, model: string): Record
   if (skippedServerTools.length > 0) {
     chatMessages.push({
       role: 'system',
-      content: `These Anthropic server tools are not available here: ${skippedServerTools.join(', ')}. Do not call them.`,
+      content: serverToolContext
+        ?? `These Anthropic server tools are not available here: ${skippedServerTools.join(', ')}. Do not call them.`,
     })
   }
 
@@ -1372,9 +1378,23 @@ export async function handleMessages(
     return { response: anthropicErrorJson('model 必填', 400, 'invalid_request_error') }
   }
 
+  // 客户端声明了托管网页工具时，网关先执行一次预检索并注入上下文；
+  // 失败不阻断对话（上下文里写明失败原因）。
+  const serverTools = detectServerWebTools(body.tools)
+  const webContext = serverTools.search || serverTools.fetch
+    ? await buildWebToolContext({
+        search: serverTools.search,
+        fetch: serverTools.fetch,
+        text: lastUserText(body.messages),
+        env,
+        ctx,
+        signal: request.signal,
+      })
+    : undefined
+
   let chatBody: Record<string, unknown>
   try {
-    chatBody = messagesToChatBody(body, model)
+    chatBody = messagesToChatBody(body, model, webContext)
   } catch (error) {
     if (error instanceof MessagesError) {
       return { response: anthropicErrorJson(error.message, error.status, error.errorType) }

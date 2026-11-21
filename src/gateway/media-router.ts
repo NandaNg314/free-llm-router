@@ -53,8 +53,17 @@ import {
   type ThreeDCallOptions,
   type ThreeDState,
 } from '../upstream/three-d.js'
+import {
+  ASR_REQUEST_MAX_BYTES,
+  AudioRequestError,
+  pcmToWav,
+  parseAudioMultipart,
+  speechToPcm,
+  transcribeAudio,
+  TTS_DEFAULT_VOICE,
+} from '../upstream/audio.js'
 import { settleSubkeyUsage } from './authz.js'
-import { BodyTooLargeError, MAX_REQUEST_BYTES, readJsonCapped } from './body.js'
+import { BodyTooLargeError, MAX_REQUEST_BYTES, readBytesCapped, readJsonCapped } from './body.js'
 import { json, jsonError } from './http.js'
 import { recordLog } from './server.js'
 
@@ -774,7 +783,7 @@ export async function resolveMediaRealm(env: Env, url: URL): Promise<string> {
   }
 }
 
-function buildDualRealmTargets(preferredRealm: string): RealmTarget[] {
+export function buildDualRealmTargets(preferredRealm: string): RealmTarget[] {
   return preferredRealm === 'global'
     ? [
         { realm: 'global', providerId: WORKBUDDY_INTL.id },
@@ -1730,6 +1739,245 @@ export async function runMediaFetch(
   }
 }
 
+// ─────────────────────── 语音（TTS / ASR） ───────────────────────
+
+export async function runMediaSpeech(
+  env: Env,
+  input: { text: string; voice: string },
+  options: { targets?: readonly RealmTarget[] } & MediaExecutionHooks = {},
+): Promise<{ pcm: Uint8Array; uid: string }> {
+  const startedAt = Date.now()
+  const targets = options.targets ?? buildDualRealmTargets('cn')
+  const primaryPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(targets[0]?.realm ?? 'cn'))
+
+  try {
+    const { value, account } = await executeMediaWithFailover(
+      env,
+      targets,
+      (acc) => {
+        const enterpriseId = acc.credential.extras?.enterpriseId || acc.credential.extras?.enterprise_id
+        return speechToPcm(
+          {
+            uid: acc.uid,
+            accessToken: acc.credential.accessToken,
+            realm: acc.realm,
+            ...(enterpriseId ? { enterpriseId } : {}),
+          },
+          env,
+          { ...input, signal: options.signal },
+        )
+      },
+      {
+        requireCredits: false,
+        modelForStats: 'tts',
+        refreshImpl: options.refreshImpl,
+        ctx: options.ctx,
+      },
+    )
+    recordMediaAudit({
+      env,
+      pool: account.pool,
+      uid: account.uid,
+      providerId: account.providerId,
+      model: options.logType === 'mcp' ? 'mcp:tts' : 'tts',
+      status: 200,
+      startedAt,
+      logType: options.logType,
+      recordUsageEntry: false,
+      ctx: options.ctx,
+    })
+    return { pcm: value.pcm, uid: account.uid }
+  } catch (error) {
+    const status = error instanceof NoAvailableMediaAccountError
+      ? 503
+      : error instanceof AudioRequestError
+        ? error.httpStatus
+        : isClientBadRequest(error)
+          ? 400
+          : 502
+    recordMediaAudit({
+      env,
+      pool: primaryPool,
+      uid: 'unassigned',
+      providerId: targets[0]?.providerId ?? DEFAULT_PROVIDER,
+      model: options.logType === 'mcp' ? 'mcp:tts' : 'tts',
+      status,
+      startedAt,
+      logType: options.logType,
+      errorText: error instanceof Error ? error.message : String(error),
+      ctx: options.ctx,
+    })
+    throw error
+  }
+}
+
+export async function runMediaTranscribe(
+  env: Env,
+  input: { audio: Uint8Array; filename: string; mime: string },
+  options: { targets?: readonly RealmTarget[] } & MediaExecutionHooks = {},
+): Promise<{ text: string; uid: string }> {
+  const startedAt = Date.now()
+  const targets = options.targets ?? buildDualRealmTargets('cn')
+  const primaryPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(targets[0]?.realm ?? 'cn'))
+
+  try {
+    const { value, account } = await executeMediaWithFailover(
+      env,
+      targets,
+      (acc) => {
+        const enterpriseId = acc.credential.extras?.enterpriseId || acc.credential.extras?.enterprise_id
+        return transcribeAudio(
+          {
+            uid: acc.uid,
+            accessToken: acc.credential.accessToken,
+            realm: acc.realm,
+            ...(enterpriseId ? { enterpriseId } : {}),
+          },
+          env,
+          { ...input, signal: options.signal },
+        )
+      },
+      {
+        requireCredits: false,
+        modelForStats: 'asr',
+        refreshImpl: options.refreshImpl,
+        ctx: options.ctx,
+      },
+    )
+    recordMediaAudit({
+      env,
+      pool: account.pool,
+      uid: account.uid,
+      providerId: account.providerId,
+      model: options.logType === 'mcp' ? 'mcp:asr' : 'asr',
+      status: 200,
+      startedAt,
+      logType: options.logType,
+      recordUsageEntry: false,
+      ctx: options.ctx,
+    })
+    return { text: value, uid: account.uid }
+  } catch (error) {
+    const status = error instanceof NoAvailableMediaAccountError
+      ? 503
+      : error instanceof AudioRequestError
+        ? error.httpStatus
+        : isClientBadRequest(error)
+          ? 400
+          : 502
+    recordMediaAudit({
+      env,
+      pool: primaryPool,
+      uid: 'unassigned',
+      providerId: targets[0]?.providerId ?? DEFAULT_PROVIDER,
+      model: options.logType === 'mcp' ? 'mcp:asr' : 'asr',
+      status,
+      startedAt,
+      logType: options.logType,
+      errorText: error instanceof Error ? error.message : String(error),
+      ctx: options.ctx,
+    })
+    throw error
+  }
+}
+
+function audioErrorResponse(error: unknown): Response {
+  if (error instanceof AudioRequestError) {
+    return jsonError(error.httpStatus, error.message, error.httpStatus === 413 ? 'payload_too_large' : 'invalid_request')
+  }
+  return mapMediaErrorToResponse(error)
+}
+
+/** `POST /v1/audio/speech`（OpenAI 兼容 TTS） */
+export async function handleAudioSpeech(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext,
+): Promise<Response> {
+  const parsed = await parseJsonObjectBody(request)
+  if (!parsed.ok) return parsed.response
+  const { body } = parsed
+
+  const text = typeof body.input === 'string' ? body.input.trim() : ''
+  if (text === '') return jsonError(400, 'input 不能为空', 'invalid_request')
+  const voice = typeof body.voice === 'string' && body.voice.trim() !== '' ? body.voice.trim() : TTS_DEFAULT_VOICE
+  const format = typeof body.response_format === 'string' && body.response_format.trim() !== ''
+    ? body.response_format.trim().toLowerCase()
+    : 'wav'
+  if (format !== 'wav' && format !== 'pcm') {
+    return jsonError(
+      400,
+      'response_format 只支持 wav 或 pcm：上游不提供 MP3，返回 MP3 头配 PCM 数据会让所有播放器都打不开。',
+      'unsupported_audio_format',
+    )
+  }
+
+  const url = new URL(request.url)
+  const preferred = url.searchParams.get('realm') ?? 'cn'
+  const targets = buildDualRealmTargets(preferred)
+  try {
+    const { pcm } = await runMediaSpeech(
+      env,
+      { text, voice },
+      { targets, ctx, signal: request.signal },
+    )
+    const bytes = format === 'wav' ? pcmToWav(pcm) : pcm
+    return new Response(bytes, {
+      status: 200,
+      headers: {
+        'content-type': format === 'wav' ? 'audio/wav' : 'audio/pcm',
+        'content-length': String(bytes.byteLength),
+        'cache-control': 'no-store',
+      },
+    })
+  } catch (error) {
+    return audioErrorResponse(error)
+  }
+}
+
+/** `POST /v1/audio/transcriptions`（OpenAI 兼容 ASR） */
+export async function handleAudioTranscriptions(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext,
+): Promise<Response> {
+  const contentType = request.headers.get('content-type') ?? ''
+  if (!contentType.toLowerCase().includes('multipart/form-data')) {
+    return jsonError(400, 'content-type 必须是 multipart/form-data', 'invalid_request')
+  }
+
+  let bytes: Uint8Array
+  try {
+    bytes = await readBytesCapped(request, ASR_REQUEST_MAX_BYTES)
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) {
+      return jsonError(413, '音频超过 3 MiB 上限', 'payload_too_large')
+    }
+    return jsonError(400, '读取请求体失败', 'invalid_request')
+  }
+
+  let part: { data: Uint8Array; filename: string; mime: string }
+  try {
+    part = parseAudioMultipart(bytes, contentType)
+  } catch (error) {
+    return audioErrorResponse(error)
+  }
+
+  const url = new URL(request.url)
+  const preferred = url.searchParams.get('realm') ?? 'cn'
+  const targets = buildDualRealmTargets(preferred)
+  try {
+    const { text } = await runMediaTranscribe(
+      env,
+      { audio: part.data, filename: part.filename, mime: part.mime },
+      { targets, ctx, signal: request.signal },
+    )
+    return json({ text })
+  } catch (error) {
+    return audioErrorResponse(error)
+  }
+}
+
 // ─────────────────────── REST HTTP Handlers（供 src/index.ts 一行转发） ───────────────────────
 
 async function parseJsonObjectBody(
@@ -2180,5 +2428,62 @@ export async function handleFetch(
     return json({ url: r.url, title: r.title, content: r.content })
   } catch (error) {
     return mapMediaErrorToResponse(error, '没有可用的抓取凭据（请先登录国内或国际版账号）')
+  }
+}
+
+/** `POST /v1/tools/search_fetch`：先检索，再抓取前 N 条结果正文。 */
+export async function handleSearchFetch(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext,
+): Promise<Response> {
+  const parsed = await parseJsonObjectBody(request)
+  if (!parsed.ok) return parsed.response
+  const { body } = parsed
+
+  const query = typeof body.query === 'string' ? body.query.trim() : ''
+  if (query === '') return jsonError(400, 'query 不能为空', 'invalid_request_error')
+  const countRaw = body.max_results
+  const maxResults = typeof countRaw === 'number' && countRaw > 0 ? Math.min(countRaw, 20) : 5
+  const topRaw = body.fetch_top_n
+  const topN = typeof topRaw === 'number' && topRaw > 0 ? Math.min(Math.floor(topRaw), 3) : 1
+  const prompt = typeof body.prompt === 'string' && body.prompt.trim() !== '' ? body.prompt.trim() : undefined
+
+  const url = new URL(request.url)
+  const preferredRealm = await resolveMediaRealm(env, url)
+  const targets = buildDualRealmTargets(preferredRealm)
+
+  try {
+    const { result: search } = await runMediaSearch(
+      env,
+      { query, count: maxResults, rerank: true },
+      { targets, ctx, signal: request.signal },
+    )
+    const pages: Array<{ url: string; title: string; content: string; error?: string }> = []
+    for (const item of search.results.slice(0, topN)) {
+      try {
+        const { result } = await runMediaFetch(
+          env,
+          { url: item.url, ...(prompt === undefined ? {} : { prompt }) },
+          { targets, ctx, signal: request.signal },
+        )
+        pages.push({ url: result.url, title: result.title || item.title, content: result.content })
+      } catch (error) {
+        pages.push({
+          url: item.url,
+          title: item.title,
+          content: '',
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return json({
+      query: search.query,
+      results: search.results,
+      pages,
+      ...(search.total === undefined ? {} : { total_results: search.total }),
+    })
+  } catch (error) {
+    return mapMediaErrorToResponse(error, '没有可用的检索凭据（请先登录国内或国际版账号）')
   }
 }

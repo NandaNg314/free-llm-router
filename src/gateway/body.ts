@@ -87,6 +87,47 @@ export async function readJsonCapped(
 }
 
 /**
+ * 读二进制 body，但**有硬上限**（供 multipart 音频等非 JSON 请求使用）。
+ */
+export async function readBytesCapped(
+  request: Request,
+  limit: number = MAX_REQUEST_BYTES,
+): Promise<Uint8Array> {
+  const declared = Number(request.headers.get('content-length') ?? '')
+  if (Number.isFinite(declared) && declared > limit) {
+    throw new BodyTooLargeError(limit, declared)
+  }
+  if (request.body === null) return new Uint8Array(0)
+
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value === undefined) continue
+      total += value.byteLength
+      if (total > limit) {
+        await reader.cancel().catch(() => undefined)
+        throw new BodyTooLargeError(limit, total)
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock?.()
+  }
+
+  const buf = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    buf.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return buf
+}
+
+/**
  * 读文本但**只保留前 `limit` 字节**（多余部分直接丢弃，不驻留内存）。
  *
  * 🔴 用于**上游错误响应体**（2026-10-21 审查补，并发专项）：

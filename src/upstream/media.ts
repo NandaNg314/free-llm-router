@@ -85,7 +85,7 @@ function agentToolTraceparent(): string {
   return `00-${hex.slice(0, 32)}-${hex.slice(32)}-01`
 }
 
-function buildCnAgentToolHeaders(uid: string, accessToken: string, enterpriseId?: string): Record<string, string> {
+export function buildCnAgentToolHeaders(uid: string, accessToken: string, enterpriseId?: string): Record<string, string> {
   const cleanUid = uid.replace(/^buddy:|^workbuddy:/, '')
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',

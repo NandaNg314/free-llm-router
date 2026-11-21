@@ -16,9 +16,11 @@ import {
   fillDeepseekEffort,
   isDeepseekThinking,
   mergeAdjacentToolCalls,
+  mirrorReasoningContent,
   normalizeStop,
   normalizeToolChoice,
   normalizeTools,
+  padEmptyTextParts,
   prepareChatBody,
   reorderEarlyToolResults,
   repackToolResultBlocks,
@@ -648,4 +650,44 @@ test('11134（模型供应方暂不可用）⇒ 模型级繁忙，不按账号�
   const c = classify(502, text)
   assert.equal(c.kind, 'rate_limited')
   assert.equal(refineModelScoped(c.kind, text).dimension, 'model')
+})
+
+// ─────────────────────── 11151：空 text 段补位 ───────────────────────
+
+test('padEmptyTextParts：空 text 段补一个空格，其余内容与引用不变', () => {
+  const parts = [{ type: 'text', text: '' }, { type: 'image_url', image_url: { url: 'x' } }]
+  const msgs = [{ role: 'user', content: parts }]
+  const out = padEmptyTextParts(msgs) as M[]
+  assert.notEqual(out, msgs)
+  assert.deepEqual((out[0]!.content as M[])[0], { type: 'text', text: ' ' })
+  assert.deepEqual((out[0]!.content as M[])[1], parts[1], '非 text 段原样保留')
+  assert.equal(parts[0]!.text, '', '不得就地改写入参')
+})
+
+test('padEmptyTextParts：无空段 / 字符串正文 / 非数组内容均零改动（返回同一引用）', () => {
+  const clean = [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }]
+  assert.equal(padEmptyTextParts(clean), clean)
+  const str = [{ role: 'user', content: '' }]
+  assert.equal(padEmptyTextParts(str), str)
+  const tool = [{ role: 'tool', tool_call_id: 'x', content: '' }]
+  assert.equal(padEmptyTextParts(tool), tool)
+})
+
+// ─────────────────────── 历史思考镜像 ───────────────────────
+
+test('mirrorReasoningContent：kimi/glm/minimax 等模型把非空 reasoning_content 镜像到 reasoning', () => {
+  for (const model of ['buddy/kimi-k3', 'glm-5.3-flash', 'minimax-m3', 'mimo-x', 'step-2', 'space-bunny-1']) {
+    const msgs = [{ role: 'assistant', content: 'ok', reasoning_content: 'think' }]
+    const out = mirrorReasoningContent(msgs, model) as M[]
+    assert.equal(out[0]!.reasoning, 'think', model)
+  }
+})
+
+test('mirrorReasoningContent：空思考 / 已有 reasoning / 其他模型均零改动', () => {
+  const empty = [{ role: 'assistant', content: 'ok', reasoning_content: '' }]
+  assert.equal(mirrorReasoningContent(empty, 'kimi-k3'), empty)
+  const already = [{ role: 'assistant', content: 'ok', reasoning_content: 'a', reasoning: 'b' }]
+  assert.equal(mirrorReasoningContent(already, 'kimi-k3'), already)
+  const deepseek = [{ role: 'assistant', content: 'ok', reasoning_content: 'a' }]
+  assert.equal(mirrorReasoningContent(deepseek, 'deepseek-v4.1-flash'), deepseek)
 })

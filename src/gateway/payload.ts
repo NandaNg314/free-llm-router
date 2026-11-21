@@ -804,6 +804,55 @@ export function backfillReasoningContent(messages: unknown[], model: unknown, th
 }
 
 /**
+ * 空 `text` 段补一个空格（移植自 workbuddy2api-hub #840）。
+ *
+ * 上游对每个 `type:"text"` 段做长度校验：空串回 400 `code=11151`，
+ * 且会把该会话标脏、后续重试同样失败。客户端（尤其是 Anthropic / Responses
+ * 转 Chat 的路径）常常产出只有图片没有文字的 text 段。
+ */
+export function padEmptyTextParts(messages: unknown[]): unknown[] {
+  let changed = false
+  const out = messages.map((m) => {
+    if (!isObj(m) || !Array.isArray(m.content)) return m
+    let touched = false
+    const parts = m.content.map((part) => {
+      if (!isObj(part) || part.type !== 'text' || typeof part.text !== 'string' || part.text !== '') return part
+      touched = true
+      return { ...part, text: ' ' }
+    })
+    if (!touched) return m
+    changed = true
+    return { ...m, content: parts }
+  })
+  return changed ? out : messages
+}
+
+/**
+ * 把非空 `reasoning_content` 镜像到上游读取的 `reasoning` 字段
+ * （移植自 workbuddy2api-hub v2.0.2）。
+ *
+ * kimi / glm / minimax / mimo / step / space-bunny 的上游只读 `reasoning`，
+ * 而客户端回放历史时往往只带 `reasoning_content`。只镜像**非空**内容，
+ * 不写空白占位（DeepSeek 那条路径的占位规则见 {@link backfillReasoningContent}）。
+ */
+const REASONING_MIRROR_PREFIXES = ['kimi', 'glm', 'minimax', 'mimo', 'step', 'space-bunny'] as const
+
+export function mirrorReasoningContent(messages: unknown[], model: unknown): unknown[] {
+  const bare = bareModel(model)
+  if (bare === '' || !REASONING_MIRROR_PREFIXES.some((prefix) => bare.startsWith(prefix))) return messages
+  let changed = false
+  const out = messages.map((m) => {
+    if (!isObj(m) || m.role !== 'assistant') return m
+    const rc = m.reasoning_content
+    if (typeof rc !== 'string' || rc === '') return m
+    if (typeof m.reasoning === 'string' && m.reasoning !== '') return m
+    changed = true
+    return { ...m, reasoning: rc }
+  })
+  return changed ? out : messages
+}
+
+/**
  * `stop` 归一化：字符串 → 单元素数组（移植自 workbuddy2api-hub `normalize_stop`）。
  *
  * OpenAI 允许 `string | string[]`，上游 Go 端却定死为 `[]string`：
@@ -1616,6 +1665,16 @@ export function prepareChatBody(input: unknown): PrepareResult {
   if (cleaned !== messages) {
     messages = cleaned
     applied.push('tool-pairing')
+  }
+  const padded = padEmptyTextParts(messages)
+  if (padded !== messages) {
+    messages = padded
+    applied.push('empty-text-pad')
+  }
+  const mirrored = mirrorReasoningContent(messages, body.model)
+  if (mirrored !== messages) {
+    messages = mirrored
+    applied.push('reasoning-mirror')
   }
   const backfilled = backfillReasoningContent(messages, body.model, isDeepseekThinking(body))
   if (backfilled !== messages) {

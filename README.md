@@ -63,7 +63,9 @@
 - **生图** `/v1/images/generations`、**改图** `/v1/images/edits`（国际版账号，支持传入本地图片 data URL）
 - **视频** `/v1/videos/generations`、`/v1/videos/tasks`（国际版账号，异步提交 + 归属账号轮询，支持首尾帧图生视频）
 - **混元 3D** `/v1/3d/generations`、`/v1/3d/tasks`、`GET /v1/3d/:jobId`（国际版与国内版 OAuth 账号均支持，自动签发临时云凭证 + TC3 签名，输出 `GLB` / `OBJ` / `FBX` / `STL` / `USDZ`）
-- **联网检索** `/v1/search`、**网页抓取** `/v1/fetch`（双分片智能选号与容灾）
+- **联网检索** `/v1/search`、**网页抓取** `/v1/fetch`（双分片智能选号与容灾）；同时提供 `/v1/tools/search|fetch|search_fetch` 与伪模型 `wb-search` / `wb-fetch` / `wb-search-fetch`（直接经 Chat 协议返回结果，不消耗模型额度）
+- **网页工具注入**：Anthropic `web_search_*` / `web_fetch_*` 与 Responses 托管 `web_search` 由网关真实执行预检索并注入上下文，不再静默丢弃
+- **语音** `/v1/audio/speech`（TTS，WAV / PCM）与 `/v1/audio/transcriptions`（ASR，multipart，3 MiB 上限）
 - **MCP** `/mcp` —— OpenCode / Claude Code / Cursor / Cline 自动发现 7 项工具（检索、抓取、生图、视频提交/查询、3D 提交/查询）
 
 ### 管理与安全
@@ -302,6 +304,11 @@ curl -X POST http://127.0.0.1:11451/v1/fetch -H "Authorization: Bearer $KEY" \
 | GET | `/v1/3d/:jobId` | 按 Job ID 查询混元 3D 任务 |
 | POST | `/v1/search` | 联网检索 |
 | POST | `/v1/fetch` | 抓网页正文 |
+| POST | `/v1/tools/search` | 联网检索（tools 命名） |
+| POST | `/v1/tools/fetch` | 抓网页正文（tools 命名） |
+| POST | `/v1/tools/search_fetch` | 检索并抓取前 N 条结果 |
+| POST | `/v1/audio/speech` | 语音合成（OpenAI 兼容，WAV / PCM） |
+| POST | `/v1/audio/transcriptions` | 语音转写（OpenAI 兼容，multipart） |
 | POST | `/mcp` | MCP（Streamable HTTP，7 项工具） |
 | GET | `/admin/campaign` | 查询国内个人版账号运营活动进度 |
 | POST | `/admin/campaign/claim` | 批量预演或领取运营活动奖励（默认 `dryRun: true`） |

@@ -89,12 +89,16 @@ import {
   setAutoContinuationOverride,
 } from './gateway/server.js'
 import { handleMcp } from './gateway/mcp.js'
+import { WEB_TOOL_MODELS } from './gateway/web-tools.js'
 import {
   checkMediaSubkeyModel,
+  handleAudioSpeech,
+  handleAudioTranscriptions,
   handleFetch,
   handleImageEdits,
   handleImageGenerations,
   handleSearch,
+  handleSearchFetch,
   handleThreeDGenerations,
   handleThreeDJobGet,
   handleThreeDTasks,
@@ -4963,6 +4967,21 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         'no_available_account',
       )
     }
+
+    // 网页工具伪模型：不经过任何上游模型，直接用网关的 /agenttool 能力返回结果。
+    const webToolNames: Record<(typeof WEB_TOOL_MODELS)[number], string> = {
+      'wb-search': '联网检索（直接返回结果）',
+      'wb-fetch': '网页抓取（直接返回正文）',
+      'wb-search-fetch': '检索 + 抓取（直接返回结果）',
+    }
+    for (const id of WEB_TOOL_MODELS) {
+      data.push(
+        annotateModelEntry(
+          { id, object: 'model', owned_by: 'web', name: webToolNames[id] },
+          'web',
+        ),
+      )
+    }
     /**
      * 🔴 **子密钥的模型白名单必须作用于目录本身**（2026-10-21 审查补，安全面专项）。
      *
@@ -5063,6 +5082,29 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
   if (path === '/v1/fetch' && request.method === 'POST') {
     return await handleFetch(request, env, ctx)
+  }
+
+  // ── 网页工具网关（与 /v1/search、/v1/fetch 同后端，只是换成 tools 命名） ──
+  if (path === '/v1/tools/search' && request.method === 'POST') {
+    return await handleSearch(request, env, ctx)
+  }
+  if (path === '/v1/tools/fetch' && request.method === 'POST') {
+    return await handleFetch(request, env, ctx)
+  }
+  if ((path === '/v1/tools/search_fetch' || path === '/v1/tools/search-fetch') && request.method === 'POST') {
+    return await handleSearchFetch(request, env, ctx)
+  }
+
+  // ── OpenAI 兼容语音（TTS / ASR） ──
+  if (path === '/v1/audio/speech' && request.method === 'POST') {
+    const denied = checkMediaSubkeyModel(subkeyRecord, ['tts', 'hunyuan-tts-2.5'])
+    if (denied !== undefined) return denied
+    return await handleAudioSpeech(request, env, ctx)
+  }
+  if (path === '/v1/audio/transcriptions' && request.method === 'POST') {
+    const denied = checkMediaSubkeyModel(subkeyRecord, ['asr'])
+    if (denied !== undefined) return denied
+    return await handleAudioTranscriptions(request, env, ctx)
   }
 
   if ((path === '/v1/videos/generations' || path === '/v1/videos') && request.method === 'POST') {

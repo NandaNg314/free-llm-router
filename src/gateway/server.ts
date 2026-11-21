@@ -42,7 +42,15 @@ import { deriveDeviceId, referenceChatHeaders } from '../upstream/headers.js'
 import { deriveIntlConversationId, newTurnRequestId } from '../upstream/conversation.js'
 import { deriveStickySessionKey, extractCallerScope, isGenericCallerUser } from '../providers/conversation.js'
 import { wrapContinuationStream } from './continuation.js'
-import { cleanupToolPairing, prepareChatBody, requestHasImage, sanitizeChatBody, trimMessagesByLimit } from './payload.js'
+import {
+  cleanupToolPairing,
+  mirrorReasoningContent,
+  padEmptyTextParts,
+  prepareChatBody,
+  requestHasImage,
+  sanitizeChatBody,
+  trimMessagesByLimit,
+} from './payload.js'
 import { BodyTooLargeError, readJsonCapped } from './body.js'
 import { resolveSafetyFor, safetyConfigFor } from './safety.js'
 import { throttleUpstream } from './throttle.js'
@@ -948,6 +956,15 @@ export async function handleChatCompletions(
       ? ((rawBody as Record<string, unknown>).model as string)
       : ''
 
+  // ── 网页工具伪模型（wb-search / wb-fetch / wb-search-fetch）──
+  //
+  // 动态 import：`web-tools` 依赖 `media-router`，而 `media-router` 又依赖本文件的
+  // `recordLog` —— 静态 import 会形成环。伪模型只在命中时才加载，正常请求零成本。
+  if (/^(?:[^/]+\/)?wb-(?:search|fetch|search-fetch)$/i.test(rawModel.trim())) {
+    const { handleWebToolChat } = await import('./web-tools.js')
+    return await handleWebToolChat(rawBody, env, ctx, rawModel, request.signal)
+  }
+
   // ── 单请求消息数硬上限（全链路唯一一处裁剪） ──
   //
   // ## 为什么插在这里（而不是 `handleProviderChat` 或 `prepareChatBody` 里）
@@ -990,7 +1007,9 @@ export async function handleChatCompletions(
     const msgBody = rawBody as Record<string, unknown>
     if (Array.isArray(msgBody.messages)) {
       const before = msgBody.messages as unknown[]
-      const normalized = cleanupToolPairing(before)
+      let normalized = cleanupToolPairing(before)
+      normalized = padEmptyTextParts(normalized)
+      normalized = mirrorReasoningContent(normalized, rawModel)
       if (normalized !== before) {
         rawBody = { ...msgBody, messages: normalized }
         // ⚠️ 隐私红线：只打模型名，不打任何消息内容。
@@ -2294,8 +2313,12 @@ function streamResponse(
               }
               controller.enqueue(encoder.encode(translator.translate(frame.data)))
             } else if (frame.kind === 'error') {
-              // ⚠️ 非预期形状必须让客户端看到（不静默丢）
+              // ⚠️ 非预期形状必须让客户端看到（不静默丢）。
+              // 错误帧是**终态**：不再继续读上游，也不补 finish / usage / [DONE]
+              // （OpenAI SSE 里 error 之后的内容一律没有语义）。
               controller.enqueue(encoder.encode(errorFrame(frame.error ?? '非预期帧')))
+              errorDetected = true
+              break
             }
             nl = buffer.indexOf('\n', start)
           }
@@ -2345,8 +2368,8 @@ function streamResponse(
           hooks.onError(msg)
           hooks.onFinish?.(undefined)
           try {
+            // 错误帧是终态，不再补 [DONE]（与流内 error 的处理保持同一语义）。
             controller.enqueue(encoder.encode(errorFrame(msg)))
-            controller.enqueue(encoder.encode(doneFrame()))
           } catch {
             // 忽略向已关闭流 enqueue 的异常
           }

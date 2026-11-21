@@ -53,6 +53,7 @@ import {
   type AggregatedCompletion,
 } from './stream.js'
 import { handleChatCompletions } from './server.js'
+import { buildWebToolContext, detectServerWebTools, lastUserTextFromResponses } from './web-tools.js'
 import type { Env } from '../env.js'
 
 // ─────────────────────────── 请求侧 ───────────────────────────
@@ -1719,6 +1720,22 @@ export async function handleResponses(
   }
 
   chatBody.stream = true
+
+  // 托管网页工具（web_search / web_fetch）由网关执行预检索后注入上下文。
+  const serverTools = detectServerWebTools(body.tools)
+  if (serverTools.search || serverTools.fetch) {
+    const webContext = await buildWebToolContext({
+      search: serverTools.search,
+      fetch: serverTools.fetch,
+      text: lastUserTextFromResponses(body.input),
+      env,
+      ctx,
+      signal: request.signal,
+    })
+    if (webContext !== undefined && Array.isArray(chatBody.messages)) {
+      chatBody.messages = [{ role: 'system', content: webContext }, ...(chatBody.messages as unknown[])]
+    }
+  }
 
   const wantsStream = body.stream === true
   const responseId = hexId('resp')

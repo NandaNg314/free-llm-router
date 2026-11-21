@@ -17,6 +17,7 @@ import { isAutoContinuationEnabled } from '../src/gateway/server.js'
 import { workbuddyProvider } from '../src/providers/buddy.js'
 import { resolveManualThreeDCredential } from '../src/upstream/three-d.js'
 import worker, { resetCorsConfigCache } from '../src/index.js'
+import { APP_VERSION } from '../src/version.js'
 
 function dbFile(name: string): string {
   fs.mkdirSync(path.join(process.cwd(), '.build'), { recursive: true })
@@ -531,7 +532,7 @@ test('混元 3D 路由、子密钥白名单、MCP 7 工具发现与 /admin/media
       now,
     )
 
-    // 1. MCP initialize 暴露最新版本号 1.2.0，tools/list 完整暴露 7 个工具
+    // 1. MCP initialize 暴露当前版本号，tools/list 完整暴露 7 个工具
     const mcpInit = await worker.fetch(
       new Request('http://localhost/mcp', {
         method: 'POST',
@@ -542,7 +543,7 @@ test('混元 3D 路由、子密钥白名单、MCP 7 工具发现与 /admin/media
       ctx,
     )
     const initJson = (await mcpInit.json()) as { result: { serverInfo: { version: string } } }
-    assert.equal(initJson.result.serverInfo.version, '1.2.0')
+    assert.equal(initJson.result.serverInfo.version, APP_VERSION)
 
     const mcpTools = await worker.fetch(
       new Request('http://localhost/mcp', {
