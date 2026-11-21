@@ -22,6 +22,7 @@ import { TaskRunnerDO, type RunContext, type TaskStep } from './taskrunner/TaskR
 import { classify } from './upstream/client.js'
 import { diagnoseAccount, extractPaidStatusFromSummary, healthy } from './pool/state.js'
 import { AccountPoolDO, type PersistedCorsConfig } from './pool/AccountPoolDO.js'
+import { shouldSkipScheduledRun } from './taskrunner/dedup.js'
 import { planByName, type PlanName } from './taskrunner/plans.js'
 import { cstDay } from './upstream/travel.js'
 import {
@@ -129,7 +130,6 @@ import {
   registerSubkeyUsage,
 } from './gateway/authz.js'
 import { authBlocked, noteAuthFailure, noteAuthSuccess } from './gateway/inbound-limit.js'
-import { utc8DayKey } from './store/usage.js'
 import { BodyTooLargeError, MAX_IMPORT_BYTES, MAX_REQUEST_BYTES, readJsonCapped } from './gateway/body.js'
 import { fetchBalance } from './upstream/checkin.js'
 import { claimCompensation, fetchCompensationStatus } from './upstream/compensation.js'
@@ -5927,7 +5927,7 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
        * 重启即归零），`growth` 计划（含 5 个真实对话）就会**再烧一遍配额**。
        *
        * 修法：与「上一次已跑完同一计划且落在今天（UTC+8）」的账号直接跳过。
-       * 日键用 `utc8DayKey` —— 与项目其它日界（签到、额度）同一条纪律，
+       * 日键用固定 UTC+8 —— 与项目其它日界（签到、额度）同一条纪律，
        * 不能用本机时区。
        *
        * ⚠️ 只对 **cron 扇出**去重，**不影响**面板上的「手动执行」：
@@ -5938,11 +5938,7 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
       let alreadyDoneToday = false
       try {
         const status = await env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(account.uid)).status(account.uid)
-        alreadyDoneToday =
-          status !== undefined
-          && status.finished
-          && status.plan === planToRun
-          && utc8DayKey(status.startedAt) === utc8DayKey(now)
+        alreadyDoneToday = shouldSkipScheduledRun({ status, plan: planToRun, now })
       } catch (error) {
         console.warn(
           `[cron] 读 ${account.uid} 的运行状态失败，改为直接入队（去重让位于不漏跑）：`,
