@@ -4982,6 +4982,28 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         ),
       )
     }
+
+    // 语音模型：OpenAI 的 `/v1/models` 同样会列出 tts-1 / whisper-1，
+    // 这里把上游实际模型 id 暴露出来，客户端才能在下拉框里选到。
+    const audioModels: Array<{ id: string; name: string; modelType: 'tts' | 'asr' }> = [
+      { id: 'hunyuan-tts-2.5', name: '语音合成 · Hunyuan TTS 2.5（WAV / PCM）', modelType: 'tts' },
+      { id: 'hunyuan-asr', name: '语音转写 · Hunyuan ASR', modelType: 'asr' },
+    ]
+    for (const m of audioModels) {
+      data.push(
+        annotateModelEntry(
+          {
+            id: m.id,
+            object: 'model',
+            owned_by: 'audio',
+            name: m.name,
+            type: 'audio',
+            audio_kind: m.modelType,
+          },
+          'audio',
+        ),
+      )
+    }
     /**
      * 🔴 **子密钥的模型白名单必须作用于目录本身**（2026-10-21 审查补，安全面专项）。
      *

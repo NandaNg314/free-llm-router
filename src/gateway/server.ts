@@ -965,6 +965,18 @@ export async function handleChatCompletions(
     return await handleWebToolChat(rawBody, env, ctx, rawModel, request.signal)
   }
 
+  // 语音模型出现在 `/v1/models` 里，但**不能**走 Chat：给一句能直接照做的提示。
+  const bareChatModel = rawModel.trim().toLowerCase().split('/').pop() ?? ''
+  if (bareChatModel === 'hunyuan-tts-2.5' || bareChatModel === 'hunyuan-asr') {
+    return {
+      response: jsonError(
+        400,
+        `「${rawModel}」是音频模型，请调用 ${bareChatModel === 'hunyuan-asr' ? '/v1/audio/transcriptions' : '/v1/audio/speech'}，不要走 /v1/chat/completions。`,
+        'invalid_request_error',
+      ),
+    }
+  }
+
   // ── 单请求消息数硬上限（全链路唯一一处裁剪） ──
   //
   // ## 为什么插在这里（而不是 `handleProviderChat` 或 `prepareChatBody` 里）
