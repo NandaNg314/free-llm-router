@@ -39,6 +39,24 @@ export const WEB_USER_AGENT =
 /** 打卡用的免费模型（参考项目默认值；可用 env `WORKBUDDY_DAILY_CHAT_MODEL` 覆盖）。 */
 export const DEFAULT_DAILY_CHAT_MODEL = 'deepseek-v4.1-flash'
 export const DAILY_CHAT_PROMPT = 'Hi'
+/**
+ * 国际版活跃对话默认 `system` 提示词（同步自 `L0NE-6/WorkBuddy-Daily` `22c50c3`，issue #63）：
+ * 国际版对话链路要求首条消息为 `role: 'system'`，缺失时会触发 `400 / code=11-128 / first message is not system prompt`。
+ */
+export const DAILY_CHAT_SYSTEM_PROMPT = 'You are a helpful assistant.'
+
+/** 构造固定为 `system → user` 两段的国际版网页任务/活跃会话消息列表（`22c50c3`）。 */
+export function buildWebDailyMessages(
+  prompt = DAILY_CHAT_PROMPT,
+  systemPrompt = DAILY_CHAT_SYSTEM_PROMPT,
+): Array<{ role: 'system' | 'user'; content: string }> {
+  const sys = systemPrompt.trim() || DAILY_CHAT_SYSTEM_PROMPT
+  const usr = prompt.trim() || DAILY_CHAT_PROMPT
+  return [
+    { role: 'system', content: sys },
+    { role: 'user', content: usr },
+  ]
+}
 
 const ACP_PROTOCOL_VERSION = 1
 /** 打卡只需要 agent 把话说完，不提供文件系统/终端能力。 */
@@ -52,6 +70,8 @@ export interface WebDailyChatInput {
 export interface WebDailyChatOptions {
   model?: string
   prompt?: string
+  /** 首条 `system` 提示词（缺省为 `DAILY_CHAT_SYSTEM_PROMPT`，`22c50c3`）。 */
+  systemPrompt?: string
   /** 发出 prompt 后最多等多久跑完（默认 120s；参考实测一次「Hi」十几秒）。 */
   waitMs?: number
   /** 状态轮询间隔（默认 5s）。 */
@@ -139,6 +159,8 @@ export async function runWebDailyChat(
   const now = options.now ?? Date.now
   const model = (options.model ?? '').trim() || DEFAULT_DAILY_CHAT_MODEL
   const prompt = options.prompt ?? DAILY_CHAT_PROMPT
+  const systemPrompt = (options.systemPrompt ?? '').trim() || DAILY_CHAT_SYSTEM_PROMPT
+  const messages = buildWebDailyMessages(prompt, systemPrompt)
   const waitMs = Math.max(1_000, options.waitMs ?? 120_000)
   const pollMs = Math.max(0, options.pollMs ?? 5_000)
   const timeoutMs = options.requestTimeoutMs ?? 30_000
@@ -237,6 +259,8 @@ export async function runWebDailyChat(
       headers,
       body: JSON.stringify({
         prompt,
+        systemPrompt,
+        messages,
         model,
         // 网页端建会话时固定带上这两项（抓包所得），保持请求形态一致
         conversationOrigin: 'workbuddy-app',

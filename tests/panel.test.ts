@@ -105,6 +105,12 @@ test('⚠️ img-src 只额外放开微信官方二维码域名（不得用通�
   assert.deepEqual(m[1].trim().split(/\s+/), ["'self'", 'data:', 'https://open.weixin.qq.com'])
 })
 
+test("⚠️ media-src 只放开同源与 blob:（供面板音频试听与视频代理预览，不得放开外部域）", () => {
+  const m = /media-src ([^;]*)/.exec(CSP)
+  assert.ok(m, '应有 media-src')
+  assert.deepEqual(m[1].trim().split(/\s+/), ["'self'", 'blob:'])
+})
+
 // ─────────────────────── 资源路由（嵌入的单页面板） ───────────────────────
 
 test('面板入口：/panel/ 与 /panel/index.html 都返回 HTML，且不缓存', () => {

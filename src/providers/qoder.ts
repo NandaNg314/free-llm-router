@@ -1900,6 +1900,59 @@ interface QoderCampaign {
   actionType?: string
   claimStatus?: string
   amount?: number
+  claimedAt?: unknown
+}
+
+const QODER_CST_OFFSET_MS = 8 * 60 * 60 * 1000
+
+function formatUtc8DateKey(epochMs: number): string {
+  const shifted = new Date(epochMs + QODER_CST_OFFSET_MS)
+  const y = shifted.getUTCFullYear()
+  const m = String(shifted.getUTCMonth() + 1).padStart(2, '0')
+  const d = String(shifted.getUTCDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+function parseQoderClaimedAtMs(raw: unknown): number | undefined {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return raw < 1e12 ? Math.round(raw * 1000) : Math.round(raw)
+  }
+  if (typeof raw !== 'string') return undefined
+  const trimmed = raw.trim()
+  if (trimmed === '') return undefined
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number(trimmed)
+    if (Number.isFinite(n) && n > 0) return n < 1e12 ? Math.round(n * 1000) : Math.round(n)
+  }
+  // 无显式时区的 `YYYY-MM-DD HH:mm:ss` 按 Qoder 服务端自然日口径（UTC+8）解析
+  const normalized =
+    /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)
+      ? `${trimmed.replace(' ', 'T')}+08:00`
+      : trimmed
+  const parsed = Date.parse(normalized)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/**
+ * 判断上游返回的 `claimedAt` 是否落在「今天（UTC+8 自然日）」（同步自 `xu20060420fan-cell` `2e8d0c3`）。
+ * 字段缺失或无法解析时返回 `false`（不臆断今日已领）。
+ */
+export function isQoderClaimedAtToday(claimedAt: unknown, nowMs = Date.now()): boolean {
+  const ts = parseQoderClaimedAtMs(claimedAt)
+  if (ts === undefined) return false
+  return formatUtc8DateKey(ts) === formatUtc8DateKey(nowMs)
+}
+
+/**
+ * 判断上游返回的 `claimedAt` 是否**确凿陈旧**（可解析出时间戳，但不在今日 UTC+8 自然日内，`2e8d0c3`）。
+ *
+ * - `claimedAt` 缺失或无法解析时返回 `false`（保持无时间戳响应的历史兼容，不推翻状态）；
+ * - 一旦确凿落在旧日期（如昨日或更早的活动实例），返回 `true` —— 严禁据此把待签账号误判为「今日已领」造成假签到死循环。
+ */
+export function isQoderClaimedAtStale(claimedAt: unknown, nowMs = Date.now()): boolean {
+  const ts = parseQoderClaimedAtMs(claimedAt)
+  if (ts === undefined) return false
+  return formatUtc8DateKey(ts) !== formatUtc8DateKey(nowMs)
 }
 
 /**
@@ -1930,12 +1983,23 @@ function parseCampaigns(body: unknown): { claimable: boolean; campaigns: QoderCa
     const benefit = typeof entry.benefit === 'object' && entry.benefit !== null
       ? (entry.benefit as Record<string, unknown>)
       : undefined
+    const reward = typeof entry.reward === 'object' && entry.reward !== null
+      ? (entry.reward as Record<string, unknown>)
+      : undefined
+    const claimedAt =
+      entry.claimedAt ??
+      entry.claimed_at ??
+      benefit?.claimedAt ??
+      benefit?.claimed_at ??
+      reward?.claimedAt ??
+      reward?.claimed_at
     campaigns.push({
       campaignId,
       ...(key !== undefined ? { campaignKey: key } : {}),
       ...(typeof entry.actionType === 'string' ? { actionType: entry.actionType } : {}),
       ...(typeof entry.claimStatus === 'string' ? { claimStatus: entry.claimStatus } : {}),
       ...(typeof benefit?.amount === 'number' ? { amount: benefit.amount } : {}),
+      ...(claimedAt !== undefined ? { claimedAt } : {}),
     })
   }
   return { claimable: record.claimable === true, campaigns }
@@ -2004,6 +2068,8 @@ async function checkin(
     return parseCampaigns(await res.json().catch(() => undefined)).campaigns
   }
   const isBenefit = (c: QoderCampaign): boolean => c.actionType === 'CLAIM_BENEFIT'
+  const isNonStaleBenefit = (c: QoderCampaign): boolean =>
+    isBenefit(c) && !(c.claimStatus === 'CLAIMED' && isQoderClaimedAtStale(c.claimedAt))
   // ⚠️ 只领 `actionType === 'CLAIM_BENEFIT' && claimStatus === 'CLAIMABLE'`：
   // 实测还有 `VIEW_DETAILS` 型活动（如「Pro 首月翻倍」），对它发 claim 是错的。
   const findTarget = (list: QoderCampaign[]): QoderCampaign | undefined =>
@@ -2011,12 +2077,12 @@ async function checkin(
 
   let useMachine = hasMachine
   let campaigns = await listCampaigns(useMachine)
-  // ⚠️ 中国版：带了（可能已过期的）machine 头却没拿到 `CLAIM_BENEFIT` →
+  // ⚠️ 中国版：带了（可能已过期的）machine 头却没拿到今日有效 `CLAIM_BENEFIT` →
   // **不带头再查一次**。CN 不带指纹头本来就正常下发，而过期/自造的 token
   // 会让服务端过滤掉每日领取活动（见 `checkinRequiresMachine` 的出处）。
-  if (useMachine && !product.checkinRequiresMachine && !campaigns.some(isBenefit)) {
+  if (useMachine && !product.checkinRequiresMachine && !campaigns.some(isNonStaleBenefit)) {
     const plain = await listCampaigns(false)
-    if (plain.some(isBenefit)) {
+    if (plain.some(isNonStaleBenefit)) {
       useMachine = false
       campaigns = plain
     }
@@ -2024,9 +2090,19 @@ async function checkin(
 
   const target = findTarget(campaigns)
   if (target === undefined) {
-    // 有 `CLAIM_BENEFIT` 但已 `CLAIMED` → 真·今天已领。
-    if (campaigns.some((c) => isBenefit(c) && c.claimStatus === 'CLAIMED')) {
+    // 有 `CLAIM_BENEFIT` 且已 `CLAIMED`：**必须校验 `claimedAt` 非历史陈旧时刻**（`2e8d0c3`）。
+    // 若上游在 10:00（UTC+8）刷新前仍挂着昨日已领活动实例（`claimedAt` 落在旧日），绝不能误判成「今日已领」，
+    // 否则调用方会写入今日已签标记，导致整天不再尝试签到。
+    const claimedBenefits = campaigns.filter((c) => isBenefit(c) && c.claimStatus === 'CLAIMED')
+    if (claimedBenefits.some((c) => !isQoderClaimedAtStale(c.claimedAt))) {
       return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（活动状态为 CLAIMED）' }
+    }
+    if (claimedBenefits.length > 0) {
+      const staleStamps = claimedBenefits.map((c) => String(c.claimedAt ?? '')).join('、')
+      throw new ProviderError({
+        provider: product.id,
+        message: `Qoder 当前仅下发历史已领取活动（claimedAt=${staleStamps}，非今日 UTC+8），今日签到额度尚未下发或待 10:00（UTC+8）刷新`,
+      })
     }
     const listed = campaigns.length === 0
       ? '活动列表为空'
@@ -2078,8 +2154,20 @@ async function checkin(
   } catch {
     parsed = undefined
   }
+  const benefit = typeof parsed?.benefit === 'object' && parsed.benefit !== null
+    ? (parsed.benefit as Record<string, unknown>)
+    : undefined
+  const claimRespClaimedAt =
+    parsed?.claimedAt ?? parsed?.claimed_at ?? benefit?.claimedAt ?? benefit?.claimed_at
   // ⚠️ **幂等判据是 `replayed`，不是状态码**：重复领取也回 200，但
   // `replayed:true`、不含 `benefit`。另认 409 / `ALREADY_CLAIMED`（L0NE-6/Qoder-Daily）。
+  // 但若响应明确携带历史陈旧 `claimedAt`（非今日 UTC+8，`2e8d0c3`），绝不能误判为今日已领或今日领取成功。
+  if (isQoderClaimedAtStale(claimRespClaimedAt)) {
+    throw new ProviderError({
+      provider: product.id,
+      message: `Qoder 活动领取返回历史陈旧 claimedAt（${String(claimRespClaimedAt)}，非今日 UTC+8），未计为今日已签`,
+    })
+  }
   if (claimRes.status === 409 || parsed?.result === 'ALREADY_CLAIMED' || parsed?.replayed === true) {
     return { alreadyDone: true, gained: 0, detail: 'Qoder 今日积分已领取（服务端回已领取/replayed）' }
   }
@@ -2099,9 +2187,6 @@ async function checkin(
       message: `Qoder 签到未完成（上游状态 ${parsed.status}）：${text.slice(0, 200)}`,
     })
   }
-  const benefit = typeof parsed?.benefit === 'object' && parsed.benefit !== null
-    ? (parsed.benefit as Record<string, unknown>)
-    : undefined
   const gained = typeof benefit?.amount === 'number' ? benefit.amount : 0
   const validity = typeof benefit?.validity === 'object' && benefit.validity !== null
     ? (benefit.validity as Record<string, unknown>)

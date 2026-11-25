@@ -9,6 +9,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  OFFICIAL_CLI_REPLACEMENT,
+  WORKBUDDY_FALLBACK_SYSTEM_PROMPT,
   backfillReasoningContent,
   cleanupOrphanToolCalls,
   cleanupToolPairing,
@@ -28,6 +30,7 @@ import {
   scrubFingerprintText,
   scrubFingerprints,
   scrubToolArguments,
+  stripInjectedAssistantHead,
 } from '../src/gateway/payload.ts'
 import { classify, shouldPunish, shouldRotate } from '../src/upstream/client.ts'
 import { clientStatusFor, mapErrorToPunishment, refineModelScoped } from '../src/gateway/server.ts'
@@ -426,7 +429,13 @@ test('gpt-* 的 max_tokens < 16 夹到 16；其他模型不动', () => {
 test('客户端指纹改写：Claude Code / Codex / OmO / billing header', () => {
   assert.equal(
     scrubFingerprintText("You are Claude Code, Anthropic's official CLI for Claude."),
-    "You are Claude Code, Anthropic's official CLI tool for Claude.",
+    `${OFFICIAL_CLI_REPLACEMENT}.`,
+  )
+  assert.equal(
+    scrubFingerprintText(
+      "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    ),
+    `${OFFICIAL_CLI_REPLACEMENT}.`,
   )
   assert.equal(
     scrubFingerprintText('You are a coding agent running in the Codex CLI, a terminal-based coding assistant.'),
@@ -633,7 +642,7 @@ test('prepareChatBody 串起全部修复', () => {
 // ─────────────────────── 错误分类 ───────────────────────
 
 test('请求形状类业务码 ⇒ bad_request：不罚号、不换号、回 400（即使上游用 5xx 包着）', () => {
-  for (const code of [11101, 11129, 11133, 11148, 11150, 11155]) {
+  for (const code of [11101, 11102, 11103, 11129, 11133, 11148, 11150, 11155, 14401]) {
     for (const status of [400, 500]) {
       const c = classify(status, JSON.stringify({ code, msg: 'x' }))
       assert.equal(c.kind, 'bad_request', `${code}@${status}`)
@@ -690,4 +699,106 @@ test('mirrorReasoningContent：空思考 / 已有 reasoning / 其他模型均零
   assert.equal(mirrorReasoningContent(already, 'kimi-k3'), already)
   const deepseek = [{ role: 'assistant', content: 'ok', reasoning_content: 'a' }]
   assert.equal(mirrorReasoningContent(deepseek, 'deepseek-v4.1-flash'), deepseek)
+})
+
+// ─────────────────────── #293 / #297 / #276 增量清洗护栏 ───────────────────────
+
+test('🔴 official CLI 自述句改写（7513e88）：覆盖多厂商变体、不留残句、幂等、普通散文与 user/tool 零改动', () => {
+  const hitMatrix = [
+    "You are Claude Code, Anthropic's official CLI for Claude.",
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    "You are Grok CLI, xAI's official CLI for xAI, here to help.",
+    "  You are GPT CLI, OpenAI's official CLI for Codex.",
+  ]
+  for (const text of hitMatrix) {
+    const once = scrubFingerprintText(text)
+    assert.equal(once, `${OFFICIAL_CLI_REPLACEMENT}.`, text)
+    assert.ok(!once.toLowerCase().includes('official cli for'), once)
+    assert.equal(scrubFingerprintText(once), once, '二次调用必须严格幂等')
+  }
+
+  const passMatrix = [
+    'The product X released by Y in 2023 was notable.',
+    'You are working on a project about Grok.',
+    'xAI released Grok 4.6 in 2024.',
+    `${OFFICIAL_CLI_REPLACEMENT}.`,
+    'As you are an assistant made by Mistral, please continue.',
+    'You are Claude Code, a helpful coding assistant.',
+  ]
+  for (const prose of passMatrix) {
+    assert.equal(scrubFingerprintText(prose), prose, `普通散文必须逐字节保留：${prose}`)
+  }
+
+  const identity = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+  const prepared = prepareChatBody({
+    model: 'deepseek-v4.1-flash',
+    messages: [
+      { role: 'system', content: identity },
+      { role: 'assistant', content: identity },
+      { role: 'user', content: identity },
+      { role: 'tool', tool_call_id: 'c1', content: identity },
+      { role: 'assistant', content: '', tool_calls: [call('c1', 'read_file')] },
+    ],
+  })
+  const msgs = (JSON.parse(prepared.body) as M).messages as M[]
+  assert.equal(msgs[0]!.content, `${OFFICIAL_CLI_REPLACEMENT}.`)
+  assert.equal(msgs[1]!.content, `${OFFICIAL_CLI_REPLACEMENT}.`)
+  assert.equal(msgs[2]!.content, identity, 'user 正文绝不改写')
+  assert.equal(msgs[4]!.content, identity, 'tool 结果正文绝不改写')
+})
+
+test('🔴 assistant 重复中性头残留剥离（a8280b1）：字符串/分段、多层上限、剥空保护、system/user/tool 零触碰', () => {
+  const head = `${WORKBUDDY_FALLBACK_SYSTEM_PROMPT}\n\n`
+  assert.equal(stripInjectedAssistantHead(`${head}实际回复内容。`), '实际回复内容。')
+  assert.equal(stripInjectedAssistantHead(`${head}${head}${head}真实内容。`), '真实内容。')
+  assert.equal(stripInjectedAssistantHead(head), head, '仅有中性头时不得剥成空串')
+  assert.equal(
+    stripInjectedAssistantHead(`${WORKBUDDY_FALLBACK_SYSTEM_PROMPT} 不带空行的正常句子。`),
+    `${WORKBUDDY_FALLBACK_SYSTEM_PROMPT} 不带空行的正常句子。`,
+  )
+
+  const msgs = [
+    { role: 'system', content: `${head}系统规则` },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: `${head}第一段。` },
+        { type: 'text', text: `${head}${head}第二段。` },
+      ],
+    },
+    { role: 'user', content: `${head}用户原话` },
+  ]
+  const out = scrubFingerprints(msgs) as M[]
+  assert.equal(out[0], msgs[0], 'system 消息中性头不剥离')
+  assert.deepEqual(
+    (out[1]!.content as M[]).map((p) => p.text),
+    ['第一段。', '第二段。'],
+  )
+  assert.equal(out[2], msgs[2], 'user 消息原封不动')
+})
+
+test('🔴 工具 schema pattern 代理区双反斜杠 \\\\uD800–\\\\uDFFF 与孤立代理码元剥离（abed839）', () => {
+  const doubleEscaped = '^[^\\\\uD800-\\\\uDFFF]*$'
+  const braceEscaped = '^[^\\\\u{D800}-\\\\u{DFFF}]*$'
+  const loneSurrogateInMemory = JSON.parse('"^[^\\uD800-\\uDFFF]*$"') as string
+
+  for (const pat of [doubleEscaped, braceEscaped, loneSurrogateInMemory]) {
+    const body: M = {
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'read_local',
+            parameters: {
+              type: 'object',
+              properties: { path: { type: 'string', minLength: 1, pattern: pat } },
+            },
+          },
+        },
+      ],
+    }
+    assert.equal(normalizeTools(body), true, pat)
+    const prop = ((((body.tools as M[])[0]!.function as M).parameters as M).properties as Record<string, M>).path!
+    assert.deepEqual(prop, { type: 'string', minLength: 1 })
+  }
 })

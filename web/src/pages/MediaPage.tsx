@@ -1,14 +1,18 @@
 import {
   AlertTriangle,
   Box,
+  Check,
+  Copy,
   Download,
   ExternalLink,
   Film,
   Image as ImageIcon,
   Loader2,
+  Mic,
   Search,
   Sparkles,
   Upload,
+  Volume2,
   X,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
@@ -27,14 +31,17 @@ import {
   useGenerateImage,
   useSubmitThreeD,
   useSubmitVideo,
+  useSynthesizeSpeech,
+  useTranscribeAudio,
   useWebFetch,
   useWebSearch,
+  type SpeechSynthesisOutput,
   type ThreeDTask,
   type VideoTask,
 } from '@/lib/queries'
 import { toast } from 'sonner'
 
-type Tab = 'image' | 'video' | '3d' | 'search' | 'fetch'
+type Tab = 'image' | 'video' | 'audio' | '3d' | 'search' | 'fetch'
 
 const SIZES = ['1024x1024', '1024x768', '768x1024'] as const
 const ASPECTS = ['16:9', '9:16', '1:1'] as const
@@ -75,14 +82,16 @@ export function MediaPage() {
     <>
       <PageHeader
         title="媒体与检索"
-        description="生成图片、生成视频、生成混元 3D 模型、联网搜索、抓取网页正文。"
+        description="生成图片、生成视频、语音合成与转写、生成混元 3D 模型、联网搜索、抓取网页正文。"
         actions={
           <Segmented
             value={tab}
             onChange={(v) => setTab(v as Tab)}
+            className="h-auto max-w-full flex-wrap gap-0.5 sm:h-9 sm:flex-nowrap [&_button]:px-2.5 sm:[&_button]:px-3"
             options={[
               { value: 'image', label: '生图' },
               { value: 'video', label: '视频' },
+              { value: 'audio', label: '语音' },
               { value: '3d', label: '3D 生成' },
               { value: 'search', label: '联网检索' },
               { value: 'fetch', label: '抓网页' },
@@ -95,18 +104,19 @@ export function MediaPage() {
         <AlertTriangle className="text-primary mt-0.5 size-4 shrink-0" strokeWidth={1.75} />
         <div className="min-w-0 space-y-1">
           <span>
-            这四项能力<b>只有国际版账号</b>可用（国内账号实测返回 401，是腾讯网关层直接拒的）。
+            生图与视频<b>只有国际版账号</b>可用（国内账号实测返回 401，是腾讯网关层直接拒的）。
             没有国际版账号时请先到「供应商与账号」登录一个，否则会提示
             <code className="bg-black/[0.06] dark:bg-white/[0.08] mx-1 rounded px-1 py-0.5 font-mono text-[11.5px]">unsupported_realm</code>。
           </span>
           <span className="text-muted-foreground block text-xs">
-            混元 3D 生成、联网检索与抓网页还额外支持国内版 OAuth 账号自动容灾选号。
+            语音（TTS / ASR）、混元 3D 生成、联网检索与抓网页同时支持国内版与国际版账号自动选号与容灾。
           </span>
         </div>
       </div>
 
       {tab === 'image' && <ImageTab />}
       {tab === 'video' && <VideoTab />}
+      {tab === 'audio' && <AudioTab />}
       {tab === '3d' && <ThreeDTab />}
       {tab === 'search' && <SearchTab />}
       {tab === 'fetch' && <FetchTab />}
@@ -788,6 +798,328 @@ function ThreeDTab() {
               </div>
             )}
           </div>
+        )}
+      </div>
+    </Card>
+  )
+}
+
+const TTS_DEFAULT_VOICE_ID = 'f191_female_cn_tts2.5_flash'
+const ASR_MAX_FILE_BYTES = 3 * 1024 * 1024
+
+function fmtBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+}
+
+function AudioTab() {
+  const tts = useSynthesizeSpeech()
+  const asr = useTranscribeAudio()
+  const [mode, setMode] = useState<'tts' | 'asr'>('tts')
+
+  // TTS 状态
+  const [ttsText, setTtsText] = useState('')
+  const [voiceMode, setVoiceMode] = useState<'default' | 'custom'>('default')
+  const [customVoice, setCustomVoice] = useState('')
+  const [ttsFormat, setTtsFormat] = useState<'wav' | 'pcm'>('wav')
+  const [speechOut, setSpeechOut] = useState<(SpeechSynthesisOutput & { url: string }) | null>(null)
+
+  // ASR 状态
+  const [asrFile, setAsrFile] = useState<File | null>(null)
+  const [asrFormat, setAsrFormat] = useState<'json' | 'text'>('json')
+  const [asrText, setAsrText] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    return () => {
+      if (speechOut?.url) URL.revokeObjectURL(speechOut.url)
+    }
+  }, [speechOut])
+
+  const effectiveVoice =
+    voiceMode === 'custom' && customVoice.trim() !== '' ? customVoice.trim() : TTS_DEFAULT_VOICE_ID
+
+  const runTts = async () => {
+    const trimmed = ttsText.trim()
+    if (trimmed === '') return
+    let out: SpeechSynthesisOutput
+    try {
+      out = await tts.mutateAsync({
+        input: trimmed,
+        voice: effectiveVoice,
+        response_format: ttsFormat,
+      })
+    } catch {
+      return
+    }
+    const nextUrl = URL.createObjectURL(out.blob)
+    setSpeechOut({ ...out, url: nextUrl })
+    toast.success('语音合成完成')
+  }
+
+  const downloadSpeech = () => {
+    if (!speechOut) return
+    const a = document.createElement('a')
+    a.href = speechOut.url
+    a.download = `speech-${Date.now()}.${speechOut.format}`
+    a.click()
+    toast.success('已开始下载音频')
+  }
+
+  const pickAudioFile = (file: File | undefined) => {
+    if (!file) return
+    if (file.size > ASR_MAX_FILE_BYTES) {
+      toast.error('音频文件过大', { description: '上游硬性限制单文件不超过 3 MB，请裁剪或压缩后重试。' })
+      return
+    }
+    if (file.size === 0) {
+      toast.error('音频文件为空')
+      return
+    }
+    setAsrFile(file)
+    setAsrText(null)
+  }
+
+  const runAsr = async () => {
+    if (!asrFile) return
+    let res: { text: string }
+    try {
+      res = await asr.mutateAsync({ file: asrFile, responseFormat: asrFormat })
+    } catch {
+      return
+    }
+    setAsrText(res.text)
+    toast.success('语音转写完成')
+  }
+
+  const copyTranscript = async () => {
+    if (!asrText) return
+    try {
+      await navigator.clipboard.writeText(asrText)
+      setCopied(true)
+      toast.success('已复制识别结果')
+      window.setTimeout(() => setCopied(false), 1800)
+    } catch {
+      toast.error('复制失败，请手动选中复制')
+    }
+  }
+
+  return (
+    <Card className="overflow-hidden">
+      <div className="border-b px-5 py-4">
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          {mode === 'tts' ? (
+            <Volume2 className="text-muted-foreground size-4 shrink-0" strokeWidth={1.75} />
+          ) : (
+            <Mic className="text-muted-foreground size-4 shrink-0" strokeWidth={1.75} />
+          )}
+          <Segmented
+            value={mode}
+            onChange={(v) => setMode(v as 'tts' | 'asr')}
+            options={[
+              { value: 'tts', label: '文字转语音（TTS）' },
+              { value: 'asr', label: '语音转文字（ASR）' },
+            ]}
+          />
+        </div>
+
+        {mode === 'tts' ? (
+          <div className="space-y-3">
+            <Textarea
+              value={ttsText}
+              onChange={(e) => setTtsText(e.target.value)}
+              rows={3}
+              placeholder="输入要合成语音的文字，例如：你好，欢迎体验混元语音合成服务。"
+              className="resize-none text-[13.5px]"
+            />
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-muted-foreground text-xs">音色</span>
+              <Segmented
+                value={voiceMode}
+                onChange={(v) => setVoiceMode(v as 'default' | 'custom')}
+                options={[
+                  { value: 'default', label: '标准女声（默认）' },
+                  { value: 'custom', label: '自定义 ID' },
+                ]}
+              />
+              <span className="text-muted-foreground ml-1 text-xs">格式</span>
+              <Segmented
+                value={ttsFormat}
+                onChange={(v) => setTtsFormat(v as 'wav' | 'pcm')}
+                options={[
+                  { value: 'wav', label: 'WAV' },
+                  { value: 'pcm', label: 'PCM' },
+                ]}
+              />
+              <div className="ml-auto flex items-center gap-2">
+                {tts.isPending && <Badge tone="warning">合成中…</Badge>}
+                <Button onClick={() => void runTts()} disabled={tts.isPending || ttsText.trim() === ''}>
+                  {tts.isPending ? <Loader2 className="animate-spin" strokeWidth={1.75} /> : <Volume2 strokeWidth={1.75} />}
+                  生成语音
+                </Button>
+              </div>
+            </div>
+            {voiceMode === 'custom' && (
+              <div className="max-w-md">
+                <Input
+                  value={customVoice}
+                  onChange={(e) => setCustomVoice(e.target.value)}
+                  placeholder={`输入上游支持的音色 ID（留空回退 ${TTS_DEFAULT_VOICE_ID}）`}
+                  className="h-8 font-mono text-[12.5px]"
+                />
+              </div>
+            )}
+            <div className="text-muted-foreground flex items-start gap-1.5 text-xs leading-relaxed">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" strokeWidth={1.75} />
+              <span className="min-w-0 break-words">
+                输出采样率 <span className="tabular-nums">24,000 Hz</span> · 单声道 · <span className="tabular-nums">16-bit</span>；在线试听建议选 WAV（裸 PCM 无容器头，仅供底层音频管线使用）。
+              </span>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="rounded-lg border border-dashed p-3.5">
+              {asrFile === null ? (
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="hover:bg-accent/40 flex w-full cursor-pointer flex-col items-center justify-center gap-1.5 rounded-md py-4 text-center transition-colors"
+                >
+                  <Upload className="text-muted-foreground size-4" strokeWidth={1.75} />
+                  <span className="text-[13px] font-medium">选择本地音频文件上传识别</span>
+                  <span className="text-muted-foreground text-xs tabular-nums">
+                    支持 WAV / MP3 / M4A / WebM / OGG 等带容器格式，单文件上限 3 MB
+                  </span>
+                </button>
+              ) : (
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[13px] font-medium" title={asrFile.name}>
+                      {asrFile.name}
+                    </div>
+                    <div className="text-muted-foreground mt-0.5 text-xs tabular-nums">
+                      {fmtBytes(asrFile.size)} · {asrFile.type || 'audio/*'}
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <Button size="sm" variant="outline" onClick={() => fileInputRef.current?.click()}>
+                      更换文件
+                    </Button>
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      aria-label="移除音频文件"
+                      onClick={() => {
+                        setAsrFile(null)
+                        setAsrText(null)
+                      }}
+                    >
+                      <X strokeWidth={1.75} />
+                    </Button>
+                  </div>
+                </div>
+              )}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="audio/*,.wav,.mp3,.m4a,.webm,.ogg,.flac,.aac"
+                className="hidden"
+                onChange={(e) => {
+                  pickAudioFile(e.target.files?.[0])
+                  e.target.value = ''
+                }}
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-muted-foreground text-xs">返回格式</span>
+              <Segmented
+                value={asrFormat}
+                onChange={(v) => setAsrFormat(v as 'json' | 'text')}
+                options={[
+                  { value: 'json', label: 'JSON' },
+                  { value: 'text', label: '纯文本（text）' },
+                ]}
+              />
+              <div className="ml-auto flex items-center gap-2">
+                {asr.isPending && <Badge tone="warning">识别中…</Badge>}
+                <Button onClick={() => void runAsr()} disabled={asr.isPending || asrFile === null}>
+                  {asr.isPending ? <Loader2 className="animate-spin" strokeWidth={1.75} /> : <Mic strokeWidth={1.75} />}
+                  开始识别
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="p-5">
+        {mode === 'tts' ? (
+          <>
+            {tts.isError && (
+              <Empty icon={<AlertTriangle strokeWidth={1.75} />} title="语音合成失败">
+                <span className="block font-mono text-[11.5px] break-all">{tts.error.message}</span>
+              </Empty>
+            )}
+            {!tts.isPending && !tts.isError && !speechOut && (
+              <Empty icon={<Volume2 strokeWidth={1.75} />} title="还没有合成记录">
+                <span className="block">输入文本后点击「生成语音」，支持在线试听与一键下载。</span>
+              </Empty>
+            )}
+            {speechOut && (
+              <div className="space-y-3">
+                {speechOut.format === 'wav' ? (
+                  <audio controls src={speechOut.url} className="w-full" />
+                ) : (
+                  <div className="bg-muted/40 rounded-lg border px-4 py-3 text-xs leading-relaxed">
+                    已生成裸 PCM 音频流（浏览器原生播放器需 WAV 容器头才能直接试听，请点击下方按钮下载使用，或切换为 WAV 格式在线试听）。
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs tabular-nums">
+                    <span>格式 {speechOut.format.toUpperCase()}</span>
+                    <span>大小 {fmtBytes(speechOut.byteLength)}</span>
+                    <span className="max-w-[220px] truncate font-mono" title={effectiveVoice}>
+                      音色 {effectiveVoice}
+                    </span>
+                  </div>
+                  <Button size="sm" variant="outline" onClick={downloadSpeech}>
+                    <Download strokeWidth={1.75} /> 下载 {speechOut.format.toUpperCase()}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            {asr.isError && (
+              <Empty icon={<AlertTriangle strokeWidth={1.75} />} title="语音识别失败">
+                <span className="block font-mono text-[11.5px] break-all">{asr.error.message}</span>
+              </Empty>
+            )}
+            {!asr.isPending && !asr.isError && asrText === null && (
+              <Empty icon={<Mic strokeWidth={1.75} />} title="还没有识别记录">
+                <span className="block">上传 3 MB 以内的音频文件并点击「开始识别」。</span>
+              </Empty>
+            )}
+            {asrText !== null && (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-muted-foreground text-xs tabular-nums">
+                    识别完成 · 共 {asrText.length} 个字符
+                  </span>
+                  <Button size="sm" variant="outline" onClick={() => void copyTranscript()} disabled={asrText === ''}>
+                    {copied ? <Check strokeWidth={1.75} /> : <Copy strokeWidth={1.75} />}
+                    {copied ? '已复制' : '复制结果'}
+                  </Button>
+                </div>
+                <pre className="bg-muted/40 max-h-[50vh] overflow-auto rounded-lg p-4 text-[13px] leading-relaxed whitespace-pre-wrap break-words">
+                  {asrText || '（未识别出有效文字）'}
+                </pre>
+              </div>
+            )}
+          </>
         )}
       </div>
     </Card>

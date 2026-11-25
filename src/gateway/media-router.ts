@@ -54,12 +54,14 @@ import {
   type ThreeDState,
 } from '../upstream/three-d.js'
 import {
+  ASR_DEFAULT_MODEL,
   ASR_REQUEST_MAX_BYTES,
   AudioRequestError,
   pcmToWav,
   parseAudioMultipart,
   speechToPcm,
   transcribeAudio,
+  TTS_DEFAULT_MODEL,
   TTS_DEFAULT_VOICE,
 } from '../upstream/audio.js'
 import { settleSubkeyUsage } from './authz.js'
@@ -490,6 +492,38 @@ function isClientBadRequest(error: unknown): boolean {
   return false
 }
 
+/**
+ * 识别 `/v1/fetch` 上游 edgebrowser 的域名/边缘级失败（`15021` 域名路由策略拒绝、`15022` 目标站连不上）。
+ * 同一 URL 在同分片换任何账号结果完全一致，因此同分片立即止损退出（允许跨分片回退），且绝不罚账号。
+ */
+export function isFetchEdgeFault(error: unknown): boolean {
+  if (error instanceof UpstreamError) {
+    if (error.code === 15021 || error.code === 15022) return true
+    const combined = `${error.message}\n${error.detail}`
+    if (/"code"\s*:\s*1502[12]\b|业务码\s*1502[12]\b/.test(combined)) return true
+  }
+  const msg = error instanceof Error ? error.message : String(error)
+  return /"code"\s*:\s*1502[12]\b|业务码\s*1502[12]\b/.test(msg)
+}
+
+function isNonAccount4xx(error: unknown): error is UpstreamError {
+  return (
+    error instanceof UpstreamError
+    && error.httpStatus >= 400
+    && error.httpStatus < 500
+    && error.httpStatus !== 401
+    && error.httpStatus !== 402
+    && error.httpStatus !== 403
+    && error.httpStatus !== 429
+    && error.kind !== 'auth_error'
+    && error.kind !== 'session_dead'
+    && error.kind !== 'credit_exhausted'
+    && error.kind !== 'rate_limited'
+    && error.kind !== 'waf_blocked'
+    && error.kind !== 'request_illegal'
+  )
+}
+
 function applyAccountPenaltyIfNeeded(
   pool: DurableObjectStub<AccountPoolDO>,
   uid: string,
@@ -498,13 +532,15 @@ function applyAccountPenaltyIfNeeded(
   ctx?: ExecutionContext,
 ): void {
   if (typeof pool.applyFailure !== 'function') return
-  if (error instanceof ThreeDNoCredentialError || isClientBadRequest(error)) return
+  if (error instanceof ThreeDNoCredentialError || isClientBadRequest(error) || isFetchEdgeFault(error)) return
 
   let kind: 'soft' | 'hard' | 'breaker' | 'session_dead' | 'restricted' | undefined
   let reason = redactThreeDSecrets(error instanceof Error ? error.message : String(error)).slice(0, 160)
 
   if (error instanceof UpstreamError) {
     switch (error.kind) {
+      case 'network':
+        break
       case 'credit_exhausted':
         kind = 'hard'
         break
@@ -557,6 +593,12 @@ export interface FailoverOptions {
   modelForStats?: string
   /** 若同步调用当场返回了积分消耗（如生图/改图），传入可实时扣减快照；异步任务提交阶段不传。 */
   extractCredit?: (value: unknown) => number | undefined
+  /** 每次尝试候选账号时回调（便于失败审计日志准确关联最后命中的账号）。 */
+  onAttempt?: (account: SelectedMediaAccount) => void
+  /** 命中域名/边缘级故障时立即停止当前分片内的换号且不罚号（保留跨分片回退）。 */
+  stopRealmOnError?: (error: unknown) => boolean
+  /** 提交阶段将非账号级 4xx（除 401/402/403/429）一律视作请求错误立即 fail-fast 且不罚号。 */
+  treat4xxAsBadRequest?: boolean
   refreshImpl?: RefreshFn
   ctx?: ExecutionContext
 }
@@ -634,6 +676,7 @@ export async function executeMediaWithFailover<T>(
         credential: cred,
         pool,
       }
+      options.onAttempt?.(activeAccount)
 
       try {
         const value = await fn(activeAccount)
@@ -658,6 +701,7 @@ export async function executeMediaWithFailover<T>(
                 await pool.putCredential(candidate.uid, refreshed, Date.now())
               }
               activeAccount = { ...activeAccount, credential: refreshed }
+              options.onAttempt?.(activeAccount)
               const retryValue = await fn(activeAccount)
               const creditCost = options.extractCredit?.(retryValue)
               if (typeof pool.noteSuccess === 'function') {
@@ -679,9 +723,25 @@ export async function executeMediaWithFailover<T>(
           continue
         }
 
+        if (options.treat4xxAsBadRequest && isNonAccount4xx(finalError)) {
+          throw new UpstreamError({
+            kind: 'bad_request',
+            httpStatus: 400,
+            code: finalError.code,
+            message: finalError.message,
+            detail: finalError.detail,
+          })
+        }
+
         // 请求自身的参数/内容合规错误：立即 fail-fast，不罚号、不继续打其他账号
         if (isClientBadRequest(finalError)) {
           throw finalError
+        }
+
+        // 域名/边缘级故障（如 /v1/fetch 的 15021/15022）：不罚号，立即退出本分片避免同域死循环换号
+        if (options.stopRealmOnError?.(finalError)) {
+          lastError = finalError
+          break
         }
 
         lastError = finalError
@@ -1090,6 +1150,9 @@ export async function runMediaVideoSubmit(
     enableAudio?: boolean
     image?: string
     lastImage?: string
+    referenceImages?: unknown
+    referenceVideos?: unknown
+    referenceAudios?: unknown
     wait?: boolean
     timeoutSeconds?: number
   },
@@ -1104,6 +1167,7 @@ export async function runMediaVideoSubmit(
   const modelName = (input.model ?? '').trim() || INTl_VIDEO_MODEL
   const ledger = hooks.ledger ?? mediaTaskLedger
   const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+  let lastAccount: SelectedMediaAccount | undefined
 
   let submitted: VideoSubmitResult
   let account: SelectedMediaAccount
@@ -1115,6 +1179,10 @@ export async function runMediaVideoSubmit(
       {
         requireCredits: true,
         modelForStats: modelName,
+        treat4xxAsBadRequest: true,
+        onAttempt: (acc) => {
+          lastAccount = acc
+        },
         refreshImpl: hooks.refreshImpl,
         ctx: hooks.ctx,
       },
@@ -1125,9 +1193,9 @@ export async function runMediaVideoSubmit(
     const status = error instanceof NoAvailableMediaAccountError ? 503 : isClientBadRequest(error) ? 400 : 502
     recordMediaAudit({
       env,
-      pool: globalPool,
-      uid: 'unassigned',
-      providerId: WORKBUDDY_INTL.id,
+      pool: lastAccount?.pool ?? globalPool,
+      uid: lastAccount?.uid ?? 'unassigned',
+      providerId: lastAccount?.providerId ?? WORKBUDDY_INTL.id,
       model: hooks.logType === 'mcp' ? 'mcp:generate_video' : modelName,
       status,
       startedAt,
@@ -1684,6 +1752,7 @@ export async function runMediaFetch(
   const startedAt = Date.now()
   const targets = options.targets ?? [{ realm: 'global', providerId: WORKBUDDY_INTL.id }]
   const primaryPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(targets[0]?.realm ?? 'global'))
+  let lastAccount: SelectedMediaAccount | undefined
 
   try {
     const { value, account } = await executeMediaWithFailover(
@@ -1705,6 +1774,10 @@ export async function runMediaFetch(
       {
         requireCredits: false,
         modelForStats: 'web_fetch',
+        stopRealmOnError: isFetchEdgeFault,
+        onAttempt: (acc) => {
+          lastAccount = acc
+        },
         refreshImpl: options.refreshImpl,
         ctx: options.ctx,
       },
@@ -1725,9 +1798,9 @@ export async function runMediaFetch(
     const status = error instanceof NoAvailableMediaAccountError ? 503 : isClientBadRequest(error) ? 400 : 502
     recordMediaAudit({
       env,
-      pool: primaryPool,
-      uid: 'unassigned',
-      providerId: targets[0]?.providerId ?? WORKBUDDY_INTL.id,
+      pool: lastAccount?.pool ?? primaryPool,
+      uid: lastAccount?.uid ?? 'unassigned',
+      providerId: lastAccount?.providerId ?? (targets[0]?.providerId ?? WORKBUDDY_INTL.id),
       model: options.logType === 'mcp' ? 'mcp:web_fetch' : 'web_fetch',
       status,
       startedAt,
@@ -1741,14 +1814,22 @@ export async function runMediaFetch(
 
 // ─────────────────────── 语音（TTS / ASR） ───────────────────────
 
+function normalizeAudioModelName(raw: string | undefined, fallback: string): string {
+  const trimmed = (raw ?? '').trim()
+  if (trimmed === '') return fallback
+  return trimmed.replace(/^(?:buddy|workbuddy|audio)[:/]/i, '') || fallback
+}
+
 export async function runMediaSpeech(
   env: Env,
-  input: { text: string; voice: string },
+  input: { text: string; voice: string; model?: string },
   options: { targets?: readonly RealmTarget[] } & MediaExecutionHooks = {},
-): Promise<{ pcm: Uint8Array; uid: string }> {
+): Promise<{ pcm: Uint8Array; uid: string; model: string }> {
   const startedAt = Date.now()
+  const modelName = normalizeAudioModelName(input.model, TTS_DEFAULT_MODEL)
   const targets = options.targets ?? buildDualRealmTargets('cn')
   const primaryPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(targets[0]?.realm ?? 'cn'))
+  let lastAccount: SelectedMediaAccount | undefined
 
   try {
     const { value, account } = await executeMediaWithFailover(
@@ -1764,12 +1845,15 @@ export async function runMediaSpeech(
             ...(enterpriseId ? { enterpriseId } : {}),
           },
           env,
-          { ...input, signal: options.signal },
+          { text: input.text, voice: input.voice, signal: options.signal },
         )
       },
       {
         requireCredits: false,
-        modelForStats: 'tts',
+        modelForStats: modelName,
+        onAttempt: (acc) => {
+          lastAccount = acc
+        },
         refreshImpl: options.refreshImpl,
         ctx: options.ctx,
       },
@@ -1779,14 +1863,13 @@ export async function runMediaSpeech(
       pool: account.pool,
       uid: account.uid,
       providerId: account.providerId,
-      model: options.logType === 'mcp' ? 'mcp:tts' : 'tts',
+      model: options.logType === 'mcp' ? 'mcp:tts' : modelName,
       status: 200,
       startedAt,
       logType: options.logType,
-      recordUsageEntry: false,
       ctx: options.ctx,
     })
-    return { pcm: value.pcm, uid: account.uid }
+    return { pcm: value.pcm, uid: account.uid, model: modelName }
   } catch (error) {
     const status = error instanceof NoAvailableMediaAccountError
       ? 503
@@ -1797,10 +1880,10 @@ export async function runMediaSpeech(
           : 502
     recordMediaAudit({
       env,
-      pool: primaryPool,
-      uid: 'unassigned',
-      providerId: targets[0]?.providerId ?? DEFAULT_PROVIDER,
-      model: options.logType === 'mcp' ? 'mcp:tts' : 'tts',
+      pool: lastAccount?.pool ?? primaryPool,
+      uid: lastAccount?.uid ?? 'unassigned',
+      providerId: lastAccount?.providerId ?? (targets[0]?.providerId ?? DEFAULT_PROVIDER),
+      model: options.logType === 'mcp' ? 'mcp:tts' : modelName,
       status,
       startedAt,
       logType: options.logType,
@@ -1813,12 +1896,14 @@ export async function runMediaSpeech(
 
 export async function runMediaTranscribe(
   env: Env,
-  input: { audio: Uint8Array; filename: string; mime: string },
+  input: { audio: Uint8Array; filename: string; mime: string; model?: string },
   options: { targets?: readonly RealmTarget[] } & MediaExecutionHooks = {},
-): Promise<{ text: string; uid: string }> {
+): Promise<{ text: string; uid: string; model: string }> {
   const startedAt = Date.now()
+  const modelName = normalizeAudioModelName(input.model, ASR_DEFAULT_MODEL)
   const targets = options.targets ?? buildDualRealmTargets('cn')
   const primaryPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(targets[0]?.realm ?? 'cn'))
+  let lastAccount: SelectedMediaAccount | undefined
 
   try {
     const { value, account } = await executeMediaWithFailover(
@@ -1834,12 +1919,15 @@ export async function runMediaTranscribe(
             ...(enterpriseId ? { enterpriseId } : {}),
           },
           env,
-          { ...input, signal: options.signal },
+          { audio: input.audio, filename: input.filename, mime: input.mime, signal: options.signal },
         )
       },
       {
         requireCredits: false,
-        modelForStats: 'asr',
+        modelForStats: modelName,
+        onAttempt: (acc) => {
+          lastAccount = acc
+        },
         refreshImpl: options.refreshImpl,
         ctx: options.ctx,
       },
@@ -1849,14 +1937,13 @@ export async function runMediaTranscribe(
       pool: account.pool,
       uid: account.uid,
       providerId: account.providerId,
-      model: options.logType === 'mcp' ? 'mcp:asr' : 'asr',
+      model: options.logType === 'mcp' ? 'mcp:asr' : modelName,
       status: 200,
       startedAt,
       logType: options.logType,
-      recordUsageEntry: false,
       ctx: options.ctx,
     })
-    return { text: value, uid: account.uid }
+    return { text: value, uid: account.uid, model: modelName }
   } catch (error) {
     const status = error instanceof NoAvailableMediaAccountError
       ? 503
@@ -1867,10 +1954,10 @@ export async function runMediaTranscribe(
           : 502
     recordMediaAudit({
       env,
-      pool: primaryPool,
-      uid: 'unassigned',
-      providerId: targets[0]?.providerId ?? DEFAULT_PROVIDER,
-      model: options.logType === 'mcp' ? 'mcp:asr' : 'asr',
+      pool: lastAccount?.pool ?? primaryPool,
+      uid: lastAccount?.uid ?? 'unassigned',
+      providerId: lastAccount?.providerId ?? (targets[0]?.providerId ?? DEFAULT_PROVIDER),
+      model: options.logType === 'mcp' ? 'mcp:asr' : modelName,
       status,
       startedAt,
       logType: options.logType,
@@ -1901,6 +1988,7 @@ export async function handleAudioSpeech(
   const text = typeof body.input === 'string' ? body.input.trim() : ''
   if (text === '') return jsonError(400, 'input 不能为空', 'invalid_request')
   const voice = typeof body.voice === 'string' && body.voice.trim() !== '' ? body.voice.trim() : TTS_DEFAULT_VOICE
+  const model = typeof body.model === 'string' && body.model.trim() !== '' ? body.model.trim() : undefined
   const format = typeof body.response_format === 'string' && body.response_format.trim() !== ''
     ? body.response_format.trim().toLowerCase()
     : 'wav'
@@ -1913,12 +2001,12 @@ export async function handleAudioSpeech(
   }
 
   const url = new URL(request.url)
-  const preferred = url.searchParams.get('realm') ?? 'cn'
+  const preferred = url.searchParams.get('realm') ?? (typeof body.realm === 'string' && body.realm.trim() !== '' ? body.realm.trim() : 'cn')
   const targets = buildDualRealmTargets(preferred)
   try {
     const { pcm } = await runMediaSpeech(
       env,
-      { text, voice },
+      { text, voice, ...(model === undefined ? {} : { model }) },
       { targets, ctx, signal: request.signal },
     )
     const bytes = format === 'wav' ? pcmToWav(pcm) : pcm
@@ -1956,7 +2044,7 @@ export async function handleAudioTranscriptions(
     return jsonError(400, '读取请求体失败', 'invalid_request')
   }
 
-  let part: { data: Uint8Array; filename: string; mime: string }
+  let part: ReturnType<typeof parseAudioMultipart>
   try {
     part = parseAudioMultipart(bytes, contentType)
   } catch (error) {
@@ -1964,14 +2052,28 @@ export async function handleAudioTranscriptions(
   }
 
   const url = new URL(request.url)
-  const preferred = url.searchParams.get('realm') ?? 'cn'
+  const preferred = url.searchParams.get('realm') ?? part.realm ?? 'cn'
   const targets = buildDualRealmTargets(preferred)
   try {
     const { text } = await runMediaTranscribe(
       env,
-      { audio: part.data, filename: part.filename, mime: part.mime },
+      {
+        audio: part.data,
+        filename: part.filename,
+        mime: part.mime,
+        ...(part.model === undefined ? {} : { model: part.model }),
+      },
       { targets, ctx, signal: request.signal },
     )
+    if (part.responseFormat === 'text') {
+      return new Response(text, {
+        status: 200,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      })
+    }
     return json({ text })
   } catch (error) {
     return audioErrorResponse(error)
@@ -2177,6 +2279,9 @@ export async function handleVideoGenerations(
         ...(typeof body.enable_audio === 'boolean' ? { enableAudio: body.enable_audio } : {}),
         ...(firstImage === undefined ? {} : { image: firstImage }),
         ...(lastImage === undefined ? {} : { lastImage }),
+        ...(body.reference_images === undefined ? {} : { referenceImages: body.reference_images }),
+        ...(body.reference_videos === undefined ? {} : { referenceVideos: body.reference_videos }),
+        ...(body.reference_audios === undefined ? {} : { referenceAudios: body.reference_audios }),
         ...(typeof body.wait === 'boolean' ? { wait: body.wait } : {}),
         ...(typeof body.timeout_seconds === 'number' ? { timeoutSeconds: body.timeout_seconds } : {}),
       },

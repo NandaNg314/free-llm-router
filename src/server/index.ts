@@ -29,6 +29,8 @@ export interface ServerOptions {
   autoCron?: boolean
   /** 是否信任反向代理追加的 `X-Forwarded-For`（见 {@link resolveClientIp}）。 */
   trustProxy?: boolean
+  /** 本地桌面模式（精简 VPS 横幅并启用控制台友好退出）。 */
+  localMode?: boolean
 }
 
 /**
@@ -112,6 +114,13 @@ function strictPort(raw: string | undefined): number {
 /** 进程级兜底是否已安装（只装一次，见 `startServer` 内的说明）。 */
 let unhandledGuardInstalled = false
 
+// 直接运行入口判定（node src/server/index.js 或打包后的 node dist/server.mjs）
+const isDirectRun =
+  !process.argv[1]?.includes('.test.') &&
+  (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}` ||
+    process.argv[1]?.endsWith('server.mjs') ||
+    process.argv[1]?.endsWith('server.js'))
+
 export function startServer(options: ServerOptions = {}) {
   /**
    * 🔴 **端口不能走 `parseInt`**（2026-10-21 审查补，配置健壮性专项）。
@@ -127,6 +136,7 @@ export function startServer(options: ServerOptions = {}) {
   const host = options.host ?? process.env.HOST ?? '0.0.0.0'
   const autoCron = options.autoCron ?? envFlag(process.env.AUTO_TASK_CRON, true)
   const trustProxy = options.trustProxy ?? envFlag(process.env.TRUST_PROXY, false)
+  const localMode = options.localMode ?? envFlag(process.env.LOCAL_MODE, false)
 
   /**
    * 🔴 **进程级未捕获异常兜底**（2026-10-21 审查补，并发专项）。
@@ -374,8 +384,46 @@ export function startServer(options: ServerOptions = {}) {
   }, 5 * 60 * 1000)
   pruneInterval.unref?.()
 
-  // 4. 启动监听
+  // 4. 监听错误保护（避免 EADDRINUSE / EACCES 抛裸未捕获异常堆栈）
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (cronInterval) clearInterval(cronInterval)
+    clearInterval(pruneInterval)
+    // 若测试或外部调用方额外挂了自己的 error 监听器，交由调用方断言处理
+    if (server.listenerCount('error') > 1) return
+    try {
+      db.close()
+    } catch {
+      // ignore
+    }
+    const nextPort = Math.min(65535, Math.max(1024, port + 1))
+    if (err.code === 'EADDRINUSE') {
+      console.error(
+        `\n❌ 启动失败：端口 ${port} (${host}) 已被其他程序占用（EADDRINUSE）。\n` +
+          `   请关闭占用该端口的程序，或改用其他空闲端口（例如：--port ${nextPort}）。\n`,
+      )
+    } else if (err.code === 'EACCES') {
+      console.error(
+        `\n❌ 启动失败：没有权限绑定 ${host}:${port}（EACCES，可能是系统保留端口或权限不足）。\n` +
+          `   请改用其他空闲端口重试（例如：--port ${nextPort}）。\n`,
+      )
+    } else {
+      console.error(`\n❌ HTTP 服务监听异常（${err.code || 'UNKNOWN'}）：${err.message}\n`)
+    }
+    if (isDirectRun || localMode) {
+      process.exit(1)
+    }
+  })
+
+  // 5. 启动监听
   server.listen(port, host, () => {
+    if (localMode) {
+      // 本地版启动器 start-local.mjs 已输出完整面板地址与口令框体，此处仅输出单行就绪确认，避免「VPS」字样双横幅冲突
+      const displayHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host
+      console.log(
+        `  ✅ 服务已就绪（监听 http://${displayHost}:${port} · 自动任务${autoCron ? '已启用' : '已禁用'}）\n`,
+      )
+      return
+    }
     // 对外的公网地址（可选）：由 PUBLIC_URL 环境变量提供，避免把域名硬编码进代码。
     const publicUrl = process.env.PUBLIC_URL?.trim()
     console.log(`
@@ -391,8 +439,11 @@ export function startServer(options: ServerOptions = {}) {
 `)
   })
 
-  // 5. 优雅退出
+  // 6. 优雅退出（防重入 + Windows 控制台关闭/Ctrl+Break SIGBREAK 落盘保护）
+  let shuttingDown = false
   const shutdown = () => {
+    if (shuttingDown) return
+    shuttingDown = true
     console.log('\n🛑 正在停止 free-llm-router 服务...')
     if (cronInterval) clearInterval(cronInterval)
     clearInterval(pruneInterval)
@@ -429,16 +480,31 @@ export function startServer(options: ServerOptions = {}) {
 
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
+  if (process.platform === 'win32') {
+    try {
+      process.on('SIGBREAK', shutdown)
+    } catch {
+      // ignore
+    }
+  }
+
+  // 测试反复创建/关闭 server 时自动卸载信号监听与定时器，防止 MaxListenersExceededWarning
+  server.once('close', () => {
+    if (cronInterval) clearInterval(cronInterval)
+    clearInterval(pruneInterval)
+    process.off('SIGINT', shutdown)
+    process.off('SIGTERM', shutdown)
+    if (process.platform === 'win32') {
+      try {
+        process.off('SIGBREAK', shutdown)
+      } catch {
+        // ignore
+      }
+    }
+  })
 
   return { server, runtime }
 }
-
-// 直接运行入口（node src/server/index.js 或打包后的 node dist/server.mjs）
-const isDirectRun =
-  !process.argv[1]?.includes('.test.') &&
-  (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}` ||
-    process.argv[1]?.endsWith('server.mjs') ||
-    process.argv[1]?.endsWith('server.js'))
 
 if (isDirectRun) {
   startServer()

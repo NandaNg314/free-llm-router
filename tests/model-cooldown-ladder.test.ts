@@ -23,11 +23,15 @@ import { classify, shouldPunish, shouldRotate } from '../src/upstream/client.ts'
 
 const MIN = 60 * 1000
 
-test('🔴 11102 service info not found ⇒ model_unavailable(absent)', () => {
+test('🔴 11102 service info not found ⇒ bad_request（请求级 fail-fast，避免模型名拼错轮转全池）；model_unavailable 仍保留 absent 成因映射', () => {
+  // 按 misakano7545/workbuddy2api-panel d629a8c（issue #280）实测：
+  // 11102 模型 ID 在上游不存在时换遍全池结果一致，拆为请求级 bad_request（不换号、不罚号、不写模型负缓存）
   const body = JSON.stringify({ code: 11102, msg: 'model [x] service info not found' })
   const c = classify(400, body)
-  assert.equal(c.kind, 'model_unavailable')
-  assert.equal(modelCauseFor(c.kind), 'absent')
+  assert.equal(c.kind, 'bad_request')
+  assert.equal(shouldRotate(c.kind), false)
+  assert.equal(shouldPunish(c.kind), false)
+  assert.equal(modelCauseFor('model_unavailable'), 'absent')
 })
 
 test('🔴 11158 not allowed for user type ⇒ model_denied(denied)，且与 11102 不同类', () => {
@@ -122,8 +126,9 @@ test('🔴 502 包裹已知业务码 ⇒ 必须按业务码分类，不得吃成
   const denied = JSON.stringify({ code: 11158, msg: 'model [x] is not allowed for user type [free]' })
   assert.equal(classify(502, denied).kind, 'model_denied')
 
+  // 11102 按 d629a8c 已归请求级 bad_request（防拼错模型名轮转全池），即使 502 包裹也不得落 server
   const absent = JSON.stringify({ code: 11102, msg: 'model [x] service info not found' })
-  assert.equal(classify(502, absent).kind, 'model_unavailable')
+  assert.equal(classify(502, absent).kind, 'bad_request')
 
   const busy = JSON.stringify({ code: 14003, msg: 'model busy' })
   assert.equal(classify(502, busy).kind, 'rate_limited')
@@ -155,8 +160,9 @@ test('🔴 ProviderError 的 message 经 classify 后仍能恢复业务码类别
   assert.equal(classify(502, real).kind, 'model_denied',
     'ProviderError 分支必须能识别出 11158，而不是当网络错误')
 
+  // 11102 按 d629a8c 已拆为请求级 bad_request（不轮转全池、不喂熔断）
   const absent = '{"code":11102,"msg":"model [x] service info not found"}'
-  assert.equal(classify(502, absent).kind, 'model_unavailable')
+  assert.equal(classify(502, absent).kind, 'bad_request')
 
   const channel = '{"code":"11‑128","msg":"request illegal"}'
   assert.equal(classify(502, channel).kind, 'channel_blocked')

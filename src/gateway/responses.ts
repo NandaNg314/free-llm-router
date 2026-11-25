@@ -935,6 +935,8 @@ export function toChatBody(body: ResponsesRequest, model: string): Record<string
   const normalizedChoice = normalizeOutboundToolChoice(body.tool_choice, toolMeta)
   if (normalizedChoice !== undefined) chat.tool_choice = normalizedChoice
 
+  // `parallel_tool_calls` 在 Responses 与 Chat Completions 中同名同语义，但缺省不同（对齐 `workbuddy-manager` `a7e9891`）：
+  // 仅当客户端显式传入布尔值（尤其 `false` 单工具回合约束）时原样透传；缺省或非布尔值一律不编造字段，保留上游默认行为。
   if (typeof body.parallel_tool_calls === 'boolean') {
     chat.parallel_tool_calls = body.parallel_tool_calls
   }

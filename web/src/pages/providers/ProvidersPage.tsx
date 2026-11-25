@@ -4,8 +4,10 @@ import {
   Check,
   CheckCircle2,
   ChevronRight,
+  Download,
   GripVertical,
   Layers,
+  Loader2,
   MoreHorizontal,
   Pin,
   PinOff,
@@ -41,6 +43,7 @@ import {
   useSetProviderOrder,
 } from '@/lib/config'
 import {
+  fetchAccountInventorySnapshot,
   pinModeOf,
   useAccounts,
   usePins,
@@ -51,6 +54,7 @@ import {
   useSetPin,
   useToggleAccount,
 } from '@/lib/queries'
+import { toast } from 'sonner'
 import { accountStatus, fmtRemaining, recoveryText, STATUS_META, type AccountStatus } from '@/lib/status'
 import type { Account, PinMode, Provider, Realm } from '@/lib/types'
 import { cn, fmtInt, fmtRelative } from '@/lib/utils'
@@ -74,6 +78,29 @@ export function ProvidersPage() {
   }
   const [adding, setAdding] = useState(false)
   const [showEmpty, setShowEmpty] = useState(false)
+  const [exporting, setExporting] = useState(false)
+
+  const handleExportInventory = async () => {
+    setExporting(true)
+    try {
+      const snapshot = await fetchAccountInventorySnapshot()
+      const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json; charset=utf-8' })
+      const objectUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      const day = new Date().toISOString().slice(0, 10)
+      a.href = objectUrl
+      a.download = `flr-accounts-inventory-${day}.json`
+      a.click()
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000)
+      toast.success(`已导出 ${snapshot.totalAccounts} 个账号清单`, {
+        description: '出于安全设计不含明文令牌；完整迁移请同步备份 data/ 与 CREDENTIAL_KEY。',
+      })
+    } catch (e) {
+      toast.error('导出账号清单失败', { description: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setExporting(false)
+    }
+  }
 
   const byProvider = useMemo(() => {
     const m = new Map<string, Account[]>()
@@ -267,6 +294,17 @@ export function ProvidersPage() {
                   { value: 'disabled', label: '停用' },
                 ]}
               />
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 text-xs"
+                disabled={exporting || !(accounts.data?.length)}
+                onClick={() => void handleExportInventory()}
+                title="导出全部账号元数据与凭据状态清单（不含明文访问令牌）"
+              >
+                {exporting ? <Loader2 className="animate-spin" strokeWidth={1.75} /> : <Download strokeWidth={1.75} />}
+                导出清单
+              </Button>
             </div>
           </CardHeader>
           <AccountsTable rows={rows} loading={accounts.isLoading} providerName={providerName} query={q} />

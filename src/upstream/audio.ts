@@ -20,9 +20,12 @@ export const TTS_CHANNELS = 1
 export const TTS_SAMPLE_WIDTH = 2
 export const TTS_MAX_PCM_BYTES = 32 * 1024 * 1024
 
+export const ASR_DEFAULT_MODEL = 'hunyuan-asr'
 export const ASR_MAX_BYTES = 3 * 1024 * 1024
 export const ASR_REQUEST_MAX_BYTES = ASR_MAX_BYTES + 64 * 1024
 export const ASR_FIELD_NAMES = ['file', 'audio'] as const
+export const ASR_RESPONSE_FORMATS = ['json', 'text'] as const
+export type AsrResponseFormat = (typeof ASR_RESPONSE_FORMATS)[number]
 
 type AudioContext = {
   uid: string
@@ -171,7 +174,7 @@ export function pcmToWav(
   return out
 }
 
-/** 逐行解析上游 SSE，累计 base64 PCM；任何 error 帧立刻抛出。 */
+/** 逐行解析上游 SSE，累计 base64 PCM；任何 error 帧或未见 `speech.audio.done` 的截断流立刻抛出。 */
 async function collectTtsPcm(response: Response): Promise<Uint8Array> {
   if (response.body === null) {
     throw new UpstreamError({ kind: 'unknown', httpStatus: 502, message: 'TTS 上游没有响应体', detail: '' })
@@ -180,7 +183,52 @@ async function collectTtsPcm(response: Response): Promise<Uint8Array> {
   const decoder = new TextDecoder()
   const chunks: Uint8Array[] = []
   let total = 0
+  let sawDone = false
   let buffer = ''
+
+  const consumeLine = (rawLine: string): void => {
+    const line = rawLine.trim()
+    if (line === '' || line.startsWith(':')) return
+    const data = line.startsWith('data:') ? line.slice(5).trim() : line
+    if (data === '' || data === '[DONE]') return
+    let obj: unknown
+    try {
+      obj = JSON.parse(data)
+    } catch {
+      return
+    }
+    if (obj === null || typeof obj !== 'object') return
+    const record = obj as Record<string, unknown>
+    if (record.type === 'error' || record.error !== undefined) {
+      const { message, code } = errorMessageOf(record)
+      throw isRequestCode(code, message)
+        ? new AudioRequestError(400, code || 'tts_bad_request', message || 'TTS 请求参数不合法')
+        : new UpstreamError({
+            kind: 'unknown',
+            httpStatus: 502,
+            message: message || 'TTS 上游返回错误',
+            detail: code,
+          })
+    }
+    if (record.type === 'speech.audio.done') {
+      sawDone = true
+    }
+    if (record.type !== 'speech.audio.delta' && record.type !== 'speech.audio.done') return
+    const chunk = pcmChunkOf(record)
+    if (chunk === undefined) return
+    const bytes = decodeBase64(chunk)
+    total += bytes.byteLength
+    if (total > TTS_MAX_PCM_BYTES) {
+      throw new UpstreamError({
+        kind: 'unknown',
+        httpStatus: 502,
+        message: 'TTS 音频超过 32 MiB 上限',
+        detail: '',
+      })
+    }
+    chunks.push(bytes)
+  }
+
   try {
     for (;;) {
       const { done, value } = await reader.read()
@@ -188,51 +236,33 @@ async function collectTtsPcm(response: Response): Promise<Uint8Array> {
       buffer += decoder.decode(value, { stream: true })
       let newline = buffer.indexOf('\n')
       while (newline >= 0) {
-        const line = buffer.slice(0, newline).trim()
+        const line = buffer.slice(0, newline)
         buffer = buffer.slice(newline + 1)
         newline = buffer.indexOf('\n')
-        if (line === '' || line.startsWith(':')) continue
-        const data = line.startsWith('data:') ? line.slice(5).trim() : line
-        if (data === '' || data === '[DONE]') continue
-        let obj: unknown
-        try {
-          obj = JSON.parse(data)
-        } catch {
-          continue
-        }
-        if (obj === null || typeof obj !== 'object') continue
-        const record = obj as Record<string, unknown>
-        if (record.type === 'error' || record.error !== undefined) {
-          const { message, code } = errorMessageOf(record)
-          throw isRequestCode(code, message)
-            ? new AudioRequestError(400, code || 'tts_bad_request', message || 'TTS 请求参数不合法')
-            : new UpstreamError({
-                kind: 'unknown',
-                httpStatus: 502,
-                message: message || 'TTS 上游返回错误',
-                detail: code,
-              })
-        }
-        if (record.type !== 'speech.audio.delta' && record.type !== 'speech.audio.done') continue
-        const chunk = pcmChunkOf(record)
-        if (chunk === undefined) continue
-        const bytes = decodeBase64(chunk)
-        total += bytes.byteLength
-        if (total > TTS_MAX_PCM_BYTES) {
-          throw new UpstreamError({
-            kind: 'unknown',
-            httpStatus: 502,
-            message: 'TTS 音频超过 32 MiB 上限',
-            detail: '',
-          })
-        }
-        chunks.push(bytes)
+        consumeLine(line)
       }
     }
     buffer += decoder.decode()
+    if (buffer.trim() !== '') {
+      for (const rem of buffer.split('\n')) {
+        consumeLine(rem)
+      }
+    }
   } finally {
     await reader.cancel().catch(() => undefined)
     reader.releaseLock?.()
+  }
+  // APISIX 分块流偶发在 delta 中途断开：未收到 speech.audio.done 说明音频残缺，
+  // 必须抛可重试的 network/502 交由 media-router 换号重试，绝不能把半段音频包成 200 返回。
+  if (!sawDone) {
+    throw new UpstreamError({
+      kind: 'network',
+      httpStatus: 502,
+      message: total > 0
+        ? `TTS 上游音频流被提前截断（已收 ${total} 字节，缺少 speech.audio.done）`
+        : 'TTS 上游流未正常完成（缺少 speech.audio.done）',
+      detail: 'truncated_tts_stream',
+    })
   }
   if (total === 0) {
     throw new UpstreamError({
@@ -294,11 +324,18 @@ export async function speechToPcm(
   return { pcm: await collectTtsPcm(response) }
 }
 
-/** 解析 multipart，只取 `file` / `audio` 字段。 */
+/** 解析 multipart，提取 `file` / `audio` 音频字段及可选 `response_format` / `model` / `realm` 文本字段。 */
 export function parseAudioMultipart(
   body: Uint8Array,
   contentType: string,
-): { data: Uint8Array; filename: string; mime: string } {
+): {
+  data: Uint8Array
+  filename: string
+  mime: string
+  responseFormat: AsrResponseFormat
+  model?: string
+  realm?: string
+} {
   const marker = 'boundary='
   const pos = contentType.toLowerCase().indexOf(marker)
   if (pos < 0) throw new AudioRequestError(400, 'invalid_multipart', 'multipart boundary is missing')
@@ -316,6 +353,11 @@ export function parseAudioMultipart(
     }
     return -1
   }
+
+  let audioPart: { data: Uint8Array; filename: string; mime: string } | undefined
+  let rawResponseFormat = ''
+  let model: string | undefined
+  let realm: string | undefined
 
   let cursor = 0
   for (;;) {
@@ -352,14 +394,48 @@ export function parseAudioMultipart(
         mime = line.slice(13).trim() || mime
       }
     }
-    if (!(ASR_FIELD_NAMES as readonly string[]).includes(field)) continue
-    const data = body.subarray(headEnd + crlfcrlf.length, partEnd)
-    if (data.byteLength === 0) {
-      throw new AudioRequestError(400, 'empty_audio', '音频文件为空')
+
+    const partData = body.subarray(headEnd + crlfcrlf.length, partEnd)
+    if ((ASR_FIELD_NAMES as readonly string[]).includes(field)) {
+      if (audioPart === undefined) {
+        if (partData.byteLength === 0) {
+          throw new AudioRequestError(400, 'empty_audio', '音频文件为空')
+        }
+        audioPart = { data: partData, filename, mime }
+      }
+      continue
     }
-    return { data, filename, mime }
+
+    if (field === 'response_format') {
+      rawResponseFormat = new TextDecoder().decode(partData).trim()
+    } else if (field === 'model') {
+      const m = new TextDecoder().decode(partData).trim()
+      if (m !== '') model = m
+    } else if (field === 'realm') {
+      const r = new TextDecoder().decode(partData).trim()
+      if (r !== '') realm = r
+    }
   }
-  throw new AudioRequestError(400, 'missing_audio', 'multipart 里必须包含 file 或 audio 字段')
+
+  if (audioPart === undefined) {
+    throw new AudioRequestError(400, 'missing_audio', 'multipart 里必须包含 file 或 audio 字段')
+  }
+
+  const normalizedFormat = rawResponseFormat.toLowerCase() || 'json'
+  if (normalizedFormat !== 'json' && normalizedFormat !== 'text') {
+    throw new AudioRequestError(
+      400,
+      'unsupported_response_format',
+      `response_format "${rawResponseFormat}" 不支持：上游不提供词级时间戳（不支持 srt / vtt / verbose_json），请改用 json 或 text`,
+    )
+  }
+
+  return {
+    ...audioPart,
+    responseFormat: normalizedFormat,
+    ...(model === undefined ? {} : { model }),
+    ...(realm === undefined ? {} : { realm }),
+  }
 }
 
 function buildAsrMultipart(audio: Uint8Array, filename: string, mime: string): { body: Uint8Array; contentType: string } {

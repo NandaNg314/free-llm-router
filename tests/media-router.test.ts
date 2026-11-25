@@ -7,11 +7,14 @@ import type { Env } from '../src/env.ts'
 import { createAccountState, type AccountState } from '../src/pool/state.ts'
 import type { ProviderCredential } from '../src/providers/types.ts'
 import { UpstreamError } from '../src/upstream/client.ts'
+import { normalizeVideoReferences } from '../src/upstream/media.ts'
 import { ThreeDCredentialManager } from '../src/upstream/three-d.ts'
 import { pickCredential } from '../src/gateway/models.ts'
 import {
   checkMediaSubkeyModel,
   executeMediaWithFailover,
+  handleAudioSpeech,
+  handleAudioTranscriptions,
   handleFetch,
   handleImageEdits,
   handleImageGenerations,
@@ -590,4 +593,311 @@ test('安全边界：COS 媒体代理后缀白名单防 SSRF 与子密钥模型�
     limits: { ...restrictedSubkey.limits, models: ['hy-3d'] },
   }
   assert.equal(checkMediaSubkeyModel(allowedSubkey, ['hy-3d', '3.1']), undefined)
+})
+
+test('🔴 语音路由：TTS 缺 done 截断自动换号且不罚号 + ASR response_format(json/text/400) + appendLog 记准账号与模型', async () => {
+  const cnBucket: FakePoolBucket = {
+    accounts: [
+      makeAccount('c1-trunc', { realm: 'cn', provider: 'buddy', credits: 100 }),
+      makeAccount('c2-good', { realm: 'cn', provider: 'buddy', credits: 90 }),
+    ],
+    credentials: new Map([
+      [
+        'c1-trunc',
+        { ...makeCred('c1-trunc', 'tok_c1'), provider: 'buddy', extras: { realm: 'cn', domain: 'www.workbuddy.cn' } },
+      ],
+      [
+        'c2-good',
+        { ...makeCred('c2-good', 'tok_c2'), provider: 'buddy', extras: { realm: 'cn', domain: 'www.workbuddy.cn' } },
+      ],
+    ]),
+    logs: [],
+    usages: [],
+    failures: [],
+    successes: [],
+    putCalls: [],
+  }
+  const env = createFakeEnv({ cn: cnBucket })
+
+  let asrUpstreamCalls = 0
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    const h = new Headers(init?.headers)
+    const auth = h.get('authorization') ?? ''
+
+    if (url.endsWith('/v2/audio/speech')) {
+      if (auth.includes('tok_c1')) {
+        // c1 返回被 APISIX 半途掐断的 SSE（无 speech.audio.done）
+        const cut = `data: ${JSON.stringify({ type: 'speech.audio.delta', audio: { data: btoa('cut!') } })}\n\n`
+        return new Response(cut, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      const ok =
+        `data: ${JSON.stringify({ type: 'speech.audio.delta', audio: { data: btoa('full-pcm') } })}\n\n`
+        + `data: ${JSON.stringify({ type: 'speech.audio.done' })}\n\n`
+      return new Response(ok, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
+
+    if (url.endsWith('/agenttool/v1/asr')) {
+      asrUpstreamCalls += 1
+      return Response.json({ code: 0, text: '今天天气晴朗' })
+    }
+    return new Response('unexpected', { status: 404 })
+  }
+
+  const buildMultipartReq = (format?: string): Request => {
+    const boundary = '----flr-asr-test'
+    const enc = new TextEncoder()
+    const parts: string[] = [
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="sample.wav"\r\nContent-Type: audio/wav\r\n\r\nRIFF....WAVE`,
+    ]
+    if (format !== undefined) {
+      parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\n${format}`)
+    }
+    parts.push(`--${boundary}--\r\n`)
+    return new Request('https://gw/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+      body: enc.encode(parts.join('\r\n')),
+    })
+  }
+
+  try {
+    // 1. TTS：c1 截断 -> 自动换到 c2 拿到完整 WAV，且 c1 不记熔断惩罚
+    const ttsRes = await handleAudioSpeech(
+      new Request('https://gw/v1/audio/speech', {
+        method: 'POST',
+        body: JSON.stringify({ input: '测试语音合成', response_format: 'wav' }),
+      }),
+      env,
+    )
+    assert.equal(ttsRes.status, 200)
+    assert.equal(ttsRes.headers.get('content-type'), 'audio/wav')
+    const wavBytes = new Uint8Array(await ttsRes.arrayBuffer())
+    assert.equal(new TextDecoder().decode(wavBytes.subarray(44)), 'full-pcm', '绝不能返回 c1 的半截音频')
+    assert.equal(cnBucket.failures.length, 0, 'network 截断换号不应把 c1 喂入熔断')
+
+    const ttsLog = cnBucket.logs.find((l) => l.model === 'hunyuan-tts-2.5' && l.status === 200)
+    assert.ok(ttsLog, 'TTS 成功必须写入 model=hunyuan-tts-2.5 的请求台账')
+    assert.equal(ttsLog.uid, 'c2-good', 'TTS 台账必须记录真实命中的账号 uid')
+
+    // 2. 当所有账号的 TTS 流都被截断时，必须返回 502 且失败日志带最后尝试账号与状态码 502
+    cnBucket.credentials.delete('c2-good')
+    const ttsFailRes = await handleAudioSpeech(
+      new Request('https://gw/v1/audio/speech', {
+        method: 'POST',
+        body: JSON.stringify({ input: '测试截断失败' }),
+      }),
+      env,
+    )
+    assert.equal(ttsFailRes.status, 502)
+    const ttsErrLog = cnBucket.logs.find((l) => l.model === 'hunyuan-tts-2.5' && l.status === 502)
+    assert.ok(ttsErrLog, '截断失败日志必须记录 status=502')
+    assert.equal(ttsErrLog.uid, 'c1-trunc', '失败日志也应关联最后尝试的账号')
+
+    // 3. ASR：response_format=text / json / 不支持的时间戳格式
+    const asrTextRes = await handleAudioTranscriptions(buildMultipartReq('text'), env)
+    assert.equal(asrTextRes.status, 200)
+    assert.match(asrTextRes.headers.get('content-type') ?? '', /^text\/plain/)
+    assert.equal(await asrTextRes.text(), '今天天气晴朗')
+
+    const asrJsonRes = await handleAudioTranscriptions(buildMultipartReq('json'), env)
+    assert.equal(asrJsonRes.status, 200)
+    assert.deepEqual(await asrJsonRes.json(), { text: '今天天气晴朗' })
+
+    const asrLog = cnBucket.logs.find((l) => l.model === 'hunyuan-asr' && l.status === 200)
+    assert.ok(asrLog, 'ASR 成功必须写入 model=hunyuan-asr 的请求台账')
+    assert.equal(asrLog.uid, 'c1-trunc')
+
+    const callsBeforeBadFmt = asrUpstreamCalls
+    for (const unsupported of ['srt', 'vtt', 'verbose_json']) {
+      const badRes = await handleAudioTranscriptions(buildMultipartReq(unsupported), env)
+      assert.equal(badRes.status, 400, `${unsupported} 必须返回 400`)
+      const errBody = (await badRes.json()) as { error: { message: string } }
+      assert.match(errBody.error.message, /json/)
+    }
+    assert.equal(asrUpstreamCalls, callsBeforeBadFmt, '不支持的 response_format 必须在打上游之前直接 400 拦截')
+  } finally {
+    globalThis.fetch = origFetch
+  }
+})
+
+test('🔴 视频提交：reference_* 素材归一化为对象数组 + 提交阶段 4xx 不罚号不换号', async () => {
+  assert.deepEqual(
+    normalizeVideoReferences(['https://cdn.example.com/1.png', { image_url: 'https://cdn.example.com/2.png' }, '', 123], 'image_url'),
+    [{ image_url: 'https://cdn.example.com/1.png' }, { image_url: 'https://cdn.example.com/2.png' }],
+  )
+  assert.deepEqual(
+    normalizeVideoReferences(['https://cdn.example.com/1.mp4', { url: 'https://cdn.example.com/2.mp4' }, { audio_url: 'wrong' }], 'video_url'),
+    [{ video_url: 'https://cdn.example.com/1.mp4' }, { video_url: 'https://cdn.example.com/2.mp4' }],
+  )
+  assert.equal(normalizeVideoReferences('https://cdn.example.com/a.wav', 'audio_url'), undefined)
+
+  const bucket: FakePoolBucket = {
+    accounts: [
+      makeAccount('g1', { credits: 200 }),
+      makeAccount('g2', { credits: 150 }),
+    ],
+    credentials: new Map([
+      ['g1', makeCred('g1', 'tok_g1')],
+      ['g2', makeCred('g2', 'tok_g2')],
+    ]),
+    logs: [],
+    usages: [],
+    failures: [],
+    successes: [],
+    putCalls: [],
+  }
+  const env = createFakeEnv({ global: bucket })
+
+  let capturedBody: Record<string, unknown> | undefined
+  let submitCalls = 0
+  let mockMode: 'ok' | '400' | '422' = 'ok'
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (_input, init) => {
+    submitCalls += 1
+    capturedBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+    if (mockMode === '400') {
+      return new Response(
+        JSON.stringify({ code: 14407, msg: 'unsupported video duration: 1 seconds, supported range: 4-15 seconds' }),
+        { status: 400, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    if (mockMode === '422') {
+      return new Response(
+        JSON.stringify({ code: 2013, msg: 'media url unreachable' }),
+        { status: 422, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    return Response.json({ code: 0, data: { id: 'vid-ref-1', status: 'queued' } })
+  }
+
+  try {
+    // 1. reference_images / reference_videos / reference_audios 自动转换，非法项跳过
+    const okRes = await handleVideoGenerations(
+      new Request('https://gw/v1/videos/generations', {
+        method: 'POST',
+        body: JSON.stringify({
+          prompt: '角色转身挥手',
+          reference_images: ['https://cdn.example.com/i1.png', { url: 'https://cdn.example.com/i2.png' }, ''],
+          reference_videos: ['https://cdn.example.com/v1.mp4', { audio_url: 'bad-key' }],
+          reference_audios: 'not-array',
+        }),
+      }),
+      env,
+    )
+    assert.equal(okRes.status, 200)
+    assert.deepEqual(capturedBody?.reference_images, [
+      { image_url: 'https://cdn.example.com/i1.png' },
+      { image_url: 'https://cdn.example.com/i2.png' },
+    ])
+    assert.deepEqual(capturedBody?.reference_videos, [{ video_url: 'https://cdn.example.com/v1.mp4' }])
+    assert.equal('reference_audios' in (capturedBody ?? {}), false)
+
+    // 2. 提交阶段 400 / 422 请求级错误：只打 1 次上游（不换 g2），且零账号惩罚
+    for (const mode of ['400', '422'] as const) {
+      mockMode = mode
+      submitCalls = 0
+      const badRes = await handleVideoGenerations(
+        new Request('https://gw/v1/videos/generations', {
+          method: 'POST',
+          body: JSON.stringify({ prompt: '测试错误参数', seconds: 1 }),
+        }),
+        env,
+      )
+      assert.equal(badRes.status, 400, `视频提交 ${mode} 应映射为 400 请求错误`)
+      assert.equal(submitCalls, 1, `视频提交 ${mode} 绝不能换号打第 2 个健康号`)
+      assert.equal(bucket.failures.length, 0, `视频提交 ${mode} 绝不能给健康账号记失败惩罚`)
+    }
+  } finally {
+    globalThis.fetch = origFetch
+    mediaTaskLedger.clear()
+  }
+})
+
+test('🔴 /v1/fetch 边缘故障（15021 路由策略拒 / 15022 目标站连不上）：同分片立即止损不轮转且不罚号，支持跨分片回退', async () => {
+  for (const edge of [
+    { code: 15021, msg: 'edgebrowser: API error: domain rejected by via routing policy' },
+    { code: 15022, msg: 'edgebrowser: API error: net::ERR_CONNECTION_REFUSED' },
+  ]) {
+    const cnBucket: FakePoolBucket = {
+      accounts: [
+        makeAccount('c1', { realm: 'cn', provider: 'buddy' }),
+        makeAccount('c2', { realm: 'cn', provider: 'buddy' }),
+        makeAccount('c3', { realm: 'cn', provider: 'buddy' }),
+      ],
+      credentials: new Map([
+        ['c1', { ...makeCred('c1', 'tok_c1'), provider: 'buddy', extras: { realm: 'cn' } }],
+        ['c2', { ...makeCred('c2', 'tok_c2'), provider: 'buddy', extras: { realm: 'cn' } }],
+        ['c3', { ...makeCred('c3', 'tok_c3'), provider: 'buddy', extras: { realm: 'cn' } }],
+      ]),
+      logs: [],
+      usages: [],
+      failures: [],
+      successes: [],
+      putCalls: [],
+    }
+    const globalBucket: FakePoolBucket = {
+      accounts: [],
+      credentials: new Map(),
+      logs: [],
+      usages: [],
+      failures: [],
+      successes: [],
+      putCalls: [],
+    }
+    const env = createFakeEnv({ cn: cnBucket, global: globalBucket })
+
+    const webfetchAuths: string[] = []
+    const origFetch = globalThis.fetch
+    globalThis.fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      const h = new Headers(init?.headers)
+      if (url.endsWith('/agenttool/v1/webfetch')) {
+        const auth = h.get('authorization') ?? ''
+        webfetchAuths.push(auth)
+        if (url.startsWith('https://www.workbuddy.ai')) {
+          return Response.json({ url: 'https://docs.example.com/a', title: 'Global OK', content: '# 跨分片成功' })
+        }
+        return new Response(JSON.stringify({ code: edge.code, msg: edge.msg }), {
+          status: 422,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      // 模拟直连也连不上目标站
+      return new Response('Gateway Timeout', { status: 504 })
+    }
+
+    try {
+      // 仅 CN 池有 3 个号时：c1 命中 15021/15022 后同分片立即停手（c2/c3 不被打），且零惩罚
+      const failRes = await handleFetch(
+        new Request('https://gw/v1/fetch?realm=cn', {
+          method: 'POST',
+          body: JSON.stringify({ url: 'https://docs.example.com/a' }),
+        }),
+        env,
+      )
+      assert.equal(failRes.status, 502)
+      assert.deepEqual(webfetchAuths, ['Bearer tok_c1'], `${edge.code} 同分片只允许打 1 个号，不得轮转 c2/c3`)
+      assert.equal(cnBucket.failures.length, 0, `${edge.code} 边缘错误绝不能罚健康账号`)
+
+      // 加入 1 个国际版号后：CN 第 1 个号命中边缘故障立即切到 global 分片成功返回 200
+      globalBucket.accounts.push(makeAccount('g1', { realm: 'global', provider: 'workbuddy' }))
+      globalBucket.credentials.set('g1', makeCred('g1', 'tok_g1'))
+      webfetchAuths.length = 0
+
+      const crossRes = await handleFetch(
+        new Request('https://gw/v1/fetch?realm=cn', {
+          method: 'POST',
+          body: JSON.stringify({ url: 'https://docs.example.com/a' }),
+        }),
+        env,
+      )
+      assert.equal(crossRes.status, 200)
+      assert.deepEqual(webfetchAuths, ['Bearer tok_c1', 'Bearer tok_g1'], `${edge.code} 应跳过 c2/c3 直接跨分片回退到 g1`)
+      assert.equal(cnBucket.failures.length, 0)
+    } finally {
+      globalThis.fetch = origFetch
+    }
+  }
 })

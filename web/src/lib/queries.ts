@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { api } from './api'
+import { ApiError, api, auth } from './api'
 import { fmtInt } from './utils'
 import type { Account, AccountPin, ApiKey, ApiKeyLimits, LogEntry, PinMode, PoolCounts, Provider, Realm, Usage, UsageRow } from './types'
 
@@ -455,6 +455,163 @@ export function useSubmitThreeD() {
 /** 查询混元 3D 异步任务进度（`POST /v1/3d/tasks`）。 */
 export const checkThreeDTask = (jobId: string) =>
   api<ThreeDTask>('/v1/3d/tasks', { json: { job_id: jobId }, timeoutMs: 60_000 })
+
+// ── 语音合成（TTS）与语音转写（ASR） ──
+
+export interface SpeechSynthesisInput {
+  input: string
+  voice?: string
+  response_format?: 'wav' | 'pcm'
+}
+
+export interface SpeechSynthesisOutput {
+  blob: Blob
+  byteLength: number
+  format: 'wav' | 'pcm'
+}
+
+async function parseErrorBody(res: Response): Promise<unknown> {
+  const text = await res.text().catch(() => '')
+  if (!text) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
+}
+
+export function useSynthesizeSpeech() {
+  return useMutation<SpeechSynthesisOutput, Error, SpeechSynthesisInput>({
+    mutationFn: async (v) => {
+      const format = v.response_format ?? 'wav'
+      const ctrl = new AbortController()
+      let timedOut = false
+      const timer = setTimeout(() => {
+        timedOut = true
+        ctrl.abort()
+      }, 120_000)
+      try {
+        const res = await fetch('/v1/audio/speech', {
+          method: 'POST',
+          headers: {
+            authorization: 'Bearer ' + auth.get(),
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            input: v.input,
+            ...(v.voice && v.voice.trim() !== '' ? { voice: v.voice.trim() } : {}),
+            response_format: format,
+          }),
+          signal: ctrl.signal,
+        })
+        if (res.status === 401) window.dispatchEvent(new Event('auth:expired'))
+        if (!res.ok) throw new ApiError(res.status, await parseErrorBody(res))
+        const raw = await res.arrayBuffer()
+        const mime = format === 'pcm' ? 'audio/pcm' : 'audio/wav'
+        const blob = new Blob([raw], { type: mime })
+        return { blob, byteLength: raw.byteLength, format }
+      } catch (e) {
+        if (timedOut) throw new Error('请求超时（120 秒）')
+        throw e
+      } finally {
+        clearTimeout(timer)
+      }
+    },
+    onError: (e) => toast.error('语音合成失败', { description: e.message }),
+  })
+}
+
+export interface TranscribeInput {
+  file: File
+  responseFormat?: 'json' | 'text'
+}
+
+export function useTranscribeAudio() {
+  return useMutation<{ text: string }, Error, TranscribeInput>({
+    mutationFn: async ({ file, responseFormat = 'json' }) => {
+      const form = new FormData()
+      form.append('file', file, file.name || 'audio.wav')
+      form.append('response_format', responseFormat)
+      const ctrl = new AbortController()
+      let timedOut = false
+      const timer = setTimeout(() => {
+        timedOut = true
+        ctrl.abort()
+      }, 120_000)
+      try {
+        const res = await fetch('/v1/audio/transcriptions', {
+          method: 'POST',
+          headers: {
+            authorization: 'Bearer ' + auth.get(),
+          },
+          body: form,
+          signal: ctrl.signal,
+        })
+        if (res.status === 401) window.dispatchEvent(new Event('auth:expired'))
+        if (!res.ok) throw new ApiError(res.status, await parseErrorBody(res))
+        if (responseFormat === 'text') {
+          return { text: await res.text() }
+        }
+        const body = (await res.json()) as { text?: unknown }
+        return { text: typeof body?.text === 'string' ? body.text : '' }
+      } catch (e) {
+        if (timedOut) throw new Error('请求超时（120 秒）')
+        throw e
+      } finally {
+        clearTimeout(timer)
+      }
+    },
+    onError: (e) => toast.error('语音识别失败', { description: e.message }),
+  })
+}
+
+// ── 账号池清单导出（仅调用已鉴权的 /admin/accounts 与 /admin/credentials，不含明文密钥） ──
+
+export interface ExportedAccountSummary {
+  uid: string
+  provider: string
+  realm: Realm
+  nickname: string
+  hasCredential: boolean
+  credits: number
+  creditsExpiring: number
+  disabled: boolean
+  expiresAt: number | null
+}
+
+export async function fetchAccountInventorySnapshot() {
+  const items: ExportedAccountSummary[] = []
+  let credentialsStored = 0
+  for (const realm of REALMS) {
+    const [accRes, credRes] = await Promise.all([
+      api<{ accounts: Omit<Account, 'realm'>[] }>(`/admin/accounts?realm=${realm}`),
+      api<{ realm: string; count: number; uids: string[] }>(`/admin/credentials?realm=${realm}`),
+    ])
+    const credSet = new Set(credRes.uids ?? [])
+    credentialsStored += credRes.count ?? credSet.size
+    for (const a of accRes.accounts) {
+      items.push({
+        uid: a.uid,
+        provider: a.provider,
+        realm,
+        nickname: a.nickname,
+        hasCredential: credSet.has(a.uid),
+        credits: a.credits,
+        creditsExpiring: a.creditsExpiring ?? 0,
+        disabled: a.disabled,
+        expiresAt: a.expiresAt,
+      })
+    }
+  }
+  items.sort((a, b) => a.provider.localeCompare(b.provider) || a.realm.localeCompare(b.realm) || a.uid.localeCompare(b.uid))
+  return {
+    exportedAt: new Date().toISOString(),
+    totalAccounts: items.length,
+    credentialsStored,
+    note: '安全说明：网关凭据采用 AES-GCM 加密落盘，HTTP 接口不回传明文 accessToken/refreshToken。跨机器完整迁移请直接备份并拷贝 data/ 目录与 .env 中的 CREDENTIAL_KEY。',
+    accounts: items,
+  }
+}
 
 /** 媒体直链的**同源代理**（跨域资源浏览器不让 download，必须走它）。 */
 export function mediaProxyUrl(url: string): string {

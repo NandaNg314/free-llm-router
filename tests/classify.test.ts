@@ -20,6 +20,7 @@ import assert from 'node:assert/strict'
 import {
   classify,
   isAccountRestriction,
+  isGatewayAuthRejection,
   isProviderOverloaded,
   isRestricted,
   isUpstreamQueueBusy,
@@ -144,7 +145,10 @@ test('成功信封 → code 0 不被当作错误类别', () => {
 test('已知业务码映射到正确类别', () => {
   const cases: Array<[number, string]> = [
     [6004, 'rate_limited'],
-    [11102, 'model_unavailable'],
+    [11102, 'bad_request'],
+    [14401, 'bad_request'],
+    [11103, 'bad_request'],
+    [11158, 'model_denied'],
     [14018, 'credit_exhausted'],
     [14017, 'rate_limited'],
     [11140, 'request_illegal'],
@@ -476,4 +480,64 @@ test('🔴 11140 细分判据：剔除泛化「已被限制」，区分限流/�
   const safetyBlocked = '{"code":11140,"msg":"content failed safety review"}'
   assert.equal(isAccountRestriction(safetyBlocked), false)
   assert.equal(classify(400, safetyBlocked).kind, 'bad_request')
+})
+
+test('🔴 11102/14401（模型不存在）、11103（后端未启用）、11353+[413]（TEI 输入过大）归 bad_request，与 11158（档位拒绝换号）严格拆开', () => {
+  const missing11102 =
+    '{"code":11102,"msg":"model [DeepSeek-V4.1-Flash] service info not found","retry_policy":{"retry":false}}'
+  const missing14401 = '{"code":14401,"msg":"Image model [foo] route config not found"}'
+  const backend11103 = '{"code":11103,"msg":"Backend [hunyuan-stream] is not supported"}'
+  const tei413 =
+    '{"code":11353,"msg":"Generate embedding failed with error: 11353:generate bemdding by tei failed with status code: [413]"}'
+
+  for (const body of [missing11102, missing14401, backend11103, tei413]) {
+    for (const status of [400, 404, 500, 502]) {
+      const r = classify(status, body)
+      assert.equal(r.kind, 'bad_request', `status=${status} body=${body}`)
+      assert.equal(shouldRotate(r.kind), false, '纯请求/模型名拼写问题不得触发换号风暴')
+      assert.equal(shouldPunish(r.kind), false, '不得惩罚健康账号或写 6 小时模型负缓存')
+    }
+  }
+
+  // 无数字 code 的 400/404 `service info not found` 同样归 bad_request
+  assert.equal(classify(400, '{"msg":"service info not found"}').kind, 'bad_request')
+  assert.equal(classify(404, '{"msg":"model [x] service info not found"}').kind, 'bad_request')
+  // 429 + 11102 仍保底走限流语义
+  assert.equal(classify(429, missing11102).kind, 'rate_limited')
+
+  // 不带 [413] 的 11353 是 TEI 自身故障，500 外壳仍归 server
+  const tei500 = '{"code":11353,"msg":"generate embedding by tei failed"}'
+  assert.equal(classify(500, tei500).kind, 'server')
+
+  // 11158（免费号无权调用专属模型）必须保持 model_denied → 换号 + 模型级负缓存
+  const denied11158 = '{"code":11158,"msg":"model [gpt-6-luna] is not allowed for user type [personal_free_user]"}'
+  const d = classify(400, denied11158)
+  assert.equal(d.kind, 'model_denied')
+  assert.equal(shouldRotate(d.kind), true)
+  assert.equal(shouldPunish(d.kind), true)
+  assert.equal(mapErrorToPunishment(d.kind).dimension, 'model')
+})
+
+test('🔴 网关边缘 HTML 401/403（openresty/APISIX/Authorization Required）归可冷却恢复错误，仅 12153 JSON 才判 session_dead（0ec35a0）', () => {
+  const apisix403 = '<em>Powered by <a href="https://apisix.apache.org/">APISIX</a>.</em>'
+  assert.equal(isGatewayAuthRejection(401, HTML_401), true)
+  assert.equal(isGatewayAuthRejection(403, apisix403), true)
+  assert.equal(isGatewayAuthRejection(401, '<html>blocked</html>'), false)
+  assert.equal(isGatewayAuthRejection(502, HTML_401), false)
+
+  // 边缘 HTML 401/403 绝不落入 session_dead / restricted 永久死刑
+  const c401 = classify(401, HTML_401)
+  assert.equal(c401.kind, 'auth_error')
+  assert.equal(mapErrorToPunishment(c401.kind).punish, false)
+  assert.notEqual(mapErrorToPunishment(c401.kind).dimension, 'session_dead')
+
+  const c403 = classify(403, apisix403)
+  assert.equal(c403.kind, 'waf_blocked')
+  assert.equal(mapErrorToPunishment(c403.kind).dimension, 'soft')
+  assert.notEqual(mapErrorToPunishment(c403.kind).dimension, 'session_dead')
+
+  // 真吊销信封（12153 JSON）绝不误判为边缘网关 HTML，仍归 session_dead
+  const revoked = '{"code":12153,"msg":"Offline user session not found"}'
+  assert.equal(isGatewayAuthRejection(401, revoked), false)
+  assert.equal(classify(401, revoked).kind, 'session_dead')
 })

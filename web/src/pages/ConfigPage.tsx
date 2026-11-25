@@ -134,7 +134,7 @@ ANTHROPIC_API_KEY=${k}`
       <Head
         icon={<Terminal />}
         title="接入指南"
-        desc="兼容 OpenAI 与 Anthropic 双协议：/v1/models、/v1/chat/completions、/v1/responses、/v1/messages（含 count_tokens），并支持 /v1/images/*、/v1/videos/*、/v1/3d/* 与 /mcp。"
+        desc="兼容 OpenAI 与 Anthropic 双协议：/v1/models、/v1/chat/completions、/v1/responses、/v1/messages（含 count_tokens），并支持 /v1/images/*、/v1/videos/*、/v1/audio/*、/v1/3d/*、/v1/tools/* 与 /mcp。"
       />
       <div className="space-y-3 px-5 pb-5">
         <Field label="Base URL" value={base} onCopy={() => copyText(base, '已复制 Base URL')} />
@@ -190,11 +190,13 @@ ANTHROPIC_API_KEY=${k}`
             <span>数据面同时接受 Bearer 与 x-api-key 请求头（主密钥与子密钥均支持）。</span>
           </li>
           <li>
-            <span className="text-foreground font-medium">媒体与 3D 端点：</span>
+            <span className="text-foreground font-medium">媒体、语音与检索端点：</span>
             <code className="font-mono">/v1/images/generations</code>、
             <code className="font-mono">/v1/videos/generations</code>、
+            <code className="font-mono">/v1/audio/speech</code>、
+            <code className="font-mono">/v1/audio/transcriptions</code>、
             <code className="font-mono">/v1/3d/generations</code>、
-            <code className="font-mono">/v1/3d/tasks</code>、
+            <code className="font-mono">/v1/tools/search</code>、
             <code className="font-mono">/mcp</code>。
           </li>
           <li>
@@ -648,8 +650,8 @@ function StatusCard() {
         />
         <Row
           icon={<Lock className="text-muted-foreground" />}
-          title="凭据加密存储"
-          desc="账号凭据用 AES-GCM 加密后落盘，密钥是部署时配置的 CREDENTIAL_KEY。"
+          title="凭据加密存储与备份迁移"
+          desc="账号凭据用 AES-GCM 加密后落盘（HTTP 接口不回传明文令牌）；跨机器完整备份或迁移时请同时拷贝 data/ 目录与 .env 中的 CREDENTIAL_KEY。"
         />
       </div>
       <Dialog

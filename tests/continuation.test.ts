@@ -4,14 +4,20 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import {
+  BROWSER_COMPLETE_NUDGE,
   CONTINUE_NUDGE,
+  INTERNAL_NUDGE_PREFIX,
   KEEPALIVE_FRAME,
+  NARRATION_COLON_NUDGE,
+  NARRATION_PROMISE_NUDGE,
   buildContinuationBody,
   extractLastSentence,
+  isBrowserCompleteDirectiveOnly,
   mergeSegmentUsage,
   narrationTailPromises,
   narrationTailSuspends,
   shouldContinueTruncated,
+  shouldRescueBrowserComplete,
   shouldRescueNarrationHover,
   toolCallMarkupState,
   wrapContinuationStream,
@@ -395,4 +401,106 @@ test('wrapContinuationStream：预告句悬停自动救援补出 tool_calls，�
   )
   assert.deepEqual(merged, { prompt_tokens: 80, completion_tokens: 35, total_tokens: 115 })
   assert.equal(narrationTailPromises('接下来我来修改 config.ts'), true)
+})
+
+test('🔴 独立 `::browser-complete` 控制标记救援与合成续写提示语纯中性守卫（6dc02b3 / f60c68d / 2e2358c）', async () => {
+  const marker = '::browser-complete{title="Adjusted three disputed answers"}'
+  assert.equal(isBrowserCompleteDirectiveOnly(` \n${marker}\r\n`), true)
+  for (const nonStandalone of [
+    `说明一下 ${marker}`,
+    `${marker} 后面还有正文`,
+    '::browser-completed{title="x"}',
+    '::browser-complete{title="x"',
+  ]) {
+    assert.equal(isBrowserCompleteDirectiveOnly(nonStandalone), false, nonStandalone)
+  }
+
+  // 所有合成续写提示语不得泄露网关自称词，且不要求模型回复「已完成」污染客户端正文
+  for (const [name, nudge] of Object.entries({
+    INTERNAL_NUDGE_PREFIX,
+    CONTINUE_NUDGE,
+    NARRATION_COLON_NUDGE,
+    NARRATION_PROMISE_NUDGE,
+    BROWSER_COMPLETE_NUDGE,
+  })) {
+    const low = nudge.toLowerCase()
+    assert.ok(!low.includes('wb2api'), `${name} 不得包含 wb2api`)
+    assert.ok(!low.includes('free-llm-router'), `${name} 不得包含项目名`)
+    assert.ok(!low.includes('网关'), `${name} 不得包含「网关」自称`)
+    assert.ok(!low.includes('非用户消息'), `${name} 应使用中性标记而非旧措辞`)
+    assert.ok(!nudge.includes('已完成'), `${name} 不得诱导输出「已完成」`)
+  }
+
+  assert.equal(
+    shouldRescueBrowserComplete({
+      finishReason: 'stop',
+      text: marker,
+      requestBody: AGENT_TOOL_BODY,
+    }).rescue,
+    true,
+  )
+  assert.equal(
+    shouldRescueBrowserComplete({
+      finishReason: 'stop',
+      text: marker,
+      requestBody: { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+    }).reason,
+    'no_tool_context',
+  )
+
+  // 跨多个 SSE delta 拆分的独立 `::browser-complete`：对客户端隐藏并自动触发 1 次续写
+  const splitSeg = sseStreamFromLines([
+    'data: {"id":"b1","choices":[{"index":0,"delta":{"content":"::browser-"}}]}\n\n',
+    'data: {"id":"b1","choices":[{"index":0,"delta":{"content":"complete{title=\\"split\\"}"}}]}\n\n',
+    'data: {"id":"b1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":12,"total_tokens":112}}\n\n',
+    'data: [DONE]\n\n',
+  ])
+  const sentBodies: Array<Record<string, unknown>> = []
+  const switchKinds: string[] = []
+  const wrapped = wrapContinuationStream(splitSeg, {
+    requestBody: AGENT_TOOL_BODY,
+    onSegmentSwitch(info) {
+      switchKinds.push(info.kind)
+    },
+    async openNextSegment(nextBody) {
+      sentBodies.push(nextBody)
+      return sseStreamFromLines([
+        'data: {"id":"b2","choices":[{"index":0,"delta":{"content":"任务尚未结束，已完成最终核验结论。"}}]}\n\n',
+        'data: {"id":"b2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":130,"completion_tokens":15,"total_tokens":145}}\n\n',
+        'data: [DONE]\n\n',
+      ])
+    },
+  })
+
+  const outText = await readStreamText(wrapped)
+  assert.equal(sentBodies.length, 1)
+  assert.deepEqual(switchKinds, ['browser_complete'])
+  assert.ok(!outText.includes('::browser-'), `控制标记不得泄漏给客户端：${outText}`)
+  const agg = aggregateSse(outText, { model: 'deepseek-v4.1-flash', now: Date.now() })
+  assert.equal(agg.choices[0]!.message.content, '任务尚未结束，已完成最终核验结论。')
+  const sentMsgs = sentBodies[0]!.messages as Array<Record<string, unknown>>
+  assert.equal(sentMsgs[sentMsgs.length - 2]!.content, '::browser-complete{title="split"}')
+  assert.equal(sentMsgs[sentMsgs.length - 1]!.content, BROWSER_COMPLETE_NUDGE)
+
+  // 半截未闭合候选（非合法控制标记）在流结束时原样刷出，绝不吞字
+  const unclosedSeg = sseStreamFromLines([
+    'data: {"id":"b3","choices":[{"index":0,"delta":{"content":"::browser-complete{unclosed"}}]}\n\n',
+    'data: {"id":"b3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ])
+  let unclosedRetries = 0
+  const unclosedOut = await readStreamText(
+    wrapContinuationStream(unclosedSeg, {
+      requestBody: AGENT_TOOL_BODY,
+      async openNextSegment() {
+        unclosedRetries += 1
+        return null
+      },
+    }),
+  )
+  assert.equal(unclosedRetries, 0, '未闭合标记不得误触发救援')
+  assert.equal(
+    aggregateSse(unclosedOut, { model: 'deepseek-v4.1-flash', now: Date.now() }).choices[0]!.message.content,
+    '::browser-complete{unclosed',
+  )
 })

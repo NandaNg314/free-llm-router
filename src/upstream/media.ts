@@ -579,9 +579,11 @@ export async function webFetch(
     } catch (directError) {
       const upstreamMsg = upstreamError instanceof Error ? upstreamError.message : String(upstreamError)
       const directMsg = directError instanceof Error ? directError.message : String(directError)
+      const upstreamCode = upstreamError instanceof UpstreamError ? upstreamError.code : undefined
       throw new UpstreamError({
         kind: 'unknown',
         httpStatus: 502,
+        ...(upstreamCode === undefined ? {} : { code: upstreamCode }),
         message: `抓取失败：上游接口与直连抓取均不可用`,
         detail: `上游：${upstreamMsg.slice(0, 300)}；直连：${directMsg.slice(0, 300)}`,
       })
@@ -725,9 +727,17 @@ export async function directFetch(url: string): Promise<FetchResult> {
   })
 
   const contentType = res.headers.get('content-type') ?? ''
-  // 非 HTML：可能是纯文本 / JSON / markdown，原样返回
+  // 非 HTML：仅在 2xx 成功时把纯文本 / JSON / markdown 原样返回；非 2xx 错误页必须抛错！
   if (!/text\/html|application\/xhtml/i.test(contentType)) {
     const text = await res.text()
+    if (!res.ok) {
+      throw new UpstreamError({
+        kind: 'unknown',
+        httpStatus: res.status,
+        message: `直连抓取失败：目标站点返回 HTTP ${res.status}`,
+        detail: `url=${url}`,
+      })
+    }
     return { url, title: '', content: text.slice(0, 200_000) }
   }
 
@@ -843,6 +853,39 @@ export interface VideoTaskResult {
  *    调用方必须把 `failed` 的 `error.message` 原样交给用户 ——
  *    笼统报「生成失败」会让人反复重试同一个 prompt。
  */
+/**
+ * 将视频参考素材数组（`reference_images` / `reference_videos` / `reference_audios`）
+ * 归一化为上游要求的对象数组（`[{ image_url }]` / `[{ video_url }]` / `[{ audio_url }]`）。
+ *
+ * - 字符串条目自动包成 `{ [urlKey]: url }`；
+ * - 对象条目优先取 `[urlKey]`，回退取 `url`；
+ * - 非数组或无法提取有效 URL 的条目安全丢弃，避免整单因单个畸形字段被拒。
+ */
+export function normalizeVideoReferences(
+  raw: unknown,
+  urlKey: 'image_url' | 'video_url' | 'audio_url',
+): Array<Record<string, string>> | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: Array<Record<string, string>> = []
+  for (const item of raw) {
+    let url = ''
+    if (typeof item === 'string') {
+      url = item.trim()
+    } else if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
+      const rec = item as Record<string, unknown>
+      if (typeof rec[urlKey] === 'string' && rec[urlKey].trim() !== '') {
+        url = rec[urlKey].trim()
+      } else if (typeof rec.url === 'string' && rec.url.trim() !== '') {
+        url = rec.url.trim()
+      }
+    }
+    if (url !== '') {
+      out.push({ [urlKey]: url })
+    }
+  }
+  return out.length > 0 ? out : undefined
+}
+
 export async function submitVideo(
   ctx: { uid: string; accessToken: string },
   env: Env,
@@ -866,6 +909,12 @@ export async function submitVideo(
     image?: string
     /** 尾帧（可选，字段名 **`last_image_url`**）。 */
     lastImage?: string
+    /** 参考图素材（`["url"]` 或 `[{"image_url":"..."}]` / `[{"url":"..."}]`）。 */
+    referenceImages?: unknown
+    /** 参考视频素材（`["url"]` 或 `[{"video_url":"..."}]` / `[{"url":"..."}]`）。 */
+    referenceVideos?: unknown
+    /** 参考音频素材（`["url"]` 或 `[{"audio_url":"..."}]` / `[{"url":"..."}]`）。 */
+    referenceAudios?: unknown
   },
 ): Promise<VideoSubmitResult> {
   const model = (input.model ?? '').trim() || INTl_VIDEO_MODEL
@@ -874,6 +923,9 @@ export async function submitVideo(
     : 5
   const aspect = (input.aspectRatio ?? '').trim() || '16:9'
   const hasImage = input.image !== undefined && input.image !== ''
+  const refImages = normalizeVideoReferences(input.referenceImages, 'image_url')
+  const refVideos = normalizeVideoReferences(input.referenceVideos, 'video_url')
+  const refAudios = normalizeVideoReferences(input.referenceAudios, 'audio_url')
 
   /**
    * `extra_parameters` 里放什么。
@@ -887,19 +939,53 @@ export async function submitVideo(
   if (input.resolution !== undefined && input.resolution !== '') extra.resolution = input.resolution
   if (input.enableAudio !== undefined) extra.enable_audio = input.enableAudio
 
-  const { data } = await mediaCall<{ id?: unknown; task_id?: unknown; status?: unknown }>(
-    ctx, env, '/v2/videos/generations',
-    {
-      model,
-      prompt: input.prompt,
-      seconds,
-      watermark: true,
-      // ⚠️ 字段名是 image_url / last_image_url，**不是 image / last_image**
-      ...(hasImage ? { image_url: input.image } : {}),
-      ...(input.lastImage === undefined || input.lastImage === '' ? {} : { last_image_url: input.lastImage }),
-      ...(Object.keys(extra).length === 0 ? {} : { extra_parameters: extra }),
-    },
-  )
+  let data: { id?: unknown; task_id?: unknown; status?: unknown }
+  try {
+    const res = await mediaCall<{ id?: unknown; task_id?: unknown; status?: unknown }>(
+      ctx, env, '/v2/videos/generations',
+      {
+        model,
+        prompt: input.prompt,
+        seconds,
+        watermark: true,
+        // ⚠️ 字段名是 image_url / last_image_url，**不是 image / last_image**
+        ...(hasImage ? { image_url: input.image } : {}),
+        ...(input.lastImage === undefined || input.lastImage === '' ? {} : { last_image_url: input.lastImage }),
+        ...(refImages === undefined ? {} : { reference_images: refImages }),
+        ...(refVideos === undefined ? {} : { reference_videos: refVideos }),
+        ...(refAudios === undefined ? {} : { reference_audios: refAudios }),
+        ...(Object.keys(extra).length === 0 ? {} : { extra_parameters: extra }),
+      },
+    )
+    data = res.data
+  } catch (error) {
+    // 视频提交阶段的 4xx（除 401/402/403/429 及账号级状态）均为建任务前的请求参数/素材拒绝
+    //（如 14407 时长越界、2013 素材不可达）：未建任务、未扣积分，必须归为 bad_request 不罚号不换号。
+    if (
+      error instanceof UpstreamError
+      && error.httpStatus >= 400
+      && error.httpStatus < 500
+      && error.httpStatus !== 401
+      && error.httpStatus !== 402
+      && error.httpStatus !== 403
+      && error.httpStatus !== 429
+      && error.kind !== 'auth_error'
+      && error.kind !== 'session_dead'
+      && error.kind !== 'credit_exhausted'
+      && error.kind !== 'rate_limited'
+      && error.kind !== 'waf_blocked'
+      && error.kind !== 'request_illegal'
+    ) {
+      throw new UpstreamError({
+        kind: 'bad_request',
+        httpStatus: 400,
+        code: error.code,
+        message: error.message,
+        detail: error.detail,
+      })
+    }
+    throw error
+  }
 
   // ⚠️ 提交响应里任务 id 在 `id`（不是 `task_id`）；两个都认，防止上游改字段
   const taskId = typeof data.id === 'string' ? data.id

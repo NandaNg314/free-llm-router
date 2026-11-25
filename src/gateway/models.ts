@@ -99,7 +99,10 @@ export async function pickCredential(
    * 报的是上游 401 —— 看起来像「凭据坏了」，实际是选错了账号。
    */
   providerId = DEFAULT_PROVIDER,
-): Promise<{ uid: string; credential: { accessToken: string; extras?: Record<string, string> } } | undefined> {
+): Promise<{
+  uid: string
+  credential: { accessToken: string; enterpriseId?: string; extras?: Record<string, string> }
+} | undefined> {
   const now = Date.now()
   const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
   const accounts = await pool.listAccounts(realm, now)
@@ -119,12 +122,58 @@ export async function pickCredential(
     })
 
   for (const { account } of candidates) {
-    const credential = (await pool.getCredential(account.uid)) as { accessToken?: string; extras?: Record<string, string> } | undefined
+    const credential = (await pool.getCredential(account.uid)) as {
+      accessToken?: string
+      enterpriseId?: string
+      enterprise_id?: string
+      extras?: Record<string, string>
+    } | undefined
     if (credential !== undefined && typeof credential.accessToken === 'string' && credential.accessToken !== '') {
-      return { uid: account.uid, credential: { accessToken: credential.accessToken, extras: credential.extras } }
+      const enterpriseId = (
+        credential.enterpriseId ??
+        credential.enterprise_id ??
+        credential.extras?.enterpriseId ??
+        credential.extras?.enterprise_id ??
+        ''
+      ).trim()
+      return {
+        uid: account.uid,
+        credential: {
+          accessToken: credential.accessToken,
+          ...(enterpriseId !== '' ? { enterpriseId } : {}),
+          extras: credential.extras,
+        },
+      }
     }
   }
   return undefined
+}
+
+/**
+ * 构造目录读取的账号身份头（同步自 `dsh-connect-workbuddy` `94efc8f`，issue #303）。
+ *
+ * - `/v3/config` 按账号作答：企业成员账号若不带企业头会被网关降级答成个人名册；
+ * - **成套发送纪律**：实测只发 `X-Enterprise-Id` 不发 `X-User-Id` 会返回空的 `cli` 名册（比不发更糟），
+ *   故只有 `uid` 与 `enterpriseId` 同时非空时才一并附带 `X-Enterprise-Id` 与 `X-Tenant-Id`；
+ * - 个人账号（无 `enterpriseId`）不发送任何企业头，也绝不编造 `X-No-Enterprise-Id`。
+ */
+export function catalogIdentityHeaders(input: {
+  uid?: string
+  enterpriseId?: string
+  extras?: Record<string, string>
+}): Record<string, string> {
+  const bareUid = (input.uid ?? '').replace(/^workbuddy:/, '').trim()
+  if (bareUid === '') return {}
+  const eid = (
+    input.enterpriseId ??
+    input.extras?.enterpriseId ??
+    input.extras?.enterprise_id ??
+    ''
+  ).trim()
+  return {
+    'X-User-Id': bareUid,
+    ...(eid !== '' ? { 'X-Enterprise-Id': eid, 'X-Tenant-Id': eid } : {}),
+  }
 }
 
 /**
@@ -134,22 +183,38 @@ export async function pickCredential(
  * 不在流式回答的热路径上（那条路径绝不能缓冲）。
  */
 export async function listModels(
-  ctx: { uid: string; accessToken: string },
+  ctx: {
+    uid: string
+    accessToken: string
+    enterpriseId?: string
+    extras?: Record<string, string>
+  },
   env: Env,
 ): Promise<OpenAiModel[]> {
   const bases = resolveUpstream(env)
   const machineId = await deriveDeviceId(ctx.uid, 'machine')
   const sessionId = await deriveDeviceId(ctx.uid, 'session')
+  const headers = cliChatHeaders({
+    uid: ctx.uid,
+    machineId,
+    sessionId,
+    accessToken: ctx.accessToken,
+    conversationRequestId: crypto.randomUUID().replaceAll('-', ''),
+  })
+  // 个人账号不发企业头与 X-No-Enterprise-Id；企业账号在有 X-User-Id 时成套附带 X-Enterprise-Id + X-Tenant-Id
+  delete headers['X-No-Enterprise-Id']
+  if (ctx.accessToken !== '') {
+    const identity = catalogIdentityHeaders(ctx)
+    if (identity['X-User-Id'] !== undefined) {
+      Object.assign(headers, identity)
+    } else {
+      delete headers['X-User-Id']
+    }
+  }
 
   const res = await fetch(`${bases.chat}/v3/config`, {
     method: 'GET',
-    headers: cliChatHeaders({
-      uid: ctx.uid,
-      machineId,
-      sessionId,
-      accessToken: ctx.accessToken,
-      conversationRequestId: crypto.randomUUID().replaceAll('-', ''),
-    }),
+    headers,
     signal: AbortSignal.timeout(20_000),
   })
 

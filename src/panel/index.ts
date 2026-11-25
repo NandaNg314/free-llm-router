@@ -52,6 +52,7 @@ export const CSP =
   // ⇒ 二维码显示为破碎图标、且不报「我们的」错误（只有浏览器控制台一条 CSP 违规）。
   // ❗ 仅放开**这一个** HTTPS 域名（微信官方、可信）；不要用通配 `https:`。
   "img-src 'self' data: https://open.weixin.qq.com; " +
+  "media-src 'self' blob:; " +
   "form-action 'self'; " +
   "frame-ancestors 'none'; " +
   "base-uri 'none'"

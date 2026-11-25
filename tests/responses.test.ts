@@ -658,3 +658,40 @@ test('⚠️ usage 为 null 时输出 null（不能编造 0 —— 那会被当�
   )
   assert.equal(obj.usage, null)
 })
+
+test('🔴 `parallel_tool_calls` 透传与回显守卫（a7e9891）：显式 false 不被吞，缺省/非布尔值不编造出站字段', async () => {
+  // 1. 请求侧：显式布尔原样透传，缺省或非布尔一律不写出站键
+  assert.equal(toChatBody({ input: 'hi', parallel_tool_calls: false }, 'm').parallel_tool_calls, false)
+  assert.equal(toChatBody({ input: 'hi', parallel_tool_calls: true }, 'm').parallel_tool_calls, true)
+  assert.equal('parallel_tool_calls' in toChatBody({ input: 'hi' }, 'm'), false)
+  for (const invalid of ['false', 'true', 0, 1, null] as unknown[]) {
+    const out = toChatBody({ input: 'hi', parallel_tool_calls: invalid }, 'm')
+    assert.equal('parallel_tool_calls' in out, false, `非布尔值 ${String(invalid)} 不得写入 Chat 请求体`)
+  }
+
+  // 2. 非流式响应侧：回显布尔值，未给或非布尔回落 OpenAI 默认 true
+  const agg = {
+    id: 'c_p',
+    object: 'chat.completion' as const,
+    created: 1,
+    model: 'm',
+    choices: [{ index: 0, message: { role: 'assistant' as const, content: 'ok' }, finish_reason: 'stop' }],
+  }
+  assert.equal(toResponsesObject({ input: 'hi', parallel_tool_calls: false }, 'm', agg, 'r1').parallel_tool_calls, false)
+  assert.equal(toResponsesObject({ input: 'hi', parallel_tool_calls: true }, 'm', agg, 'r2').parallel_tool_calls, true)
+  assert.equal(toResponsesObject({ input: 'hi' }, 'm', agg, 'r3').parallel_tool_calls, true)
+  assert.equal(toResponsesObject({ input: 'hi', parallel_tool_calls: 'false' }, 'm', agg, 'r4').parallel_tool_calls, true)
+
+  // 3. 流式响应侧：created / completed 快照同样保留显式 false
+  const sse = streamFromStrings([
+    'data: {"id":"s_p","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ])
+  const { events } = await collectResponsesSse(
+    toResponsesSse(sse, { input: 'hi', parallel_tool_calls: false }, 'm', 'resp_p'),
+  )
+  const created = events.find((e) => e.type === 'response.created')!.response as Record<string, unknown>
+  const completed = events.find((e) => e.type === 'response.completed')!.response as Record<string, unknown>
+  assert.equal(created.parallel_tool_calls, false)
+  assert.equal(completed.parallel_tool_calls, false)
+})

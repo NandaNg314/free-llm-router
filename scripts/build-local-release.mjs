@@ -1,30 +1,33 @@
 #!/usr/bin/env node
 /**
- * 打包「本地版」发布包。
+ * 打包「本地版」零依赖发布包（Windows / macOS / Linux 通用）。
  *
- * ## 产物里有什么
+ * ## 产物结构
  *
  * ```
  * free-llm-router-local/
- * ├── start-windows.bat       ← Windows 双击这个
- * ├── start-mac-linux.sh      ← macOS / Linux 用这个
- * ├── start-local.mjs         ← 真正的启动器
- * ├── update-local.mjs        ← 升级用（只换程序本体，不碰数据）
- * ├── dist/server.mjs         ← 单文件服务（含面板，2.6MB）
- * └── README.txt             ← 使用说明
+ * ├── start-windows.bat       ← Windows 双击启动
+ * ├── start-mac-linux.sh      ← macOS / Linux 启动（自带 0755 可执行位）
+ * ├── start-local.mjs         ← 跨平台启动内核（端口自愈 + 幂等防呆 + BOM 兼容）
+ * ├── update-windows.bat      ← Windows 拖拽 .zip 或双击一键无损升级
+ * ├── update-mac-linux.sh     ← macOS / Linux 一键无损升级（自带 0755 可执行位）
+ * ├── update-local.mjs        ← 升级器内核（支持 .zip 免解压直升 + 嵌套目录剥离 + 备份回滚）
+ * ├── VERSION                 ← 纯文本精确版本号
+ * ├── dist/server.mjs         ← 单文件完整网关与控制台前端
+ * └── README.txt              ← 详尽中文上手与升级指南
  * ```
  *
- * ## 刻意**不**放什么
+ * ## 安全与质量硬门禁
  *
- * - `node_modules/` —— 零依赖，不需要
- * - `.env` / `data/` —— **绝对不能带**：里面是发布者本人的密钥与账号凭据
- * - 源码 / 测试 / 工具脚本 —— 使用者不需要
- *
- * ⚠️ 打包前会**硬检查** `.env` 和 `data/` 没有被带进去。
- *    这不是多余：一旦带出去，别人的机器上就有你的账号凭据。
+ * 1. 严禁打包 `.env`、`data/`、`node_modules/` 或任何疑似真实密钥文本；
+ * 2. `.sh` 强制归一化为纯 LF（`\n`），`.bat` 强制归一化为纯 CRLF（`\r\n`）且无 UTF-8 BOM；
+ * 3. ZIP Central Directory 写入 Unix `version made by = (3 << 8) | 20` 与外部文件权限位
+ *    （`.sh` / `.mjs` 为 `0o100755`，其余文件为 `0o100644`），macOS / Linux 解压即用；
+ * 4. 打包末尾重新读取生成的 `.zip`，逐条用 `inflateRawSync` 解压复核 CRC32、权限位与零敏感残留。
  */
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { deflateRawSync, inflateRawSync } from 'node:zlib'
 
 const ROOT = process.cwd()
 const OUT = join(ROOT, 'release-local', 'free-llm-router-local')
@@ -37,206 +40,155 @@ if (!existsSync(join(ROOT, 'dist', 'server.mjs'))) {
   process.exit(1)
 }
 
-// ② 清空重建
+// ② 清空重建输出目录
 rmSync(join(ROOT, 'release-local'), { recursive: true, force: true })
 mkdirSync(OUT, { recursive: true })
 
-// ③ 复制必需文件
-const FILES = ['start-windows.bat', 'start-mac-linux.sh', 'start-local.mjs', 'update-local.mjs']
+// ③ 复制启动器与升级器全套脚本，并严格规整换行符与编码（无 BOM）
+const FILES = [
+  'start-windows.bat',
+  'start-mac-linux.sh',
+  'start-local.mjs',
+  'update-windows.bat',
+  'update-mac-linux.sh',
+  'update-local.mjs',
+]
+
 for (const f of FILES) {
-  if (!existsSync(join(ROOT, f))) {
+  const srcPath = join(ROOT, f)
+  if (!existsSync(srcPath)) {
     console.error(`❌ 缺 ${f}`)
     process.exit(1)
   }
-  cpSync(join(ROOT, f), join(OUT, f))
+  const text = readFileSync(srcPath, 'utf8').replace(/^\uFEFF/, '')
+  if (f.endsWith('.sh')) {
+    writeFileSync(join(OUT, f), text.replace(/\r\n/g, '\n'), 'utf8')
+  } else if (f.endsWith('.bat')) {
+    writeFileSync(join(OUT, f), text.replace(/\r?\n/g, '\r\n'), 'utf8')
+  } else {
+    writeFileSync(join(OUT, f), text.replace(/\r\n/g, '\n'), 'utf8')
+  }
 }
+
 mkdirSync(join(OUT, 'dist'), { recursive: true })
 cpSync(join(ROOT, 'dist', 'server.mjs'), join(OUT, 'dist', 'server.mjs'))
 
-// ④ 使用说明
-//
-// ⚠️ 文件名用 **ASCII**（`README.txt` 而不是「使用说明.txt」）：
-//    zip 里的中文文件名在不同平台/工具下解码不一致，实测 Git Bash 的 unzip
-//    会把「使用说明」解成乱码。文档内容仍是中文，只是文件名保持安全。
-const version = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version
-writeFileSync(join(OUT, 'README.txt'), `free-llm-router 本地版 v${version}
+// ④ 写入纯文本 VERSION 与详尽 README.txt
+const version = String(JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version).trim()
+writeFileSync(join(OUT, 'VERSION'), `${version}\n`, 'utf8')
+
+writeFileSync(
+  join(OUT, 'README.txt'),
+  `free-llm-router 本地版 v${version}
 ========================================
 
 这是什么
 --------
-把你自己的 WorkBuddy / CodeBuddy 等 16 家供应商账号，变成统一的
-OpenAI + Anthropic（Claude Code /v1/messages）兼容 API 网关，
-附带一个网页控制台。所有数据都留在**你自己的电脑上**，不上传任何地方。
+把你自己的 WorkBuddy / CodeBuddy / Qoder / Trae / Cline 等多家供应商账号，
+聚合为统一的本地 AI 网关，内置可视化网页控制台：
+  - 对话与推理：兼容 OpenAI (/v1/chat/completions, /v1/responses)
+                与 Anthropic Claude Code 原生协议 (/v1/messages)
+  - 语音能力  ：文字转语音 TTS (/v1/audio/speech) 与语音识别 ASR (/v1/audio/transcriptions)
+  - 视觉与 3D ：文生图/图生图、文生视频/图生视频（支持多模态参考素材）、混元 3D 模型生成
+  - 联网与工具：真实联网搜索 (/v1/tools/search)、网页正文抓取 (/v1/tools/fetch) 与 MCP (/mcp)
+
+所有密钥、账号凭据与调用日志均保存在你电脑本地（.env + data/router.db），不经过任何第三方服务器。
 
 
-怎么用（三步）
---------------
-第 1 步：安装 Node.js（只需要装一次）
+快速上手（三步）
+----------------
+第 1 步：安装 Node.js（只需装一次，版本要求 >= 22.13.0）
 
-  Node.js 是运行本程序的"引擎"，必须先装好。版本要 22 或更高。
+  本程序使用 Node.js 22.13+ 内置稳定版 SQLite 引擎，无需编译任何原生插件。
 
   ◆ Windows
-    1) 打开 https://nodejs.org/zh-cn
-    2) 点绿色的大按钮下载 **LTS**（长期支持版），下载的是 .msi 安装包
-    3) 双击安装，一路点「下一步」
-       ⚠️ 中途有个选项叫 "Add to PATH"（添加到环境变量），**必须保持勾选**
-          默认就是勾上的，不要取消
-    4) 装完**重启电脑**（或者至少关掉所有命令行窗口再重开）
-    5) 验证：按 Win+R，输入 cmd 回车，在黑色窗口里敲：
-           node -v
-       回车后如果看到类似 v22.x.x 或更高，就成功了
+    1) 打开 https://nodejs.org/zh-cn 下载绿色按钮的 LTS（长期支持版 .msi）
+    2) 双击安装，保持默认勾选 "Add to PATH"，一路点击「下一步」
+    3) 打开命令行输入 node -v，确认显示 v22.13.0 或更高版本（如 v22.14+ / v24.x）
 
   ◆ macOS
-    方法一（推荐，如果有 Homebrew）：
-         打开「终端」，执行：brew install node
-    方法二（图形安装）：
-         打开 https://nodejs.org/zh-cn → 下载 LTS 的 .pkg → 双击安装
-    验证：终端里敲 node -v，看到 v22.x.x 或更高即可
+    方法一（Homebrew）：brew install node
+    方法二（安装包）  ：访问 https://nodejs.org/zh-cn 下载 LTS 的 .pkg 双击安装
 
   ◆ Linux
-    用官方源或 nvm 安装 Node 22+，装完执行 node -v 确认。
-    例（Ubuntu/Debian，用 nvm）：
-         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
-         nvm install 22
-
-  ⚠️ 如果 node -v 提示"不是内部或外部命令"／"command not found"
-     ⇒ 说明没装成功，或者 PATH 没生效。
-     - Windows：重装一次，确认勾了 "Add to PATH"，然后重启电脑
-     - Mac/Linux：关掉终端重新打开（安装后需要重载环境变量）
+    使用 nvm 或官方源安装 Node.js 22.13+（例如：nvm install --lts）
 
 
 第 2 步：启动程序
 
   ◆ Windows
-      双击 start-windows.bat
-      （如果 Windows 弹出"已保护你的电脑"：点「更多信息」→「仍要运行」）
+      直接双击 start-windows.bat
+      （若弹出 SmartScreen 提示「已保护你的电脑」，点击「更多信息」→「仍要运行」）
 
   ◆ macOS / Linux
-      打开终端，cd 到这个文件夹，执行：
-          chmod +x start-mac-linux.sh     ← 只有第一次需要
+      发布包已预设可执行权限，在终端进入目录后直接执行：
           ./start-mac-linux.sh
-      （或者直接：node start-local.mjs）
+      （或执行：node start-local.mjs）
+
+  贴心特性：
+  - 服务真实就绪后会自动为你弹出浏览器控制台；
+  - 若不小心重复双击启动，程序会自动识别已在运行的实例并直接打开面板，不会报错；
+  - 若默认端口 11451 被其他软件占用，会自动顺延切换到空闲端口并在窗口顶部醒目提示。
 
 
-第 3 步：打开控制台
+第 3 步：登录控制台与接入客户端
 
-  程序启动后会自动弹出浏览器。如果没弹，手动复制屏幕上显示的地址：
-      http://127.0.0.1:11451/panel/
-  登录口令也在同一个窗口里，复制粘贴进登录框即可。
+  启动窗口会打印「面板地址」与自动生成的「登录口令」（保存在 .env 的 API_KEY 中）：
+  1. 在「供应商与账号」中添加你的账号（支持设备码/扫码登录或导入凭据）；
+  2. 在「API Key」页面可签发受限子密钥（支持按模型、IP、额度限流）；
+  3. 在「配置」页面可一键复制 Claude Code (/v1/messages)、OpenAI SDK、Cherry Studio、MCP 接入配置；
+  4. 在「媒体与检索」页面可直接在线体验：
+     - 语音合成（TTS 在线试听与 WAV/PCM 下载）与语音转文字（ASR 识别）
+     - 文生图 / 图生图、文生视频 / 图生视频
+     - 混元 3D（文生 3D / 图生 3D，支持 GLB/OBJ/FBX/STL/USDZ 导出与 PBR 材质）
+     - 官方通道实时联网搜索与网页抓取
 
-  ⚠️ 这个黑色窗口**不能关** —— 关掉程序就停了。
-     要停止时按 Ctrl+C，或直接关窗口。
+
+如何无损升级到新版本（绝对不丢账号数据）
+----------------------------------------
+⚠️ 请勿把新版压缩包直接解压覆盖旧文件夹！请使用内置的一键无损升级器：
+
+  ◆ 方法一：拖拽升级（Windows 最省心）
+      下载新版 free-llm-router-local-vX.Y.Z.zip（无需解压！），
+      直接用鼠标把 .zip 文件拖到旧目录里的 update-windows.bat 图标上松手即可！
+
+  ◆ 方法二：双击自动发现升级
+      把下载的新版 .zip 放到旧目录里（或旧目录的上一级文件夹），
+      直接双击 update-windows.bat（macOS/Linux 运行 ./update-mac-linux.sh）即可自动识别升级！
+
+  ◆ 方法三：命令行指定路径（支持传 .zip 文件或解压目录）
+      node update-local.mjs ../free-llm-router-local-vX.Y.Z.zip
+
+升级器安全承诺：
+  - 升级前自动检查新版程序语法完整性，损坏包绝不覆盖；
+  - 全程绝不触碰 .env 与 data/，升级前后自动做 SHA-256 完整性校验；
+  - 自动将旧版核心程序备份为 dist/server.mjs.bak-<时间戳>（保留最近 3 份），随时可改名回滚。
 
 
-第一次进来先做什么
+数据备份与常用参数
 ------------------
-1. 「供应商与账号」→ 添加账号（支持 16 家供应商：设备码登录 / 扫码 / 粘贴凭据或 API Key）
-2. 「模型」→ 看看有哪些模型可用
-3. 「API Key」→ 给客户端签发一把钥匙（同时支持 Bearer 与 x-api-key）
-4. 「配置」→ 里面有接入指南（Claude Code 原生 /v1/messages、OpenAI SDK、Cherry Studio、MCP 等）
+  data/router.db   —— 账号池、任务状态、子密钥与日志（SQLite 数据库）
+  .env             —— 面板主口令（API_KEY）、凭据加密密钥（CREDENTIAL_KEY）及可选 PORT 配置
 
+  ⚠️ 换电脑迁移时，请务必将 .env 和 data/ 文件夹**一起**复制（丢失 CREDENTIAL_KEY 将无法解密已存账号）。
 
-怎么用生图、视频与 3D 生成
---------------------------
-「媒体与检索」页可以直接点按钮生成图片、生成视频、生成混元 3D 模型、联网搜索、抓网页。
+  常用命令参数：
+    node start-local.mjs --port 8080      # 指定固定端口（也可在 .env 中写 PORT=8080）
+    node start-local.mjs --host 0.0.0.0   # 允许局域网其他设备访问
+    node start-local.mjs --no-open        # 启动后不自动弹出浏览器
+`,
+  'utf8',
+)
 
-注意：生图与视频**只有 WorkBuddy 国际版账号**支持（国内账号会提示
-unsupported_realm）；混元 3D 生成、联网检索与抓网页支持 WorkBuddy 国际版
-与国内版 OAuth 账号。
-
-
-【生图】
-  输入提示词即可。约 10–15 秒出图，每张约 0.03 积分。
-  想基于一张图改，切到「图生图」，选一张参考图再写「要改什么」。
-
-
-【视频】
-  输入提示词 → 选时长和比例 → 点「生成视频」。
-  约 1–2 分钟出片，4 秒片子约 29 积分。
-
-  想做「图生视频」：在右侧「首帧」里选一张图。
-  ⚠️ 选了图之后，画面会跟着这张图动，比例也跟随图片本身
-     （所以这时候比例选项不起作用，这是上游的行为）。
-
-  ⚠️ 内容审核：不要用涉政、真实领导人、敏感事件这类题材。
-     上游会直接拒绝（提示 "Failure to pass the risk control system"），
-     不过**不会扣积分**（失败的任务不计费）。
-     普通题材（动物、静物、风景、产品）都不受影响。
-
-
-【3D 生成】
-  支持「文生 3D」（输入描述）或「图生 3D」（选一张参考图），可选混元 3D 3.1 / 3.0
-  与 GLB / OBJ / FBX / STL / USDZ 五种导出格式（可开启 PBR 材质）。
-  提交后自动轮询进度，生成完成后可直接下载模型文件。
-
-
-【联网检索 / 抓网页】
-  输入关键词或网址即可。检索走的是上游官方通道，结果是真实的搜索结果，
-  不是模型编的。
-
-
-数据在哪
---------
-data/router.db   —— 账号、用量、日志（SQLite 单文件）
-.env             —— 登录口令与加密密钥（首次运行自动生成）
-
-⚠️ 备份 = 把 .env 和 data/ 一起复制走。
-   ⚠️ 只备份 data/ 而丢了 .env 里的 CREDENTIAL_KEY，
-      所有账号凭据都会解不开，只能重新登录。
-
-
-怎么更新（重要）
-----------------
-这个包**不会自动更新**，需要你手动做一次。流程：
-
-1. 去 https://github.com/NandaNg314/free-llm-router/releases 下载新版 zip
-2. 解压到**任意一个新目录**（比如 free-llm-router-local-new/）
-   ⚠️ 千万不要直接覆盖旧目录！那会把你的账号数据一起盖掉。
-3. 打开**旧目录**的终端，执行：
-      node update-local.mjs ../free-llm-router-local-new
-4. 重启程序（双击 start-windows.bat / 跑 start-mac-linux.sh）
-
-升级脚本**只替换程序本体**（dist/server.mjs 与几个启动脚本），
-**绝不碰** .env 和 data/ —— 账号、密钥、用量都还在。
-
-想回滚：脚本更新前会自动备份成 dist/server.mjs.bak-<时间戳>，
-把那个文件改名回 dist/server.mjs 即可。
-
-查当前版本：浏览器打开 http://127.0.0.1:11451/version
-
-
-常见问题
---------
-Q: 端口被占用？
-A: 用别的端口启动：node start-local.mjs --port 8080
-
-Q: 想给别人用（局域网）？
-A: node start-local.mjs --host 0.0.0.0
-   ⚠️ 这会监听所有网卡，同一局域网的人都能访问，请确认你信任他们。
-
-Q: 关掉窗口就停了？
-A: 是的，这是本地版。想要常驻可以用 Docker 或部署到服务器（见仓库 DEPLOY.md）。
-
-Q: 更新后账号没了？
-A: 正常情况不会 —— 升级脚本不碰 data/ 和 .env。
-   如果真的没了，检查是不是解压时「直接覆盖」了旧目录。
-   有备份的话，把 .env 和 data/ 拷回来即可恢复。
-`)
-
-// ⑤ 🔴 硬检查：绝对不能带出密钥或凭据
+// ⑤ 硬门禁：严禁携带任何密钥、数据库、源码或依赖目录
 const FORBIDDEN = ['.env', 'data', 'node_modules', 'src', 'tests', 'web']
 for (const f of FORBIDDEN) {
   if (existsSync(join(OUT, f))) {
-    console.error(`❌ 发布包里出现了不该有的 ${f}（可能含密钥/凭据），已中止`)
+    console.error(`❌ 发布包里出现了禁止携带的 ${f}（可能含密钥或凭据），已中止`)
     process.exit(1)
   }
 }
-// 再扫一遍文本内容里有没有明显的密钥形态
-//
-// ⚠️ 正则不能太宽：`dist/server.mjs` 里有 Tailwind 的 CSS 变量名
-// （`--tw-gradient-from-position` 被压成 `sk-image-linear-from-pos` 之类），
-// 会被 `sk-[A-Za-z0-9_-]{20,}` 误伤。
-// ⇒ 真密钥的特征是**同时含大写、小写、数字**，且长度 30+（我们生成的是 32 字符 base64url）。
+
 const looksLikeKey = (text) => {
   for (const m of text.matchAll(/sk-[A-Za-z0-9_-]{30,}/g)) {
     const s = m[0]
@@ -244,27 +196,28 @@ const looksLikeKey = (text) => {
   }
   return undefined
 }
-for (const f of ['start-local.mjs', 'update-local.mjs', 'README.txt', 'dist/server.mjs']) {
+
+const TEXT_CHECK_FILES = [
+  'start-local.mjs',
+  'start-windows.bat',
+  'start-mac-linux.sh',
+  'update-local.mjs',
+  'update-windows.bat',
+  'update-mac-linux.sh',
+  'VERSION',
+  'README.txt',
+  'dist/server.mjs',
+]
+
+for (const f of TEXT_CHECK_FILES) {
   const hit = looksLikeKey(readFileSync(join(OUT, f), 'utf8'))
   if (hit !== undefined) {
-    console.error(`❌ ${f} 里疑似有 API Key（${hit}），已中止`)
+    console.error(`❌ ${f} 内检测到疑似真实 API Key（${hit}），已中止`)
     process.exit(1)
   }
 }
 
-// ⑥ 压缩
-//
-// ⚠️ **不能用 PowerShell 的 `Compress-Archive`** —— 它写的是**反斜杠**路径分隔符，
-// 而 zip 规范要求 `/`，于是 Linux/macOS 的 `unzip` 直接报
-// `appears to use backslashes as path separators` 并**解压失败**。
-// （这是实测踩到的：一开始就用了 PowerShell，包发出去别人解不开。）
-//
-// ⚠️ 也不能依赖 `zip` 命令 —— Git Bash 里默认只有 `unzip` 没有 `zip`。
-//
-// ⇒ 用 Node 自己写 STORE（不压缩）格式的 zip：
-//   规范简单、零依赖、跨平台都对。代价是体积大一点（本项目 2.6MB，可接受）。
-import { deflateRawSync } from 'node:zlib'
-
+// ⑥ 写入跨平台标准 ZIP（带 Unix 0755 / 0644 外部权限位）
 const crcTable = (() => {
   const t = new Uint32Array(256)
   for (let n = 0; n < 256; n++) {
@@ -281,7 +234,12 @@ const crc32 = (buf) => {
   return (c ^ 0xffffffff) >>> 0
 }
 
-/** 用 DEFLATE 写一个标准 zip（路径统一 `/`）。 */
+const VERSION_MADE_BY_UNIX = (3 << 8) | 20 // Host OS = 3 (Unix), Spec = 2.0 (20)
+
+function unixModeForEntry(entryName) {
+  return entryName.endsWith('.sh') || entryName.endsWith('.mjs') ? 0o100755 : 0o100644
+}
+
 function writeZip(outFile, entries) {
   const locals = []
   const centrals = []
@@ -295,14 +253,15 @@ function writeZip(outFile, entries) {
     const body = useDeflate ? deflated : raw
     const method = useDeflate ? 8 : 0
     const crc = crc32(raw)
+    const unixMode = unixModeForEntry(name)
 
     const local = Buffer.alloc(30)
     local.writeUInt32LE(0x04034b50, 0)
-    local.writeUInt16LE(20, 4) // version needed
-    local.writeUInt16LE(0x0800, 6) // UTF-8 文件名
+    local.writeUInt16LE(20, 4) // version needed to extract
+    local.writeUInt16LE(0x0800, 6) // UTF-8 flag
     local.writeUInt16LE(method, 8)
-    local.writeUInt16LE(0, 10) // time
-    local.writeUInt16LE(0x21, 12) // date（1980-01-01，固定值保证可复现）
+    local.writeUInt16LE(0, 10) // mod time
+    local.writeUInt16LE(0x21, 12) // mod date (1980-01-01，确定性可复现构建)
     local.writeUInt32LE(crc, 14)
     local.writeUInt32LE(body.length, 18)
     local.writeUInt32LE(raw.length, 22)
@@ -312,9 +271,9 @@ function writeZip(outFile, entries) {
 
     const central = Buffer.alloc(46)
     central.writeUInt32LE(0x02014b50, 0)
-    central.writeUInt16LE(20, 4)
-    central.writeUInt16LE(20, 6)
-    central.writeUInt16LE(0x0800, 8)
+    central.writeUInt16LE(VERSION_MADE_BY_UNIX, 4) // Unix 属性创建者标识
+    central.writeUInt16LE(20, 6) // version needed
+    central.writeUInt16LE(0x0800, 8) // UTF-8 flag
     central.writeUInt16LE(method, 10)
     central.writeUInt16LE(0, 12)
     central.writeUInt16LE(0x21, 14)
@@ -322,6 +281,11 @@ function writeZip(outFile, entries) {
     central.writeUInt32LE(body.length, 20)
     central.writeUInt32LE(raw.length, 24)
     central.writeUInt16LE(nameBuf.length, 28)
+    central.writeUInt16LE(0, 30) // extra length
+    central.writeUInt16LE(0, 32) // comment length
+    central.writeUInt16LE(0, 34) // disk start
+    central.writeUInt16LE(0, 36) // internal attrs
+    central.writeUInt32LE((unixMode << 16) >>> 0, 38) // Unix external file attributes
     central.writeUInt32LE(offset, 42)
     centrals.push(central, nameBuf)
 
@@ -339,7 +303,6 @@ function writeZip(outFile, entries) {
   writeFileSync(outFile, Buffer.concat([...locals, centralBuf, end]))
 }
 
-/** 递归列出目录下所有文件（相对路径用 `/`）。 */
 function listFiles(dir, base = '') {
   const out = []
   for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -351,18 +314,95 @@ function listFiles(dir, base = '') {
   return out
 }
 
-console.log('🗜  压缩中...')
-const name = `free-llm-router-local-v${version}.zip`
-const zipPath = join(ROOT, 'release-local', name)
+/**
+ * ⑦ 构建后自检门禁：重读磁盘上的 `.zip`，逐条解压核对 CRC32、字节一致性、Unix 权限位、LF 换行符与敏感文件零残留。
+ */
+function verifyBuiltZip(zipPath, expectedEntries) {
+  const zipBuf = readFileSync(zipPath)
+  const eocdPos = zipBuf.length - 22
+  if (eocdPos < 0 || zipBuf.readUInt32LE(eocdPos) !== 0x06054b50) {
+    throw new Error('ZIP 自检失败：EOCD 签名缺失')
+  }
+  const total = zipBuf.readUInt16LE(eocdPos + 10)
+  const centralSize = zipBuf.readUInt32LE(eocdPos + 12)
+  const centralOffset = zipBuf.readUInt32LE(eocdPos + 16)
+  if (total !== expectedEntries.length) {
+    throw new Error(`ZIP 自检失败：条目数不符（期望 ${expectedEntries.length}，实际 ${total}）`)
+  }
+
+  const expectedMap = new Map(expectedEntries.map((e) => [e.name, e.data]))
+  let pos = centralOffset
+  for (let i = 0; i < total; i++) {
+    if (zipBuf.readUInt32LE(pos) !== 0x02014b50) {
+      throw new Error(`ZIP 自检失败：第 ${i + 1} 条 Central Header 签名错误`)
+    }
+    const versionMadeBy = zipBuf.readUInt16LE(pos + 4)
+    const method = zipBuf.readUInt16LE(pos + 10)
+    const expectedCrc = zipBuf.readUInt32LE(pos + 16)
+    const compSize = zipBuf.readUInt32LE(pos + 20)
+    const uncompSize = zipBuf.readUInt32LE(pos + 24)
+    const nameLen = zipBuf.readUInt16LE(pos + 28)
+    const extraLen = zipBuf.readUInt16LE(pos + 30)
+    const commentLen = zipBuf.readUInt16LE(pos + 32)
+    const extAttr = zipBuf.readUInt32LE(pos + 38)
+    const localOffset = zipBuf.readUInt32LE(pos + 42)
+    const entryName = zipBuf.subarray(pos + 46, pos + 46 + nameLen).toString('utf8')
+    pos += 46 + nameLen + extraLen + commentLen
+
+    if (entryName.includes('\\') || entryName.includes('..') || !entryName.startsWith('free-llm-router-local/')) {
+      throw new Error(`ZIP 自检失败：非法条目路径 ${entryName}`)
+    }
+    if (/(^|\/)(\.env|data|node_modules|router\.db)(\/|$)/i.test(entryName)) {
+      throw new Error(`ZIP 自检失败：发现敏感残留条目 ${entryName}`)
+    }
+    if (versionMadeBy !== VERSION_MADE_BY_UNIX) {
+      throw new Error(`ZIP 自检失败：${entryName} 的 versionMadeBy 非 Unix 标识 (0x${versionMadeBy.toString(16)})`)
+    }
+    const expectedMode = unixModeForEntry(entryName)
+    const actualMode = extAttr >>> 16
+    if (actualMode !== expectedMode) {
+      throw new Error(
+        `ZIP 自检失败：${entryName} 权限位错误（期望 0o${expectedMode.toString(8)}，实际 0o${actualMode.toString(8)}）`,
+      )
+    }
+
+    if (zipBuf.readUInt32LE(localOffset) !== 0x04034b50) {
+      throw new Error(`ZIP 自检失败：${entryName} Local Header 签名错误`)
+    }
+    const lNameLen = zipBuf.readUInt16LE(localOffset + 26)
+    const lExtraLen = zipBuf.readUInt16LE(localOffset + 28)
+    const dataStart = localOffset + 30 + lNameLen + lExtraLen
+    const slice = zipBuf.subarray(dataStart, dataStart + compSize)
+    const raw = method === 0 ? Buffer.from(slice) : method === 8 ? inflateRawSync(slice) : null
+    if (!raw) {
+      throw new Error(`ZIP 自检失败：${entryName} 未知压缩方式 ${method}`)
+    }
+    if (raw.length !== uncompSize) {
+      throw new Error(`ZIP 自检失败：${entryName} 解压大小不一致`)
+    }
+    if (crc32(raw) !== expectedCrc) {
+      throw new Error(`ZIP 自检失败：${entryName} CRC32 校验不匹配`)
+    }
+    const sourceBuf = expectedMap.get(entryName)
+    if (!sourceBuf || Buffer.compare(raw, sourceBuf) !== 0) {
+      throw new Error(`ZIP 自检失败：${entryName} 解压内容与源文件逐字节比对不一致`)
+    }
+    if (entryName.endsWith('.sh') && raw.includes(0x0d)) {
+      throw new Error(`ZIP 自检失败：${entryName} 含有 CR (\\r) 字符，必须在 Linux/macOS 下保持纯 LF`)
+    }
+  }
+}
+
+console.log('🗜  压缩并写入 Unix 可执行权限位...')
+const zipName = `free-llm-router-local-v${version}.zip`
+const zipPath = join(ROOT, 'release-local', zipName)
 const entries = listFiles(OUT).map((f) => ({
-  // ⚠️ 顶层目录名也要带上，解压出来才是一个文件夹而不是一堆散文件
   name: `free-llm-router-local/${f.name}`,
   data: f.data,
 }))
-// 保留可执行位（macOS/Linux 的 .sh 需要）—— zip 的 external attrs 在 Node 里
-// 不便设置，改为在说明里提示 `chmod +x`（启动器已经会提示）。
-writeZip(zipPath, entries)
-console.log(`\n✅ 完成 → release-local/${name}`)
-console.log(`   共 ${entries.length} 个文件`)
 
-console.log('\n发出去之前请再过一遍：这个目录**不含**任何账号或密钥。')
+writeZip(zipPath, entries)
+verifyBuiltZip(zipPath, entries)
+
+console.log(`✅ 构建后自检通过（${entries.length} 个文件 CRC32 / Unix 权限位 / 敏感数据零残留全部核验无误）`)
+console.log(`✅ 完成 → release-local/${zipName}`)

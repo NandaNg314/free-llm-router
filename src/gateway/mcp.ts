@@ -122,6 +122,22 @@ const TOOLS = [
         prompt: { type: 'string', description: '视频画面、镜头运动与光影描述' },
         image: { type: 'string', description: '可选首帧图：http(s) 公网 URL 或 data:image/...;base64,...' },
         last_image: { type: 'string', description: '可选尾帧图：http(s) 公网 URL 或 data:image/...;base64,...' },
+        reference_images: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            '可选参考图 URL 数组（风格/主体参考）。上游自行拉取素材，需使用其可达的公网 CDN/OSS 地址（githubusercontent 等拦截机房的域名会回 2013 media url unreachable）',
+        },
+        reference_videos: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '可选参考视频 URL 数组（动作/运镜参考，同样需为上游可达的公网地址）',
+        },
+        reference_audios: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '可选参考音频 URL 数组（配乐/音色参考，同样需为上游可达的公网地址）',
+        },
         model: { type: 'string', description: `视频模型名，默认 ${INTl_VIDEO_MODEL}` },
         seconds: { type: 'integer', minimum: 1, maximum: 15, description: '时长（秒），默认 5，实测支持 4–15 秒' },
         aspect_ratio: {
@@ -365,6 +381,9 @@ async function callTool(
           ...(typeof args.enable_audio === 'boolean' ? { enableAudio: args.enable_audio } : {}),
           ...(firstImage === undefined ? {} : { image: firstImage }),
           ...(lastImage === undefined ? {} : { lastImage }),
+          ...(args.reference_images === undefined ? {} : { referenceImages: args.reference_images }),
+          ...(args.reference_videos === undefined ? {} : { referenceVideos: args.reference_videos }),
+          ...(args.reference_audios === undefined ? {} : { referenceAudios: args.reference_audios }),
           ...(typeof args.wait === 'boolean' ? { wait: args.wait } : {}),
           ...(typeof args.timeout_seconds === 'number' ? { timeoutSeconds: args.timeout_seconds } : {}),
         },

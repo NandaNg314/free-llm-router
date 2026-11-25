@@ -127,7 +127,13 @@ const CODE_KIND: Record<number, ErrorKind> = {
   6021: 'rate_limited',
   // 10105：网页端单账号活跃会话已达上限（`1e1ee4d`），按结构化业务码识别
   10105: 'rate_limited',
-  11102: 'model_unavailable',
+  // 11102 / 14401「该模型 id 在上游不存在」（`d629a8c`，issue #280）：
+  // 换遍全池都是同一句拒绝，必须归请求级 `bad_request`（不换号、不罚号、不写模型冷却负缓存），
+  // 与 11158「免费号无权调专属模型 → 换号」严格拆开（429+11102 仍由 classify 按限流兜底）。
+  11102: 'bad_request',
+  14401: 'bad_request',
+  // 11103「Backend [x] is not supported」（`b35a8d0`）：模型上游后端未启用，换遍全池一致，归请求级
+  11103: 'bad_request',
   14003: 'rate_limited',
   14018: 'credit_exhausted',
   /**
@@ -480,19 +486,70 @@ export function isWafBlocked(httpStatus: number, bodyText: string): boolean {
 const RETRY_AFTER_SANITY_SEC = 600
 
 /**
+ * 识别网关层边缘（openresty / APISIX）返回的 HTML `401/403` 拦截页（同步自 `dsh-connect-workbuddy` `0ec35a0`）。
+ *
+ * ## 为什么不能把网关边缘 HTML 401/403 当作「token 永久吊销」
+ *
+ * 实测同一把 token 在 `/v2/plugin/account` 与 billing 接口均返回 200，但某条聊天/探活路由在边缘网关层
+ * 返回了 APISIX / openresty 的 HTML `401 Authorization Required` 或 `403` 页 —— 这只能说明**该路由在边缘被拒**，
+ * 绝不能等同于凭据吊销而把账号永久打入死刑。唯一确凿的会话吊销信号是带结构化业务码 `12153`
+ *（`Offline user session not found`）的 JSON 信封，或续期跳本身的 401/403。
+ */
+export function isGatewayAuthRejection(httpStatus: number, bodyText: string): boolean {
+  if (httpStatus !== 401 && httpStatus !== 403) return false
+  if (parseEnvelope(bodyText) !== undefined) return false
+  const lower = bodyText.toLowerCase()
+  if (lower.includes('offline user session not found') || /\b12153\b/.test(lower)) return false
+  return (
+    lower.includes('openresty') ||
+    lower.includes('apisix') ||
+    lower.includes('authorization required')
+  )
+}
+
+/**
  * 是否包含确定性的请求参数/工具定义损坏标记（`615dc75`）。
  *
  * 部分网关层或 `extError` 形态不带顶层数字 `code: 11129`（例如
  * `{"extError":{"code":"invalid_function_parameters"}}` 或纯文本 `invalid function call parameters`）。
  * 若漏判落入 `unknown` / `server`，会白白触发换号甚至喂账号熔断。
  */
-function isBadParamsMarker(bodyText: string): boolean {
+function isBadParamsMarker(bodyText: string, httpStatus?: number): boolean {
   const lower = bodyText.toLowerCase()
-  return (
+  if (
     lower.includes('invalid_function_parameters') ||
     lower.includes('invalid function call parameters') ||
     lower.includes('unmarshal chat params failed')
-  )
+  ) {
+    return true
+  }
+  // 无数字 code 的 400/404 `{"msg":"service info not found"}`（`d629a8c`）：同样是模型 ID 不存在
+  if (
+    (httpStatus === 400 || httpStatus === 404) &&
+    lower.includes('service info not found') &&
+    !lower.includes('not allowed for user type')
+  ) {
+    return true
+  }
+  return false
+}
+
+/**
+ * 细化 `code === 11353`（TEI 嵌入后端错误，`787401d` issue #290）：
+ * - 带 `[413]`（TEI 输入过大，上游常套在 HTTP 500 外壳里）⇒ 纯请求内容超限，归 `bad_request`
+ *  （不换号、不喂熔断，防止单条超大输入连续熔断整池健康账号）；
+ * - 不带 `[413]` 的 `11353` 属于 TEI 自身服务端故障，交还默认状态码分支（5xx → `server`）。
+ */
+function classifyCode11353(bodyText: string): ErrorKind | undefined {
+  return bodyText.toLowerCase().includes('[413]') ? 'bad_request' : undefined
+}
+
+function resolveKnownEnvelopeKind(httpStatus: number, code: number, bodyText: string): ErrorKind | undefined {
+  if (code === 11140) return classifyCode11140(bodyText)
+  if (code === 11353) return classifyCode11353(bodyText)
+  // 429 + 11102 仍按限流语义处理（`d629a8c`）
+  if (code === 11102 && httpStatus === 429) return 'rate_limited'
+  return CODE_KIND[code]
 }
 
 /**
@@ -684,15 +741,11 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
   // 时才越过 5xx，否则真网关故障（HTML/无信封/未知码）仍必须落 `server`。
   if (httpStatus >= 500) {
     const known =
-      envelope !== undefined
-        ? envelope.code === 11140
-          ? classifyCode11140(bodyText)
-          : CODE_KIND[envelope.code]
-        : undefined
+      envelope !== undefined ? resolveKnownEnvelopeKind(httpStatus, envelope.code, bodyText) : undefined
     if (known !== undefined && envelope !== undefined) {
       return { kind: known, code: envelope.code, msg: normalizeClassifiedMsg(envelope.code, envelope.msg) }
     }
-    if (envelope === undefined && isBadParamsMarker(bodyText)) {
+    if (envelope === undefined && isBadParamsMarker(bodyText, httpStatus)) {
       return { kind: 'bad_request', msg: bodyText.trim().slice(0, 200) }
     }
     return { kind: 'server', code: envelope?.code, msg: envelope?.msg ?? `upstream ${httpStatus}` }
@@ -700,7 +753,7 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
 
   // ── 3. 业务码（有信封时优先按码判） ──
   if (envelope !== undefined) {
-    const mapped = envelope.code === 11140 ? classifyCode11140(bodyText) : CODE_KIND[envelope.code]
+    const mapped = resolveKnownEnvelopeKind(httpStatus, envelope.code, bodyText)
     if (mapped !== undefined) {
       return { kind: mapped, code: envelope.code, msg: normalizeClassifiedMsg(envelope.code, envelope.msg) }
     }
@@ -719,7 +772,7 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
     if (httpStatus === 429) {
       return { kind: 'rate_limited', code: envelope.code, msg: envelope.msg }
     }
-    if (httpStatus >= 400 && isBadParamsMarker(bodyText)) {
+    if (httpStatus >= 400 && isBadParamsMarker(bodyText, httpStatus)) {
       return { kind: 'bad_request', code: envelope.code, msg: envelope.msg }
     }
     return { kind: 'unknown', code: envelope.code, msg: envelope.msg }
@@ -727,9 +780,15 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
 
   // ── 4. 无信封：按状态码与确定性参数错误特征 ──
   if (httpStatus === 401 || httpStatus === 403) {
+    if (isGatewayAuthRejection(httpStatus, bodyText)) {
+      return { kind: 'auth_error', msg: `gateway edge ${httpStatus} (recoverable)` }
+    }
     return { kind: 'auth_error', msg: `upstream ${httpStatus}` }
   }
   if (httpStatus === 404) {
+    if (isBadParamsMarker(bodyText, httpStatus)) {
+      return { kind: 'bad_request', msg: bodyText.trim().slice(0, 200) || 'upstream 404' }
+    }
     return { kind: 'not_found', msg: 'upstream 404' }
   }
   if (httpStatus === 429) {
@@ -739,7 +798,7 @@ export function classify(httpStatus: number, bodyText: string): { kind: ErrorKin
     return { kind: 'credit_exhausted', msg: 'upstream 402' }
   }
   if (httpStatus >= 400) {
-    if (isBadParamsMarker(bodyText)) {
+    if (isBadParamsMarker(bodyText, httpStatus)) {
       return { kind: 'bad_request', msg: bodyText.trim().slice(0, 200) || `upstream ${httpStatus}` }
     }
     return { kind: 'unknown', msg: `upstream ${httpStatus}` }

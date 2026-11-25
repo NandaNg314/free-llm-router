@@ -4,7 +4,7 @@
 
 **把多家大模型供应商的账号池，汇成统一的 OpenAI + Anthropic 兼容 API。**
 
-自动选号 · 冷却与容灾 · 签到与每日任务自动跑 · 生图 / 视频 / 混元 3D / 联网检索 · 自带管理面板
+自动选号 · 冷却与容灾 · 签到与每日任务自动跑 · 生图 / 视频 / 混元 3D / 语音 TTS·ASR / 联网检索 · 自带管理面板
 
 ![OpenAI & Anthropic 兼容](https://img.shields.io/badge/API-OpenAI%20%2B%20Anthropic-412991)
 ![16 家供应商](https://img.shields.io/badge/%E4%BE%9B%E5%BA%94%E5%95%86-16%20%E5%AE%B6-orange)
@@ -61,11 +61,11 @@
 ### 媒体能力与混元 3D
 
 - **生图** `/v1/images/generations`、**改图** `/v1/images/edits`（国际版账号，支持传入本地图片 data URL）
-- **视频** `/v1/videos/generations`、`/v1/videos/tasks`（国际版账号，异步提交 + 归属账号轮询，支持首尾帧图生视频）
+- **视频** `/v1/videos/generations`、`/v1/videos/tasks`（国际版账号，异步提交 + 归属账号轮询，支持首尾帧图生视频与 `reference_images` / `reference_videos` / `reference_audios` 参考素材）
 - **混元 3D** `/v1/3d/generations`、`/v1/3d/tasks`、`GET /v1/3d/:jobId`（国际版与国内版 OAuth 账号均支持，自动签发临时云凭证 + TC3 签名，输出 `GLB` / `OBJ` / `FBX` / `STL` / `USDZ`）
-- **联网检索** `/v1/search`、**网页抓取** `/v1/fetch`（双分片智能选号与容灾）；同时提供 `/v1/tools/search|fetch|search_fetch` 与伪模型 `wb-search` / `wb-fetch` / `wb-search-fetch`（直接经 Chat 协议返回结果，不消耗模型额度）
+- **联网检索** `/v1/search`、**网页抓取** `/v1/fetch`（双分片智能选号、边缘错误止损与直连回退）；同时提供 `/v1/tools/search|fetch|search_fetch` 与伪模型 `wb-search` / `wb-fetch` / `wb-search-fetch`（直接经 Chat 协议返回结果，不消耗模型额度）
 - **网页工具注入**：Anthropic `web_search_*` / `web_fetch_*` 与 Responses 托管 `web_search` 由网关真实执行预检索并注入上下文，不再静默丢弃
-- **语音** `/v1/audio/speech`（TTS，WAV / PCM）与 `/v1/audio/transcriptions`（ASR，multipart，3 MiB 上限）
+- **语音** `/v1/audio/speech`（TTS，WAV / PCM，带流完整性校验与自动换号重试）与 `/v1/audio/transcriptions`（ASR，multipart，`json` / `text` 输出，3 MiB 上限）
 - **MCP** `/mcp` —— OpenCode / Claude Code / Cursor / Cline 自动发现 7 项工具（检索、抓取、生图、视频提交/查询、3D 提交/查询）
 
 ### 管理与安全
@@ -220,7 +220,7 @@ curl -X POST http://127.0.0.1:11451/v1/videos/tasks \
   -d '{"task_id":"1372715883-WandVideo-…"}'
 ```
 
-模型 `kling-video-v3`，实测 **约 73 秒**、**约 29 积分**/4 秒片。
+模型 `kling-video-v3`，实测 **约 73 秒**、**约 29 积分**/4 秒片；同时支持传入 `reference_images` / `reference_videos` / `reference_audios`（字符串 URL 数组或对象数组均可，网关自动归一化为上游格式）。
 
 > ⚠️ **不要用涉政、真实领导人、敏感事件等题材** —— 上游风控会直接拒绝，
 > 返回 `failed` 与原因（`Failure to pass the risk control system`）。
@@ -241,6 +241,21 @@ curl -X POST http://127.0.0.1:11451/v1/3d/tasks \
   -d '{"job_id":"job_..."}'
 ```
 
+### 语音合成与语音识别（TTS / ASR）
+
+```bash
+# 1. 文字转语音（输出 24kHz 单声道 WAV 或 PCM）
+curl -X POST http://127.0.0.1:11451/v1/audio/speech \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"input":"你好，欢迎使用语音合成服务","response_format":"wav"}' \
+  --output speech.wav
+
+# 2. 语音转文字（支持 file 或 audio 字段，上限 3 MiB，response_format 可选 json 或 text）
+curl -X POST http://127.0.0.1:11451/v1/audio/transcriptions \
+  -H "Authorization: Bearer $KEY" \
+  -F "file=@speech.wav" -F "response_format=json"
+```
+
 ### 联网检索 / 抓网页
 
 ```bash
@@ -249,6 +264,10 @@ curl -X POST http://127.0.0.1:11451/v1/search -H "Authorization: Bearer $KEY" \
 
 curl -X POST http://127.0.0.1:11451/v1/fetch -H "Authorization: Bearer $KEY" \
   -H 'Content-Type: application/json' -d '{"url":"https://example.com"}'
+
+# 也支持 DeepSeek / tools 风格别名及检索+抓取组合端点：
+curl -X POST http://127.0.0.1:11451/v1/tools/search_fetch -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{"query":"TypeScript 5.6 新特性","max_results":5,"fetch_top_n":2}'
 ```
 
 ## 支持的供应商
@@ -277,10 +296,10 @@ curl -X POST http://127.0.0.1:11451/v1/fetch -H "Authorization: Bearer $KEY" \
 
 | 视图 | 内容 |
 |---|---|
-| 供应商与账号 | 账号池健康度、每家供应商的账号与能力、单号运维 |
+| 供应商与账号 | 账号池健康度、每家供应商的账号与能力、单号运维与账号清单导出 |
 | 用量 | 请求量、token、成功率，按模型和账号拆分 |
 | 任务中心 | 签到、成长任务、限时补偿；**自动调度开关** |
-| 媒体与检索 | 生图 / 改图 / 视频 / 混元 3D 生成 / 联网检索 / 抓网页 |
+| 媒体与检索 | 生图 / 改图 / 视频 / 语音（TTS·ASR） / 混元 3D 生成 / 联网检索 / 抓网页 |
 | API Key | 子密钥签发与管理 |
 | 模型 | 模型目录、启停、单模型资费探测 |
 | 配置 | 接入指南、路由策略、流式自动续写、数据面 CORS、永久积分锁 |
@@ -307,8 +326,8 @@ curl -X POST http://127.0.0.1:11451/v1/fetch -H "Authorization: Bearer $KEY" \
 | POST | `/v1/tools/search` | 联网检索（tools 命名） |
 | POST | `/v1/tools/fetch` | 抓网页正文（tools 命名） |
 | POST | `/v1/tools/search_fetch` | 检索并抓取前 N 条结果 |
-| POST | `/v1/audio/speech` | 语音合成（OpenAI 兼容，WAV / PCM） |
-| POST | `/v1/audio/transcriptions` | 语音转写（OpenAI 兼容，multipart） |
+| POST | `/v1/audio/speech` | 语音合成（OpenAI 兼容，输出 WAV / PCM） |
+| POST | `/v1/audio/transcriptions` | 语音转写（OpenAI 兼容，multipart，支持 `json` / `text`） |
 | POST | `/mcp` | MCP（Streamable HTTP，7 项工具） |
 | GET | `/admin/campaign` | 查询国内个人版账号运营活动进度 |
 | POST | `/admin/campaign/claim` | 批量预演或领取运营活动奖励（默认 `dryRun: true`） |

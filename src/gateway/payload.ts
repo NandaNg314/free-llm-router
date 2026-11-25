@@ -963,14 +963,41 @@ const SCHEMA_NUMBER_KEYWORDS = [
 const SCHEMA_BOOLEAN_KEYWORDS = ['uniqueItems', 'readOnly', 'writeOnly', 'deprecated'] as const
 
 /**
- * UTF-16 代理区码元转义 `\uD800`–`\uDFFF`（十六进制大小写不敏感）。
+ * UTF-16 代理区码元转义 `\uD800`–`\uDFFF`（含单反斜杠、字面双反斜杠 `\\uD800`、花括号 `\u{D800}`
+ * 及单层 JSON 解析落入内存的孤立代理码元，十六进制大小写不敏感）。
  *
- * 依据 `dingminhua/dsh-connect-workbuddy` 提交 `e5d53ef`（issue #274，REA MCP 260 工具实测）：
- * 上游 schema 解析器拒绝 `pattern` 中出现的 `\uD800`–`\uDFFF` 转义写法（报 400 `code=11129`），
- * 而边界外的 `\uD7FF` / `\uE000`、真实 emoji 字符，以及 `description` / `title` / `const` /
- * `enum` / `default` / `format` 中的同款字面量均返回 200。故仅剥离命中的 `pattern` 注解约束。
+ * 依据：
+ * - `dingminhua/dsh-connect-workbuddy` 提交 `e5d53ef`（issue #274，REA MCP 260 工具实测）：
+ *   上游 RE2 schema 解析器拒绝 `pattern` 中出现的 `\uD800`–`\uDFFF`（报 400 `code=11129` 整包工具被拒），
+ *   而边界外的 `\uD7FF` / `\uE000`、合法代理对（真实 emoji 字符）以及非 `pattern` 字段中的同款字面量均返回 200；
+ * - `misakano7545/workbuddy2api-panel` 提交 `abed839`（issue #276）：
+ *   覆盖字面双反斜杠 `\\uD800`–`\\uDFFF`、`\u{D800}`–`\u{DFFF}` 与内存态孤立代理码元（`JSON.stringify`
+ *   在出站时会把孤立 UTF-16 代理重新序列化成 `\ud800`–`\udfff`）。
  */
-const SURROGATE_ESCAPE_RE = /\\u[dD][89a-fA-F][0-9a-fA-F]{2}/
+const SURROGATE_ESCAPE_RE =
+  /\\+u\{0*[dD][89a-fA-F][0-9a-fA-F]{2}\}|\\+u[dD][89a-fA-F][0-9a-fA-F]{2}/
+
+function hasLoneSurrogateCodeUnit(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = i + 1 < text.length ? text.charCodeAt(i + 1) : 0
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        i += 1 // 合法代理对（如真实 emoji），整体跳过不误删
+        continue
+      }
+      return true
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      return true
+    }
+  }
+  return false
+}
+
+function hasIllegalSurrogatePattern(pattern: string): boolean {
+  return SURROGATE_ESCAPE_RE.test(pattern) || hasLoneSurrogateCodeUnit(pattern)
+}
 
 /** 当 `enum` 存在但缺 `type` 时，仅在所有元素同属单一标量类型时无损推断 `type`（`615dc75`）。 */
 function inferEnumType(values: unknown[]): string {
@@ -1081,9 +1108,9 @@ function normalizeSchema(s: Msg, mark: () => void, depth = 0): void {
     }
   }
 
-  // 5. pattern 规整：剥离 \uD800–\uDFFF 代理区转义（e5d53ef），修复 \_（615dc75）
+  // 5. pattern 规整：剥离 \uD800–\uDFFF / \\uD800–\\uDFFF / 孤立代理区转义（e5d53ef / abed839），修复 \_（615dc75）
   if (typeof s.pattern === 'string') {
-    if (SURROGATE_ESCAPE_RE.test(s.pattern)) {
+    if (hasIllegalSurrogatePattern(s.pattern)) {
       delete s.pattern
       mark()
     } else if (s.pattern.includes('\\_')) {
@@ -1206,7 +1233,7 @@ function normalizeSchema(s: Msg, mark: () => void, depth = 0): void {
       const rebuilt: Msg = {}
       for (const [pk, pv] of Object.entries(container)) {
         let nextKey = pk
-        if (SURROGATE_ESCAPE_RE.test(nextKey)) {
+        if (hasIllegalSurrogatePattern(nextKey)) {
           keyFixed = true
           continue
         }
@@ -1441,8 +1468,6 @@ const FINGERPRINT_LITERALS = [
 ]
 const FINGERPRINT_CI = /x-anthropic-billing-header|Sisyphus-Junior - Focused executor from OhMyOpenCode/i
 const FINGERPRINT_REWRITES: ReadonlyArray<readonly [string, string]> = [
-  ["You are Claude Code, Anthropic's official CLI for Claude", "You are Claude Code, Anthropic's official CLI tool for Claude"],
-  ["You are Claude Code, Anthropic's official CLI for Claude.", "You are Claude Code, Anthropic's official CLI tool for Claude."],
   ['Main branch (you will usually use this for PRs)', 'Default branch (you will usually use this for PRs)'],
   [
     'You are a coding agent running in the Codex CLI, a terminal-based coding assistant.',
@@ -1468,6 +1493,57 @@ const BARE_BILLING_HDR_RE = /x-anthropic-billing-header/gi
 const CC_KV_RE = /\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*/gi
 const GROK_XAI_RE = /You are(?:[^\n]{0,256}?)released by xAI/gi
 
+/**
+ * 第三方 CLI「`<Vendor>'s official CLI for <Product>`」渠道自述句改写（同步自 `dsh-connect-workbuddy` `7513e88`，issue #293）。
+ *
+ * Claude Code 的 system 提示词自带 `"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."`，
+ * 上游在正文任意位置做精确子串匹配回 `400 / 11128`（仅把原本的 `CLI` 改成 `CLI tool` 或在前方加中性头均不够稳妥，且换产品/厂商仍会命中）。
+ * 锚定行首或前一句句末标点后的 `You are <Product>, <Vendor>'s official CLI for <Target>...` 整句替换为中性句（保留句末句点与缩进），
+ * 普通散文提及 CLI 时逐字节放过，二次调用严格幂等。
+ */
+const OFFICIAL_CLI_PROBE = /(?:'s|\u2019s)\s+official\s+cli\s+for\b/i
+const OFFICIAL_CLI_RE =
+  /(^[ \t]*|(?<=[.!?][ \t]+))You are\s+[\w-]+(?:\s+[\w.-]+){0,3}\s*,\s*[A-Za-z0-9][\w-]*(?:\s+[A-Za-z0-9][\w-]*)?(?:'s|\u2019s)\s+official\s+CLI\s+for\s+[\w.-]+\b(?:[^.\n]|\.(?=\d))*/gim
+export const OFFICIAL_CLI_REPLACEMENT = 'You are an autonomous coding agent'
+
+/**
+ * 剥离 `assistant` 历史消息开头被注入或模型模仿叠加的重复中性头残留（同步自 `dsh-connect-workbuddy` `a8280b1`，issue #297）。
+ *
+ * 边界严格收窄：
+ * - 仅对 `role === 'assistant'` 生效（`system` 头是国际版上游硬要求，绝不能剥；`user` / `tool` 属用户数据绝不触碰）；
+ * - 仅剥离「中性头 + 空行」（`You are a helpful assistant.\n\n` / `You are a helpful AI assistant.\n\n`），
+ *   不带空行的真实散文原封保留；
+ * - 最多剥离 8 层，且若剥完只剩空白则保留最后一层，绝不把消息剥成空串。
+ */
+export const WORKBUDDY_FALLBACK_SYSTEM_PROMPT = 'You are a helpful assistant.'
+const INJECTED_ASSISTANT_HEAD_RE = /^You are a helpful (?:AI )?assistant\.\r?\n\r?\n/
+const MAX_INJECTED_HEAD_LAYERS = 8
+
+export function stripInjectedAssistantHead(text: string): string {
+  let out = text
+  for (let layer = 0; layer < MAX_INJECTED_HEAD_LAYERS; layer += 1) {
+    const m = INJECTED_ASSISTANT_HEAD_RE.exec(out)
+    if (m === null) break
+    const rest = out.slice(m[0].length)
+    if (rest.trim() === '') break
+    out = rest
+  }
+  return out
+}
+
+function stripInjectedHeadFromContent(content: unknown): unknown {
+  if (typeof content === 'string') return stripInjectedAssistantHead(content)
+  if (!Array.isArray(content)) return content
+  let changed = false
+  const out = content.map((part) => {
+    if (!isObj(part) || part.type !== 'text' || typeof part.text !== 'string') return part
+    const next = stripInjectedAssistantHead(part.text)
+    if (next === part.text) return part
+    changed = true
+    return { ...part, text: next }
+  })
+  return changed ? out : content
+}
 
 /**
  * 「客户端自我介绍句式 + 品牌」组合指纹（hub #533 / #537 / #539，2026-10-21）。
@@ -1488,10 +1564,11 @@ const IDENTITY_RE =
 const IDENTITY_PROBE = /agent\s+powered by|assistant\s+built on/i
 const IDENTITY_REPLACEMENT = 'You are a helpful AI assistant.'
 
-function hasFingerprint(text: string, identity: boolean): boolean {
+function hasFingerprint(text: string, identity: boolean, officialCli = true): boolean {
   for (const f of FINGERPRINT_LITERALS) if (text.includes(f)) return true
   if (text.includes(FP_BARE)) return true
   if (FINGERPRINT_CI.test(text)) return true
+  if (officialCli && OFFICIAL_CLI_PROBE.test(text)) return true
   return identity && IDENTITY_PROBE.test(text)
 }
 
@@ -1499,11 +1576,19 @@ function hasFingerprint(text: string, identity: boolean): boolean {
  * 改写一段文本里的客户端指纹（无指纹时原样返回同一字符串）。
  *
  * @param identity 是否同时改写「自我介绍句 + 品牌」（只对 system / developer 开）。
+ * @param trim 是否去除改写后文本的首尾空白（默认 `true`）。
+ * @param officialCli 是否改写 `<Vendor>'s official CLI for <Product>` 自述句（对 system / developer / assistant 开，对 user / tool 关）。
  */
-export function scrubFingerprintText(text: string, identity = false, trim = true): string {
-  if (text === '' || !hasFingerprint(text, identity)) return text
+export function scrubFingerprintText(
+  text: string,
+  identity = false,
+  trim = true,
+  officialCli = true,
+): string {
+  if (text === '' || !hasFingerprint(text, identity, officialCli)) return text
   let out = text.replace(OMO_JUNIOR_RE, 'Sisyphus-Junior - Focused executor')
   out = out.replace(GROK_XAI_RE, 'You are WorkBuddy')
+  if (officialCli) out = out.replace(OFFICIAL_CLI_RE, `$1${OFFICIAL_CLI_REPLACEMENT}`)
   if (identity) out = out.replace(IDENTITY_RE, IDENTITY_REPLACEMENT)
   for (const [from, to] of FINGERPRINT_REWRITES) out = out.replaceAll(from, to)
   out = out.replaceAll(FP_BARE, FP_SAFE)
@@ -1527,20 +1612,20 @@ export function scrubFingerprintText(text: string, identity = false, trim = true
  * 解析失败（流式残片等）才退回整段文本改写。
  */
 export function scrubToolArguments(args: string): string {
-  if (args === '' || !hasFingerprint(args, false)) return args
+  if (args === '' || !hasFingerprint(args, false, false)) return args
   let parsed: unknown
   try {
     parsed = JSON.parse(args)
   } catch {
-    return scrubFingerprintText(args)
+    return scrubFingerprintText(args, false, true, false)
   }
   if (parsed === null || typeof parsed !== 'object') {
-    return typeof parsed === 'string' ? JSON.stringify(scrubFingerprintText(parsed, false, false)) : args
+    return typeof parsed === 'string' ? JSON.stringify(scrubFingerprintText(parsed, false, false, false)) : args
   }
   let changed = false
   const walk = (v: unknown): unknown => {
     if (typeof v === 'string') {
-      const s = scrubFingerprintText(v, false, false)
+      const s = scrubFingerprintText(v, false, false, false)
       if (s !== v) changed = true
       return s
     }
@@ -1553,13 +1638,13 @@ export function scrubToolArguments(args: string): string {
   return changed ? JSON.stringify(next) : args
 }
 
-function scrubContent(content: unknown, identity: boolean): unknown {
-  if (typeof content === 'string') return scrubFingerprintText(content, identity)
+function scrubContent(content: unknown, identity: boolean, officialCli: boolean): unknown {
+  if (typeof content === 'string') return scrubFingerprintText(content, identity, true, officialCli)
   if (!Array.isArray(content)) return content
   let changed = false
   const out = content.map((part) => {
     if (!isObj(part) || part.type !== 'text' || typeof part.text !== 'string') return part
-    const text = scrubFingerprintText(part.text, identity)
+    const text = scrubFingerprintText(part.text, identity, true, officialCli)
     if (text === part.text) return part
     changed = true
     return { ...part, text }
@@ -1568,9 +1653,11 @@ function scrubContent(content: unknown, identity: boolean): unknown {
 }
 
 /**
- * 对整段消息历史做指纹脱敏（正文 / 文本分段 / reasoning_content / 工具参数）。无改动返回原数组。
+ * 对整段消息历史做指纹脱敏（正文 / 文本分段 / reasoning_content / 工具参数 / assistant 注入中性头剥离）。无改动返回原数组。
  *
- * 身份句改写只对 system / developer 生效；其余规则（已确认的固定指纹与裸拦截码）全角色生效。
+ * - 身份句改写（`IDENTITY_RE`）只对 `system` / `developer` 生效；
+ * - 第三方 `official CLI` 渠道自述句改写对 `system` / `developer` / `assistant` 生效，`user` / `tool` 保持逐字节不变；
+ * - `assistant` 历史消息额外剥离被注入的重复中性头残留（`#297`）。
  */
 export function scrubFingerprints(messages: unknown[]): unknown[] {
   let changed = false
@@ -1578,10 +1665,14 @@ export function scrubFingerprints(messages: unknown[]): unknown[] {
     if (!isObj(m)) return m
     let item: Msg | undefined
     const identity = m.role === 'system' || m.role === 'developer'
-    const content = scrubContent(m.content, identity)
+    const officialCli = identity || m.role === 'assistant'
+    let content = scrubContent(m.content, identity, officialCli)
+    if (m.role === 'assistant') {
+      content = stripInjectedHeadFromContent(content)
+    }
     if (content !== m.content) (item ??= { ...m }).content = content
     if (typeof m.reasoning_content === 'string') {
-      const rc = scrubFingerprintText(m.reasoning_content)
+      const rc = scrubFingerprintText(m.reasoning_content, false, true, officialCli)
       if (rc !== m.reasoning_content) (item ??= { ...m }).reasoning_content = rc
     }
     if (Array.isArray(m.tool_calls)) {

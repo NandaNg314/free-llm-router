@@ -54,17 +54,42 @@ export const DEFAULT_KEEPALIVE_INTERVAL_MS = 10_000
 /** 标准 SSE 注释心跳帧。 */
 export const KEEPALIVE_FRAME = ': keepalive\n\n'
 
+/** Codex 浏览器回合提前收尾控制标记前缀（`6dc02b3`）。 */
+export const BROWSER_COMPLETE_PREFIX = '::browser-complete'
+
+/**
+ * 合成续写指令的纯中性标记前缀（同步自 `workbuddy2api-panel` `2e2358c`、`f60c68d`）：
+ * 既让模型能将 `role: 'user'` 的合成续写指令与真实用户授权输入区分开，
+ * 又严格不含任何网关自称词或实现项目名（如 `wb2api`、`free-llm-router`、`网关`、`非用户消息`）。
+ */
+export const INTERNAL_NUDGE_PREFIX = '【内部续写指令·非用户输入】'
+
 /** `finish_reason=length` 截断续写指令。 */
 export const CONTINUE_NUDGE =
-  '你上一条回复因达到输出长度上限被截断。请从中断处继续输出剩余内容；不要重复已输出过的部分，不要道歉或解释，直接继续。'
+  `${INTERNAL_NUDGE_PREFIX}你上一条回复因达到输出长度上限被截断。请从中断处继续输出剩余内容；不要重复已输出过的部分，不要道歉或解释，直接继续。如果已经写完整，不要输出任何内容，直接结束。`
 
 /** 标点/结构悬停（如停在 `：` 或半截代码块）救援指令。 */
 export const NARRATION_COLON_NUDGE =
-  '你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，不要重复已经写过的内容，不要重新开头，不要道歉或解释。'
+  `${INTERNAL_NUDGE_PREFIX}你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，不要重复已经写过的内容，不要重新开头，不要道歉或解释。如果你确实已经写完了，什么都不要输出，直接结束这一轮。`
 
 /** 动作承诺句悬停（如「我将开始修改… / Let me update…」）救援指令。 */
 export const NARRATION_PROMISE_NUDGE =
-  '你上一条回复最后停在「我将…」「接下来我来…」「Let me…」这类承诺句上就结束了，承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，不要解释为什么停下，不要重复已经写过的内容，不要重新开头。'
+  `${INTERNAL_NUDGE_PREFIX}你上一条回复最后停在「我将…」「接下来我来…」「Let me…」这类承诺句上就结束了，承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，不要解释为什么停下，不要重复已经写过的内容，不要重新开头。如果你确实已经写完了，什么都不要输出，直接结束这一轮。`
+
+/** 独立 `::browser-complete{...}` 控制标记误收尾救援指令（`6dc02b3`、`f60c68d`、`2e2358c`）。 */
+export const BROWSER_COMPLETE_NUDGE =
+  `${INTERNAL_NUDGE_PREFIX}你刚才只输出了 \`::browser-complete{...}\` 浏览器完成控制标记，但用户任务还没有结束。不要只输出完成标记，也不要假装已经完成；请继续执行用户要求的下一步，完成后给出最终结果。如果你确认已经完成，不要输出任何内容，直接结束。`
+
+/**
+ * 判断正文是否**恰好仅包含一条独立的 `::browser-complete{...}` 控制标记**（允许首尾空白，不允许夹带其他正文，`6dc02b3`）。
+ */
+export function isBrowserCompleteDirectiveOnly(text: string): boolean {
+  const s = text.trim()
+  if (!s.startsWith(`${BROWSER_COMPLETE_PREFIX}{`)) return false
+  const rest = s.slice(BROWSER_COMPLETE_PREFIX.length)
+  const end = rest.indexOf('}')
+  return end >= 0 && rest.slice(end + 1).trim() === ''
+}
 
 // ─────────────────────────── 基础工具与句子切分 ───────────────────────────
 
@@ -671,6 +696,62 @@ export function shouldRescueNarrationHover(input: NarrationCheckInput): Narratio
   return { rescue: false, reason: 'normal_completion' }
 }
 
+export interface BrowserCompleteCheckInput {
+  finishReason: string | null | undefined
+  text: string
+  hasToolCalls?: boolean
+  hasError?: boolean
+  clientAborted?: boolean
+  hasDeclaredTools?: boolean
+  hasToolHistory?: boolean
+  requestBody?: unknown
+  browserCompleteTried?: boolean
+  segmentIndex?: number
+  maxSegments?: number
+}
+
+/**
+ * 纯函数判据：当模型在有工具上下文的回合仅输出一条独立的 `::browser-complete{...}` 控制标记即 `stop` 时，
+ * 触发单次续写救援（`6dc02b3`）。
+ */
+export function shouldRescueBrowserComplete(input: BrowserCompleteCheckInput): NarrationDecision {
+  if (input.browserCompleteTried === true) return { rescue: false, reason: 'already_tried' }
+  if (input.clientAborted === true) return { rescue: false, reason: 'client_aborted' }
+  if (input.hasError === true) return { rescue: false, reason: 'has_error' }
+  if (input.hasToolCalls === true) return { rescue: false, reason: 'already_has_tool_calls' }
+
+  const fr = typeof input.finishReason === 'string' ? input.finishReason.trim().toLowerCase() : ''
+  if (fr !== 'stop') return { rescue: false, reason: 'not_stop_finish' }
+
+  const seg = input.segmentIndex ?? 0
+  const maxSegs = input.maxSegments ?? DEFAULT_MAX_CONTINUE_SEGMENTS
+  if (seg >= maxSegs - 1) return { rescue: false, reason: 'segment_cap' }
+
+  const maxTokens =
+    input.requestBody !== undefined ? extractExplicitMaxTokens(input.requestBody) : undefined
+  if (maxTokens !== undefined && maxTokens <= PROBE_MAX_TOKENS_THRESHOLD) {
+    return { rescue: false, reason: 'probe_max_tokens' }
+  }
+
+  if (!isBrowserCompleteDirectiveOnly(input.text)) {
+    return { rescue: false, reason: 'not_standalone_browser_complete' }
+  }
+
+  const shape =
+    input.requestBody !== undefined ? inspectRequestToolShape(input.requestBody) : undefined
+  const hasDeclaredTools = input.hasDeclaredTools ?? shape?.hasDeclaredTools ?? false
+  const hasToolHistory = input.hasToolHistory ?? shape?.hasToolHistory ?? false
+  if (!hasDeclaredTools && !hasToolHistory) {
+    return { rescue: false, reason: 'no_tool_context' }
+  }
+
+  return {
+    rescue: true,
+    nudge: BROWSER_COMPLETE_NUDGE,
+    reason: 'standalone_browser_complete',
+  }
+}
+
 // ─────────────────────────── 续写请求构造与 Usage 合并 ───────────────────────────
 
 /**
@@ -806,9 +887,11 @@ export interface ContinuationStreamOptions {
   maxContinueSegments?: number
   /** 最大预告句救援次数（默认 `2`）。 */
   maxNarrationRescues?: number
+  /** 是否启用独立 `::browser-complete` 控制标记救援（默认随 `enableNarrationRescue` 开启）。 */
+  enableBrowserCompleteRescue?: boolean
   /** 换段触发时的可选观测回调（供日志打点）。 */
   onSegmentSwitch?: (info: {
-    kind: 'truncation' | 'narration'
+    kind: 'truncation' | 'narration' | 'browser_complete'
     segmentIndex: number
     reason: string
     textBytes: number
@@ -831,7 +914,8 @@ export function wrapContinuationStream(
 
   const enableTrunc = options.enableTruncationContinue !== false
   const enableNarr = options.enableNarrationRescue !== false
-  if (!enableTrunc && !enableNarr) {
+  const enableBrowserComplete = options.enableBrowserCompleteRescue ?? enableNarr
+  if (!enableTrunc && !enableNarr && !enableBrowserComplete) {
     return initialStream
   }
 
@@ -867,6 +951,7 @@ export function wrapContinuationStream(
       let segmentIndex = 0
       let narrationRescuesUsed = 0
       let lastRescueTextLength: number | undefined
+      let browserCompleteTried = false
 
       let fullText = ''
       let fullReasoning = ''
@@ -950,6 +1035,77 @@ export function wrapContinuationStream(
           let segReasoningTokens = 0
           let segLatestUsage: Record<string, unknown> | undefined
           let tailPayloads: string[] = []
+          let browserHold = ''
+          let browserCompleteSeen = false
+          let browserIncomplete = false
+          let suppressedBrowserDirectiveText = ''
+
+          const filterBrowserContent = (deltaText: string): { visible: string; hidden: boolean } => {
+            if (
+              !enableBrowserComplete ||
+              browserCompleteTried ||
+              browserCompleteSeen ||
+              (browserHold === '' && fullText.trim() !== '')
+            ) {
+              return { visible: deltaText, hidden: false }
+            }
+
+            const combined = browserHold + deltaText
+            browserHold = ''
+            const core = combined.replace(/^[ \t\r\n]+/, '')
+            if (core === '') {
+              browserHold = combined
+              return { visible: '', hidden: true }
+            }
+            if (
+              !BROWSER_COMPLETE_PREFIX.startsWith(core) &&
+              !core.startsWith(BROWSER_COMPLETE_PREFIX)
+            ) {
+              return { visible: combined, hidden: false }
+            }
+            if (!core.startsWith(BROWSER_COMPLETE_PREFIX)) {
+              browserHold = combined
+              return { visible: '', hidden: true }
+            }
+            const rest = core.slice(BROWSER_COMPLETE_PREFIX.length)
+            if (rest === '') {
+              browserHold = combined
+              return { visible: '', hidden: true }
+            }
+            if (!rest.startsWith('{')) {
+              // 前缀误报（例如 `::browser-completed`）：完整吐回之前暂存的片段
+              return { visible: combined, hidden: false }
+            }
+            const end = rest.indexOf('}')
+            if (end < 0) {
+              browserHold = combined
+              return { visible: '', hidden: true }
+            }
+            browserCompleteSeen = true
+            const closeOffsetInCombined =
+              combined.length - core.length + BROWSER_COMPLETE_PREFIX.length + end + 1
+            suppressedBrowserDirectiveText = combined.slice(0, closeOffsetInCombined)
+            const tail = rest.slice(end + 1)
+            if (tail.trim() === '') {
+              return { visible: '', hidden: true }
+            }
+            // 控制标记后紧跟真实正文：标记不触发独立救援，把整段原样交还可见流以免吞字
+            suppressedBrowserDirectiveText = ''
+            return { visible: combined, hidden: false }
+          }
+
+          const flushBrowserHold = (): void => {
+            const pending = browserHold
+            browserHold = ''
+            if (pending === '' || pending.trim() === '') return
+            browserIncomplete = true
+            const chunkFrame: Record<string, unknown> = {
+              id: streamId,
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: { content: pending }, finish_reason: null }],
+            }
+            emitDataPayload(JSON.stringify(chunkFrame))
+          }
 
           const handleLine = (line: string): void => {
             const trimmed = line.trim()
@@ -1018,6 +1174,7 @@ export function wrapContinuationStream(
             }
 
             let deltaNonEmpty = false
+            let hiddenContentOnly = false
             let frameFinish: string | null = null
 
             if (Array.isArray(frame.choices) && frame.choices.length > 0) {
@@ -1042,8 +1199,23 @@ export function wrapContinuationStream(
                   }
                   const content = typeof delta.content === 'string' ? delta.content : ''
                   if (content !== '') {
+                    const filtered = filterBrowserContent(content)
                     fullText += content
-                    deltaNonEmpty = true
+                    if (filtered.hidden) {
+                      hiddenContentOnly = filtered.visible === ''
+                      if (hiddenContentOnly) {
+                        delete delta.content
+                      } else {
+                        delta.content = filtered.visible
+                      }
+                      rebuilt = true
+                    } else if (filtered.visible !== content) {
+                      delta.content = filtered.visible
+                      rebuilt = true
+                    }
+                    if (filtered.visible !== '') {
+                      deltaNonEmpty = true
+                    }
                   }
                   const refusal = typeof delta.refusal === 'string' ? delta.refusal : ''
                   if (refusal !== '') {
@@ -1092,6 +1264,11 @@ export function wrapContinuationStream(
               return
             }
 
+            if (hiddenContentOnly && !deltaNonEmpty && frameFinish === null) {
+              maybeEmitKeepalive()
+              return
+            }
+
             if (segmentIndex > 0 && !deltaNonEmpty) {
               maybeEmitKeepalive()
               return
@@ -1129,12 +1306,38 @@ export function wrapContinuationStream(
             mergedUsage = mergeSegmentUsage(mergedUsage, segLatestUsage)
           }
 
-          // ── 段结束：依次判定「预告句悬停救援」与「截断自动续写」──
+          // 未闭合的 `::browser-...` 候选片段原样刷出，保证非控制标记正文零吞字
+          flushBrowserHold()
+
+          // ── 段结束：依次判定「`::browser-complete` 控制标记救援」「预告句悬停救援」「截断自动续写」──
           let nextBody: Record<string, unknown> | undefined
-          let switchKind: 'narration' | 'truncation' | undefined
+          let switchKind: 'narration' | 'truncation' | 'browser_complete' | undefined
           let switchReason = ''
 
-          if (enableNarr) {
+          if (enableBrowserComplete && browserCompleteSeen) {
+            const bcDecision = shouldRescueBrowserComplete({
+              finishReason: segFinishReason,
+              text: fullText,
+              hasToolCalls: sawToolCalls,
+              hasError: sawError,
+              clientAborted: isClientAborted(),
+              requestBody: options.requestBody,
+              browserCompleteTried,
+              segmentIndex,
+              maxSegments,
+            })
+            if (bcDecision.rescue && bcDecision.nudge !== undefined) {
+              nextBody = buildContinuationBody(
+                options.requestBody,
+                { text: fullText, reasoning: fullReasoning },
+                bcDecision.nudge,
+              )
+              switchKind = 'browser_complete'
+              switchReason = bcDecision.reason
+            }
+          }
+
+          if (nextBody === undefined && enableNarr && !browserIncomplete && !browserCompleteTried && !browserCompleteSeen) {
             const narrDecision = shouldRescueNarrationHover({
               finishReason: segFinishReason,
               text: fullText,
@@ -1190,14 +1393,18 @@ export function wrapContinuationStream(
           if (nextBody !== undefined && switchKind !== undefined) {
             const prevRescueCount = narrationRescuesUsed
             const prevRescueTextAt = lastRescueTextLength
+            const prevBrowserTried = browserCompleteTried
             if (switchKind === 'narration') {
               narrationRescuesUsed += 1
               lastRescueTextLength = fullText.length
+            } else if (switchKind === 'browser_complete') {
+              browserCompleteTried = true
             }
             const nextStream = await openNextWithKeepalive(nextBody)
             if (nextStream !== null) {
               segmentIndex += 1
               tailPayloads = []
+              suppressedBrowserDirectiveText = ''
               options.onSegmentSwitch?.({
                 kind: switchKind,
                 segmentIndex,
@@ -1210,6 +1417,18 @@ export function wrapContinuationStream(
             // 换段请求失败：回退计数并按原段尾帧正常收尾
             narrationRescuesUsed = prevRescueCount
             lastRescueTextLength = prevRescueTextAt
+            browserCompleteTried = prevBrowserTried
+          }
+
+          // 若吞下了独立的 `::browser-complete{...}` 但未触发救援（如无工具上下文）或续写请求失败，原样补发以免回空流
+          if (suppressedBrowserDirectiveText !== '') {
+            const fallbackFrame: Record<string, unknown> = {
+              id: streamId,
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: { content: suppressedBrowserDirectiveText }, finish_reason: null }],
+            }
+            emitDataPayload(JSON.stringify(fallbackFrame))
+            suppressedBrowserDirectiveText = ''
           }
 
           // ── 最终收尾：回放末段终态帧 → 输出合并 usage 帧 → [DONE] ──

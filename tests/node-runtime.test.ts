@@ -388,3 +388,48 @@ test('🔴 cron 调度必须按 UTC+8 算槽位，不能依赖服务器本地时
   assert.ok(/9: \{ plan: 'daily'/.test(tbl), 'UTC+8 9 点应为 daily（签到）')
   assert.ok(/21: \{ plan: 'daily'/.test(tbl), 'UTC+8 21 点应为 daily（签到第二趟）')
 })
+
+test('startServer：LOCAL_MODE=1 精简启动横幅且关闭后自动卸载信号监听器', async () => {
+  const logs: string[] = []
+  const origLog = console.log
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '))
+  }
+
+  const sigintBefore = process.listenerCount('SIGINT')
+  const sigtermBefore = process.listenerCount('SIGTERM')
+  const sigbreakBefore = process.platform === 'win32' ? process.listenerCount('SIGBREAK') : 0
+
+  const { server, runtime } = startServer({
+    port: 0,
+    host: '127.0.0.1',
+    databasePath: ':memory:',
+    autoCron: false,
+    localMode: true,
+  })
+
+  try {
+    await new Promise<void>((resolve) => {
+      if (server.listening) resolve()
+      else server.once('listening', () => resolve())
+    })
+
+    if (process.platform === 'win32') {
+      assert.equal(process.listenerCount('SIGBREAK'), sigbreakBefore + 1, 'Windows 下应挂载 SIGBREAK 优雅停机监听')
+    }
+    const output = logs.join('\n')
+    assert.ok(output.includes('服务已就绪'), '本地模式应打印精简就绪提示')
+    assert.ok(!output.includes('在 VPS 上运行'), '本地模式不应重复打印 VPS 横幅')
+  } finally {
+    console.log = origLog
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    runtime.db.close()
+  }
+
+  assert.equal(process.listenerCount('SIGINT'), sigintBefore, 'server 关闭后应卸载 SIGINT 监听器')
+  assert.equal(process.listenerCount('SIGTERM'), sigtermBefore, 'server 关闭后应卸载 SIGTERM 监听器')
+  if (process.platform === 'win32') {
+    assert.equal(process.listenerCount('SIGBREAK'), sigbreakBefore, 'server 关闭后应卸载 SIGBREAK 监听器')
+  }
+})
+

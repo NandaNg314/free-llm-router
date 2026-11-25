@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { UpstreamError } from '../src/upstream/client.ts'
 import {
   AudioRequestError,
   pcmToWav,
@@ -77,6 +78,41 @@ test('parseAudioMultipart：file 字段同样接受；缺字段 / 缺 boundary �
   )
 })
 
+test('parseAudioMultipart：提取可选 response_format（含排在 file 之后的字段），拒绝 srt/vtt/verbose_json', () => {
+  const wav = new Uint8Array([1, 2, 3, 4])
+
+  // 默认 json
+  const def = multipartBody([{ field: 'file', filename: 'a.wav', mime: 'audio/wav', data: wav }])
+  assert.equal(parseAudioMultipart(def.body, def.contentType).responseFormat, 'json')
+
+  // response_format 放在 file 字段之后也必须能提取（OpenAI SDK 标准顺序）
+  const txt = multipartBody([
+    { field: 'file', filename: 'a.wav', mime: 'audio/wav', data: wav },
+    { field: 'model', data: enc.encode('whisper-1') },
+    { field: 'response_format', data: enc.encode('TEXT') },
+  ])
+  const parsedTxt = parseAudioMultipart(txt.body, txt.contentType)
+  assert.equal(parsedTxt.responseFormat, 'text')
+  assert.equal(parsedTxt.model, 'whisper-1')
+
+  // srt / vtt / verbose_json 因上游无词级时间戳，明确回 400 AudioRequestError
+  for (const badFmt of ['srt', 'vtt', 'verbose_json']) {
+    const bad = multipartBody([
+      { field: 'file', filename: 'a.wav', mime: 'audio/wav', data: wav },
+      { field: 'response_format', data: enc.encode(badFmt) },
+    ])
+    assert.throws(
+      () => parseAudioMultipart(bad.body, bad.contentType),
+      (error: unknown) =>
+        error instanceof AudioRequestError
+        && error.httpStatus === 400
+        && error.message.includes(badFmt)
+        && error.message.includes('json'),
+      `${badFmt} 必须回 400 AudioRequestError`,
+    )
+  }
+})
+
 type FetchLike = typeof fetch
 
 async function withFetch(impl: FetchLike, fn: () => Promise<void>): Promise<void> {
@@ -89,10 +125,11 @@ async function withFetch(impl: FetchLike, fn: () => Promise<void>): Promise<void
   }
 }
 
-test('speechToPcm：拼接 SSE 里的 base64 PCM 分片', async () => {
-  const frame = (text: string): string => `data: ${JSON.stringify(text)}\n\n`
+test('speechToPcm：拼接 SSE 里的 base64 PCM 分片（以 speech.audio.done 确认完整）', async () => {
+  const frame = (payload: unknown): string => `data: ${JSON.stringify(payload)}\n\n`
   const sse = frame({ type: 'speech.audio.delta', audio: { data: btoa('ab') } })
     + frame({ type: 'speech.audio.delta', audio: { data: btoa('cd') } })
+    + frame({ type: 'speech.audio.done' })
     + 'data: [DONE]\n\n'
   await withFetch(
     async () => new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
@@ -102,6 +139,37 @@ test('speechToPcm：拼接 SSE 里的 base64 PCM 分片', async () => {
         voice: 'v',
       })
       assert.equal(new TextDecoder().decode(pcm), 'abcd')
+    },
+  )
+})
+
+test('🔴 speechToPcm：未收到 speech.audio.done 的半截 SSE 流必须抛可重试 network/502（绝不把残缺音频当成功）', async () => {
+  const frame = (payload: unknown): string => `data: ${JSON.stringify(payload)}\n\n`
+  // 模拟 APISIX 在中途断开分块流（已有部分 delta 字节，但没有 speech.audio.done）
+  const truncatedSse = frame({ type: 'speech.audio.delta', audio: { data: btoa('partial-pcm') } })
+  await withFetch(
+    async () => new Response(truncatedSse, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    async () => {
+      await assert.rejects(
+        () => speechToPcm({ uid: 'u', accessToken: 't', realm: 'cn' }, {} as never, { text: '你好', voice: 'v' }),
+        (error: unknown) =>
+          error instanceof UpstreamError
+          && !(error instanceof AudioRequestError)
+          && error.kind === 'network'
+          && error.httpStatus === 502,
+      )
+    },
+  )
+
+  // 即使有 [DONE] 但缺 speech.audio.done 也必须拒收
+  const doneWithoutAudioDone = frame({ type: 'speech.audio.delta', audio: { data: btoa('partial') } }) + 'data: [DONE]\n\n'
+  await withFetch(
+    async () => new Response(doneWithoutAudioDone, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    async () => {
+      await assert.rejects(
+        () => speechToPcm({ uid: 'u', accessToken: 't', realm: 'cn' }, {} as never, { text: '你好', voice: 'v' }),
+        (error: unknown) => error instanceof UpstreamError && error.kind === 'network' && error.httpStatus === 502,
+      )
     },
   )
 })

@@ -85,6 +85,11 @@ test('MCP：tools/list 回全部 7 个工具（含视频与 3D），且 schema �
     assert.ok(typeof t.description === 'string' && t.description.length > 20,
       `${String(t.name)} 的 description 要写清「什么时候用它」`)
   }
+  const genVideo = j.result.tools.find((t) => t.name === 'generate_video')
+  const genVideoProps = (genVideo?.inputSchema as { properties: Record<string, { type?: string }> }).properties
+  for (const refField of ['reference_images', 'reference_videos', 'reference_audios']) {
+    assert.equal(genVideoProps[refField]?.type, 'array', `generate_video 必须暴露 ${refField} 数组参数`)
+  }
 })
 
 test('🔴 MCP：工具执行失败回 isError=true，而不是 JSON-RPC 错误', async () => {
@@ -180,9 +185,16 @@ test('MCP：generate_video -> get_video_task 与 generate_3d -> get_3d_task 多�
       return new Response('Upstream busy', { status: 503 })
     }
 
+    let lastVideoBody: Record<string, unknown> | undefined
     if (url.endsWith('/v2/videos/generations')) {
       assert.equal(h.get('x-client-version'), null, '国际媒体请求绝不能泄漏国内 X-Client-* 三头')
       assert.equal(h.get('origin'), 'https://www.workbuddy.ai', '国际媒体请求 Origin 必须为 www.workbuddy.ai')
+      lastVideoBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+      if (lastVideoBody.prompt === '带参考素材延时') {
+        assert.deepEqual(lastVideoBody.reference_images, [{ image_url: 'https://cdn.example.com/ref.png' }])
+        assert.deepEqual(lastVideoBody.reference_videos, [{ video_url: 'https://cdn.example.com/ref.mp4' }])
+        assert.deepEqual(lastVideoBody.reference_audios, [{ audio_url: 'https://cdn.example.com/ref.wav' }])
+      }
       return new Response(JSON.stringify({ code: 0, data: { id: 'mcp-vid-9', status: 'queued' } }), { status: 200 })
     }
     if (url.endsWith('/v2/videos/tasks')) {
@@ -224,9 +236,22 @@ test('MCP：generate_video -> get_video_task 与 generate_3d -> get_3d_task 多�
   }
 
   try {
-    // 1. generate_video -> get_video_task
+    // 1. generate_video -> get_video_task（含 reference_* 归一化透传）
     const vSub = await handleMcp(
-      rpc({ jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'generate_video', arguments: { prompt: '星空延时' } } }),
+      rpc({
+        jsonrpc: '2.0',
+        id: 10,
+        method: 'tools/call',
+        params: {
+          name: 'generate_video',
+          arguments: {
+            prompt: '带参考素材延时',
+            reference_images: ['https://cdn.example.com/ref.png'],
+            reference_videos: ['https://cdn.example.com/ref.mp4'],
+            reference_audios: ['https://cdn.example.com/ref.wav'],
+          },
+        },
+      }),
       env,
     )
     const vSubJson = (await vSub!.json()) as { result: { isError?: boolean; content: Array<{ text: string }> } }

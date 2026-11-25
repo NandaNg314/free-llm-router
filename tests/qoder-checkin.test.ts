@@ -11,6 +11,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   encodeQoderHeaderValue,
+  isQoderClaimedAtStale,
+  isQoderClaimedAtToday,
   parseCredential,
   qoderProvider,
   qodercnProvider,
@@ -173,4 +175,75 @@ test('runtime-info 环境码：国际版固定 3，国内版固定 0（对齐 f4
   assert.equal(qoderRuntimeInfoEnv('intl'), '3')
   assert.equal(qoderRuntimeInfoEnv('qodercn'), '0')
   assert.equal(qoderRuntimeInfoEnv('cn'), '0')
+})
+
+test('🔴 陈旧 claimedAt（非今日 UTC+8）护栏：绝不把昨日旧活动误判为「今日已领」（对齐 2e8d0c3）', async () => {
+  // 1. 纯函数校验 UTC+8 跨自然日边界与缺失字段兼容性
+  const nowUtc8Morning = Date.parse('2026-11-22T01:30:00+08:00')
+  const yesterdayLateUtc8 = '2026-11-21T23:59:59+08:00'
+  const todayEarlyUtc8 = '2026-11-22T00:00:01+08:00'
+  assert.equal(isQoderClaimedAtStale(yesterdayLateUtc8, nowUtc8Morning), true)
+  assert.equal(isQoderClaimedAtToday(yesterdayLateUtc8, nowUtc8Morning), false)
+  assert.equal(isQoderClaimedAtStale(todayEarlyUtc8, nowUtc8Morning), false)
+  assert.equal(isQoderClaimedAtToday(todayEarlyUtc8, nowUtc8Morning), true)
+  // 无 claimedAt 时不推翻历史响应
+  assert.equal(isQoderClaimedAtStale(undefined, nowUtc8Morning), false)
+  assert.equal(isQoderClaimedAtStale('', nowUtc8Morning), false)
+
+  // 2. 距当前 26 小时的历史陈旧活动返回 CLAIMED：必须抛错保持待签，严禁返回 alreadyDone=true
+  const staleIso = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString()
+  const staleCampaigns = {
+    campaigns: [
+      {
+        campaignId: 'cid-old',
+        actionType: 'CLAIM_BENEFIT',
+        claimStatus: 'CLAIMED',
+        claimedAt: staleIso,
+      },
+    ],
+  }
+  const m1 = mockFetch(() => json(staleCampaigns))
+  try {
+    await assert.rejects(
+      qodercnProvider.checkin!(bare, AbortSignal.timeout(5_000)),
+      /非今日 UTC\+8/,
+    )
+  } finally {
+    m1.restore()
+  }
+
+  // 3. 今日时刻的 CLAIMED 正常判为今日已领
+  const freshIso = new Date().toISOString()
+  const freshCampaigns = {
+    campaigns: [
+      {
+        campaignId: 'cid-today',
+        actionType: 'CLAIM_BENEFIT',
+        claimStatus: 'CLAIMED',
+        claimedAt: freshIso,
+      },
+    ],
+  }
+  const m2 = mockFetch(() => json(freshCampaigns))
+  try {
+    const r = await qodercnProvider.checkin!(bare, AbortSignal.timeout(5_000))
+    assert.equal(r.alreadyDone, true)
+  } finally {
+    m2.restore()
+  }
+
+  // 4. claim 响应若返回陈旧 claimedAt（含 replayed 场景），同样拦截不记今日已签
+  const m3 = mockFetch((c) =>
+    c.method === 'GET'
+      ? json(claimable)
+      : json({ status: 'CLAIMED', replayed: true, claimedAt: staleIso }),
+  )
+  try {
+    await assert.rejects(
+      qodercnProvider.checkin!(bare, AbortSignal.timeout(5_000)),
+      /非今日 UTC\+8/,
+    )
+  } finally {
+    m3.restore()
+  }
 })

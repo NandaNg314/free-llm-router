@@ -61,9 +61,43 @@ test('🔴 cron 不得对「今天已跑完同一计划」的账号重复入队'
     assert.ok(first !== undefined, '应已入队')
     assert.equal(first.plan, 'daily', '⚠️ 计划名必须写进 RunState（否则日志恒为 daily）')
     const firstStarted = first.startedAt
+    assert.equal(firstStarted, at)
 
-    // 模拟「这一轮已经跑完」
+    // ① 反向契约（e5fe8059）：若上一轮被取消或失败（lastError 非空），同日再次触发允许重试开新一轮
     await runner.cancel('cron1')
+    mock.timers.enable({ apis: ['Date'], now: at + 60_000 })
+    try {
+      await worker.scheduled({ cron: '0 * * * *', scheduledTime: at + 60_000 } as never, rt.env, ctx)
+    } finally {
+      mock.timers.reset()
+    }
+    const retried = await runner.status('cron1')
+    assert.ok(retried !== undefined)
+    assert.notEqual(retried.startedAt, firstStarted)
+    assert.equal(retried.startedAt, at + 60_000, '上次取消/失败未成功完结时，允许重开新一轮重试')
+    const succeededStarted = retried.startedAt
+
+    // ② 正向契约：清除挂起 alarm，并将持久化进度置为真实成功完结态（finished=true, lastError='', done 全 ok）
+    await runner.cancel('cron1')
+    const succeededState = {
+      uid: 'cron1',
+      plan: 'daily',
+      queue: [],
+      done: [{ code: 'checkin', action: 'checkin', ok: true, detail: 'ok' }],
+      finished: true,
+      lastError: '',
+      cancelRequested: false,
+      startedAt: succeededStarted,
+      updatedAt: at + 60_000,
+    }
+    rt.db
+      .prepare(
+        `INSERT INTO task_progress (uid, payload, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(uid) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`,
+      )
+      .run('cron1', JSON.stringify(succeededState), at + 60_000)
+    // 淘汰无未决 alarm 的内存实例，使下次访问从 SQLite 加载真实完结态
+    rt.taskRunnerNamespace.pruneIdle(-1)
 
     // 同一小时内再触发一次（重启场景）
     mock.timers.enable({ apis: ['Date'], now: at + 120_000 })
@@ -72,12 +106,12 @@ test('🔴 cron 不得对「今天已跑完同一计划」的账号重复入队'
     } finally {
       mock.timers.reset()
     }
-    const second = await runner.status('cron1')
+    const second = await rt.env.TASK_RUNNER.get(rt.env.TASK_RUNNER.idFromName('cron1')).status('cron1')
     assert.ok(second !== undefined)
     assert.equal(
       second.startedAt,
-      firstStarted,
-      '⚠️ 今天已跑完同一计划的账号不得被重复入队 —— 否则 growth 会再烧一遍配额',
+      succeededStarted,
+      '⚠️ 今天已成功跑完同一计划的账号不得被重复入队 —— 否则 growth 会再烧一遍配额',
     )
   } finally {
     console.log = originalLog
