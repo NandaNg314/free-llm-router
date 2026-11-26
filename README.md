@@ -40,23 +40,24 @@
 
 ### 网关
 
-- **双协议原生入口**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（含 `/v1/messages/count_tokens`），支持流式、非流式、思考链和工具调用。数据面同时支持 `Authorization: Bearer <key>` 与 `x-api-key: <key>` 鉴权，并支持通过 `CORS_ORIGINS`（或面板配置页）控制跨域白名单。
-- **出站自动修正与续写救援**：工具调用配对断裂与跨轮重排、工具参数 Schema 归一化、Responses 结构化输出与 `reasoning.encrypted_content` 签名回传、Anthropic 工具内嵌图片与 `cache_read_input_tokens` 精确扣除均在网关内完成；支持可选开启流式截断自动续写与 Agent 预告句悬停救援（`AUTO_CONTINUATION=true`）。
+- **双协议原生入口**：`/v1/models`、`/v1/balance-summary`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（含 `/v1/messages/count_tokens`），支持流式、非流式、思考链和工具调用。数据面同时支持 `Authorization: Bearer <key>` 与 `x-api-key: <key>` 鉴权（只读额度汇总 `/v1/balance-summary` 另支持 `?key=` 供状态栏小组件调用），并支持通过 `CORS_ORIGINS`（或面板配置页）控制跨域白名单。
+- **出口感知统一模型映射**：支持在面板或 `/admin/config/unified-models` 自定义对外统一模型别名（如 `claude-sonnet`、`coder-pro`），按当前在线可用供应商出口自动解析到底层真实模型 ID，并仅在至少有一个目标出口在线时向 `/v1/models` 宣告。
+- **出站自动修正与续写救援**：工具调用配对断裂/重复结果去重与跨轮重排、工具参数 Schema 归一化、超长首行计费头精准剥离与客户端指纹消毒、Responses 结构化输出与 `reasoning.encrypted_content` 签名回传、Anthropic 工具内嵌图片与 `cache_read_input_tokens` 精确扣除均在网关内完成；支持可选开启流式截断自动续写与 Agent 预告句悬停救援（`AUTO_CONTINUATION=true`）。
 - **16 家供应商**：Buddy、WorkBuddy、Cline、MiniMax、CodeArts、LobsterAI、TRAE、Qoder（国内 / 国际）、OpenCode、Raccoon、ZCode、Loomy、Gemini（OAuth + API Key）、Meoo、ModelScope（魔搭社区）。
 
 ### 账号池
 
-- **自动调度与 Pro 专属模型分层**：默认先用积分最早到期的账号；针对 Pro 付费专属模型优先挑选付费档账号（无付费号时自动兜底）；按调用方作用域（`user` / `metadata.user_id` / 子密钥 ID）隔离会话粘性槽位。
-- **冷却与熔断**：账号级 / 模型级分开；`11140` 区域波次闸门按号池规模动态缩放阈值并支持指数退避与平静期清零；国内版全部不可用时自动切国际版。
+- **自动调度、Pro 分层与免费模型保底豁免**：默认先用积分最早到期的账号；针对 Pro 付费专属模型优先挑选付费档账号（无付费号时自动兜底）；已确认 `0` 倍率免费模型自动豁免「永久积分锁」保留线；按调用方作用域（`user` / `metadata.user_id` / 子密钥 ID）隔离会话粘性槽位。
+- **冷却、熔断与认证自愈**：账号级 / 模型级分开；`11140` 区域波次闸门按号池规模动态缩放阈值并支持指数退避与平静期清零；区分临时限流与明确需重登（`needsRelogin`），重登/导入凭据自动清除异常标记；国内版全部不可用时自动切国际版。
 - **聚合模型**：`aggregate/<模型名>` 把多家的同一个模型归到一起，优先走积分最快作废的渠道，失败自动换下一家。
-- **多账号登录**：面板里设备码、扫码、短信登录，或粘贴凭据 / API Key 导入（自动识别是哪一家）。
+- **多账号登录与批量运维**：面板里设备码、扫码、短信登录，或粘贴凭据 / API Key 导入（自动识别是哪一家），支持多选账号批量刷新余额与启停。
 
 ### 自动化
 
-- **每日签到**、**成长任务**（覆盖 `skill_share`、`Sequential_Tasks_1` / `Sequential_Tasks_2`、专家体验、模板、画布、连登兑换、抽奖、猫猫旅行等全套任务）。
+- **每日签到与随机错峰排程**：覆盖 `skill_share`、`Sequential_Tasks_1` / `Sequential_Tasks_2`、专家体验、模板、画布、连登兑换、抽奖、猫猫旅行等全套成长任务；可选开启国内福利随机错峰窗口（`cnTaskJitter`，在 `08:00–10:00` 按账号确定性分散执行）。
 - **运营活动查询与领奖**：内置 `/admin/campaign` 与 `/admin/campaign/claim`（默认 `dryRun: true` 安全预演，确认后一键领取星巴克等运营活动奖励）。
 - **国际版每日活跃**：自动跑完网页端 agent 会话（这是国际版拿积分的唯一方式）。
-- **后台维护**：每小时续期凭据、刷新余额、清理会话；到期时间未知的凭据也会保活。
+- **后台维护与启动温和预热**：每小时续期凭据、刷新余额、清理会话（到期时间未知的凭据也会保活）；Node 服务启动 20 秒后自动对陈旧账号按 2 秒间隔串行温和预热余额快照（可通过 `WARM_START_BALANCE=false` 关闭）。
 
 ### 媒体能力与混元 3D
 
@@ -70,8 +71,8 @@
 
 ### 管理与安全
 
-- **子密钥**：给不同工具各发一把 Key（兼容 Bearer 与 `x-api-key`），可限制请求数、token 数、可用模型（含 `/v1/messages` 与媒体/3D 路由）、来源 IP（CIDR）、过期时间。
-- **管理面板**：8 个视图（含 3D 生成工作台与数据面 CORS 配置），深浅主题，手机可用；默认注入 `X-Robots-Tag: noindex, nofollow` 防搜索引擎收录，严格 CSP。
+- **子密钥**：给不同工具各发一把 Key（兼容 Bearer 与 `x-api-key`），可限制请求数、token 数、可用模型（含统一模型别名、`/v1/messages`、`/v1/balance-summary` 与媒体/3D 路由）、来源 IP（CIDR）、过期时间。
+- **管理面板**：9 个视图（新增内置流式「对话试炼场」、`⌘K / Ctrl+K` 全局命令面板、二级分组即时搜索配置页、Live Tail 日志与请求诊断抽屉），深浅主题，手机可用；默认注入 `X-Robots-Tag: noindex, nofollow` 防搜索引擎收录，严格 CSP。
 - **凭据加密**：AES-GCM 落盘，密钥不进数据库（除非你选择自动生成）。
 
 ## 两种部署形态
@@ -292,24 +293,26 @@ curl -X POST http://127.0.0.1:11451/v1/tools/search_fetch -H "Authorization: Bea
 
 ## 管理面板
 
-8 个视图：
+9 个视图（支持 `⌘K` / `Ctrl+K` 全局命令面板快速检索页面与模型）：
 
 | 视图 | 内容 |
 |---|---|
-| 供应商与账号 | 账号池健康度、每家供应商的账号与能力、单号运维与账号清单导出 |
+| 供应商与账号 | 账号池健康度、每家供应商的账号与能力、多选批量运维与账号清单导出 |
 | 用量 | 请求量、token、成功率，按模型和账号拆分 |
-| 任务中心 | 签到、成长任务、限时补偿；**自动调度开关** |
+| 日志 | 一体化过滤工作台、Live Tail 实时流与右侧滑出式请求诊断抽屉 |
+| 对话试炼场 | 内置 OpenAI / Anthropic 双协议多轮流式对话、思考链折叠与首字延迟/吞吐遥测 |
 | 媒体与检索 | 生图 / 改图 / 视频 / 语音（TTS·ASR） / 混元 3D 生成 / 联网检索 / 抓网页 |
+| 任务中心 | 签到、成长任务、限时补偿；**自动调度与错峰开关** |
 | API Key | 子密钥签发与管理 |
-| 模型 | 模型目录、启停、单模型资费探测 |
-| 配置 | 接入指南、路由策略、流式自动续写、数据面 CORS、永久积分锁 |
-| 日志 | 最近的请求与任务记录 |
+| 模型 | 模型目录、启停、单模型资费探测、一键跳转对话试炼场 |
+| 配置 | 分组可搜索配置中心：接入指南、路由策略、统一模型映射、流式续写、防封与错峰、CORS、永久积分锁 |
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/v1/models` | 模型目录 |
+| GET | `/v1/models` | 模型目录（含聚合模型与在线出口统一模型别名） |
+| GET | `/v1/balance-summary` | 轻量只读缓存额度汇总（按 Key 权限范围聚合，支持 `?key=`） |
 | POST | `/v1/chat/completions` | 对话（OpenAI 格式） |
 | POST | `/v1/responses` | OpenAI Responses API |
 | POST | `/v1/messages` | Anthropic Messages API（兼容 `x-api-key`） |
@@ -332,6 +335,7 @@ curl -X POST http://127.0.0.1:11451/v1/tools/search_fetch -H "Authorization: Bea
 | GET | `/admin/campaign` | 查询国内个人版账号运营活动进度 |
 | POST | `/admin/campaign/claim` | 批量预演或领取运营活动奖励（默认 `dryRun: true`） |
 | GET / POST | `/admin/config/cors` | 读取或热更新数据面 CORS 白名单 |
+| GET / POST | `/admin/config/unified-models` | 读取或热更新出口感知统一模型映射 |
 | GET | `/version` | 版本号 |
 | GET | `/healthz` | 存活探针 |
 

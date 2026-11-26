@@ -22,6 +22,7 @@ import {
   Timer,
   Trash2,
   Users,
+  X,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
 import { PageHeader } from '@/components/layout/PageHeader'
@@ -46,6 +47,8 @@ import {
   fetchAccountInventorySnapshot,
   pinModeOf,
   useAccounts,
+  useBatchRefreshBalance,
+  useBatchToggleAccounts,
   usePins,
   usePool,
   useProviders,
@@ -115,9 +118,20 @@ export function ProvidersPage() {
     return (accounts.data ?? []).filter((a) => {
       const s = accountStatus(a)
       if (filter === 'ok' && s !== 'ok') return false
-      // ⚠️ 「有问题」必须覆盖全部非正常态，否则新加的状态会变成「孤儿」：
-      // 面板上明明标红，用户点「有问题」却筛不到它。
-      if (filter === 'issue' && !(s === 'cooling' || s === 'breaker' || s === 'model' || s === 'degraded' || s === 'restricted')) return false
+      // ⚠️ 「有问题」必须覆盖全部非正常态（含需重登与额度耗尽），且不混同于手动停用
+      if (
+        filter === 'issue' &&
+        !(
+          s === 'cooling' ||
+          s === 'credit_exhausted' ||
+          s === 'breaker' ||
+          s === 'model' ||
+          s === 'degraded' ||
+          s === 'restricted' ||
+          s === 'relogin'
+        )
+      )
+        return false
       if (filter === 'disabled' && s !== 'disabled') return false
       return !kw || `${a.nickname} ${a.uid} ${a.provider}`.toLowerCase().includes(kw)
     })
@@ -290,7 +304,7 @@ export function ProvidersPage() {
                 options={[
                   { value: 'all', label: '全部' },
                   { value: 'ok', label: '正常' },
-                  { value: 'issue', label: '冷却' },
+                  { value: 'issue', label: '有问题' },
                   { value: 'disabled', label: '停用' },
                 ]}
               />
@@ -508,8 +522,10 @@ function HealthBar({ list }: { list: Account[] }) {
   const color: Record<AccountStatus, string> = {
     ok: 'bg-success',
     cooling: 'bg-warning',
+    credit_exhausted: 'bg-warning',
     model: 'bg-warning',
     degraded: 'bg-warning',
+    relogin: 'bg-warning',
     breaker: 'bg-danger',
     restricted: 'bg-danger',
     disabled: 'bg-muted-foreground/30',
@@ -548,6 +564,8 @@ export function AccountsTable({
   const toggle = useToggleAccount()
   const remove = useRemoveAccount()
   const balance = useRefreshBalance()
+  const batchToggle = useBatchToggleAccounts()
+  const batchBalance = useBatchRefreshBalance()
   const clearCd = useClearCooldowns()
   const probe = useProbeAccount()
   const pins = usePins()
@@ -556,6 +574,32 @@ export function AccountsTable({
   const [confirm, setConfirm] = useState<Account | null>(null)
   /** 正在编辑防封设置的账号（null = 弹窗关闭）。 */
   const [safetyFor, setSafetyFor] = useState<Account | null>(null)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+
+  const selectable = !compact
+  const selectedAccounts = useMemo(
+    () => (selectable ? rows.filter((a) => selected.has(`${a.realm}:${a.uid}`)) : []),
+    [rows, selectable, selected],
+  )
+  const allSelected = selectable && rows.length > 0 && selectedAccounts.length === rows.length
+  const someSelected = selectable && selectedAccounts.length > 0 && !allSelected
+
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelected(new Set())
+    } else {
+      setSelected(new Set(rows.map((a) => `${a.realm}:${a.uid}`)))
+    }
+  }
+
+  const toggleSelectOne = (rowKey: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(rowKey)) next.delete(rowKey)
+      else next.add(rowKey)
+      return next
+    })
+  }
 
   const pinTo = (a: Account, mode: PinMode | null) => {
     const s = accountStatus(a)
@@ -596,28 +640,80 @@ export function AccountsTable({
 
   return (
     <>
+      {selectable && selectedAccounts.length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t bg-black/[0.02] px-4 py-2.5 dark:bg-white/[0.03]">
+          <div className="flex items-center gap-2 text-xs">
+            <span className="bg-primary/10 text-primary tabular inline-flex h-6 items-center rounded-md px-2 font-sans font-semibold tabular-nums">
+              已选 {fmtInt(selectedAccounts.length)} 个账号
+            </span>
+            <span className="text-muted-foreground hidden md:inline">可一键同步余额或批量变更启用状态</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2.5 text-xs"
+              disabled={batchBalance.isPending || batchToggle.isPending}
+              onClick={() => batchBalance.mutate(selectedAccounts)}
+            >
+              {batchBalance.isPending ? <Loader2 className="animate-spin" strokeWidth={1.75} /> : <RefreshCw strokeWidth={1.75} />}
+              批量刷余额
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2.5 text-xs"
+              disabled={batchToggle.isPending || batchBalance.isPending}
+              onClick={() => batchToggle.mutate({ accounts: selectedAccounts, disabled: false }, { onSuccess: () => setSelected(new Set()) })}
+            >
+              <CheckCircle2 strokeWidth={1.75} />
+              批量启用
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2.5 text-xs"
+              disabled={batchToggle.isPending || batchBalance.isPending}
+              onClick={() => batchToggle.mutate({ accounts: selectedAccounts, disabled: true }, { onSuccess: () => setSelected(new Set()) })}
+            >
+              <Ban strokeWidth={1.75} />
+              批量停用
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={() => setSelected(new Set())}
+            >
+              <X strokeWidth={1.75} />
+              取消选择
+            </Button>
+          </div>
+        </div>
+      )}
+
       <Table>
-        <THead>
+        <THead sticky={!compact}>
           <tr>
+            {selectable && (
+              <TH className="w-9 pr-0">
+                <input
+                  type="checkbox"
+                  aria-label="全选当前列表账号"
+                  checked={allSelected}
+                  ref={(el) => {
+                    if (el) el.indeterminate = someSelected
+                  }}
+                  onChange={toggleSelectAll}
+                  className="accent-primary size-4 cursor-pointer rounded align-middle"
+                />
+              </TH>
+            )}
             <TH>账号</TH>
             {providerName && <TH className="hidden md:table-cell">供应商</TH>}
-            {/*
-              列宽纪律（2026-11-07 桌面端修横向滚动）：
-
-              改前 `min-w-[152px]` + `min-w-[112px]` 让 7 列合计 **1120px**，
-              而容器在 1440px 屏上只有 740px ⇒ 用户必须横向拖动才能看到
-              「积分」和操作按钮，桌面端白留一大片空白。
-
-              ⇒ 状态列靠内容自适应（模型明细本身已 `whitespace-nowrap`），
-                积分列去掉硬下限，交给 `w-full` 的账号列吸收剩余宽度。
-            */}
             <TH>状态</TH>
             <TH className="text-right">积分</TH>
-            {!compact && <TH className="hidden text-right lg:table-cell">成功 / 失败</TH>}            {/*
-              `compact` = 供应商抽屉。抽屉最窄只有半屏（1280px 屏上 640px），
-              「最近成功」是可牺牲的一列 —— 抽屉里用户关心的是「哪些号还能用」，
-              不是「上次什么时候成功」。窄屏下隐藏它，让操作列不用横向滚动。
-            */}
+            {!compact && <TH className="hidden text-right lg:table-cell">成功 / 失败</TH>}
             <TH className={compact ? 'hidden 2xl:table-cell' : 'hidden sm:table-cell'}>最近成功</TH>
             <TH className="w-10" />
           </tr>
@@ -626,38 +722,44 @@ export function AccountsTable({
           {rows.map((a) => {
             const s = accountStatus(a)
             const meta = STATUS_META[s]
-            // ⚠️ 封号 / 降权 / 模型限流都要给出「什么时候恢复、还剩多久」，否则用户只能猜
             const recovery = recoveryText(a, s)
             const hint =
               s === 'disabled'
                 ? a.reason
-                : s === 'restricted'
-                  ? `上游封号，${recovery}`
-                  : s === 'degraded'
-                    ? `降权中，${recovery}`
-                    : s === 'model'
-                      ? `模型限流，${recovery}`
-                      : s === 'cooling' || s === 'breaker'
-                        ? recovery
-                        : ''
+                : s === 'relogin'
+                  ? a.reloginReason || a.reason || '登录凭据已失效，请重新登录'
+                  : s === 'credit_exhausted'
+                    ? `额度耗尽（次日 04:00 恢复）${recovery ? ` · ${recovery}` : ''}`
+                    : s === 'restricted'
+                      ? `上游封号，${recovery}`
+                      : s === 'degraded'
+                        ? `降权中，${recovery}`
+                        : s === 'model'
+                          ? `模型限流，${recovery}`
+                          : s === 'cooling' || s === 'breaker'
+                            ? recovery
+                            : ''
             const mode = pinModeOf(a, pins.data)
+            const rowKey = `${a.realm}:${a.uid}`
+            const isChecked = selectable && selected.has(rowKey)
             return (
-              <TR key={a.realm + a.uid} className="group">
+              <TR key={a.realm + a.uid} className={cn('group', isChecked && 'bg-primary/[0.04]')}>
+                {selectable && (
+                  <TD className="w-9 pr-0">
+                    <input
+                      type="checkbox"
+                      aria-label={`选择账号 ${a.nickname || a.uid}`}
+                      checked={isChecked}
+                      onChange={() => toggleSelectOne(rowKey)}
+                      className="accent-primary size-4 cursor-pointer rounded align-middle"
+                    />
+                  </TD>
+                )}
                 <TD>
                   <div className="flex items-center gap-1.5 font-medium">
                     <span className="truncate">{a.nickname || '未命名'}</span>
                     {mode && <PinBadge mode={mode} />}
                   </div>
-                  {/*
-                    UID 一律单行截断（2026-11-07）。
-
-                    改前 `sm:max-w-none` 在桌面端放开了宽度，36 字符的 UUID
-                    把「账号」列撑到 **327px**，7 列合计 1131px 塞进 740px 容器
-                    ⇒ 桌面端反而要横向拖动才看得到「积分」和操作按钮。
-
-                    ⇒ 桌面 `max-w-[220px]`（足够看清前缀区分账号），手机 `150px`；
-                      完整值始终在 `title` 里，悬停即见。
-                  */}
                   <div className="flex items-center gap-2">
                     <div
                       className={`text-muted-foreground truncate font-mono text-[11.5px] ${
@@ -667,16 +769,6 @@ export function AccountsTable({
                     >
                       {a.uid}
                     </div>
-                    {/*
-                      「探测」不占垂直空间，桌面端悬停才显形（2026-11-07）。
-
-                      改前它独占一行，11 个账号因此多出约 220px 高度，
-                      表格滚一屏只看得见 7 行。现在收进 UID 同一行：
-                      桌面端 `sm:opacity-0 sm:group-hover:opacity-100` 悬停出现，
-                      手机端保持常显 —— 触屏没有 hover，藏起来就点不到了。
-
-                      ⚠️ 会真实打一次上游（消耗极少配额），故只在点击时触发。
-                    */}
                     <button
                       type="button"
                       aria-label="探测该账号当前是否可用"
@@ -698,27 +790,19 @@ export function AccountsTable({
                   </TD>
                 )}
                 <TD className="whitespace-nowrap md:px-2">
-                  <Badge tone={meta.tone} dot>
+                  <Badge
+                    tone={meta.tone}
+                    dot
+                    title={s === 'credit_exhausted' ? '额度耗尽（次日 04:00 恢复）' : hint || undefined}
+                  >
                     {meta.label}
-                  </Badge>                  {/*
-                    模型级冷却明细。
-
-                    ## 排版纪律（2026-11-07 修 UI 挤压）
-                    第一版用了 `flex max-w-52` + `truncate`，在窄屏把
-                    「kimi-k3.1-pro」截成「kimi…」、倒计时被挤到下一行折成
-                    「1 小时 18 / 分」—— 完全看不清。
-
-                    ⇒ 改成**单行制表**：模型名给定宽度 `w-[104px]`（足够放下
-                    `kimi-k3.1-pro` 这类最长 id），倒计时用 `w-[58px] right-0`
-                    右对齐、`whitespace-nowrap` 绝不折行。整块 `whitespace-nowrap`
-                    保证父级不会把两段拆开。
-                  */}
+                  </Badge>
                   {(() => {
                     const now = Date.now()
                     const active = (a.modelCooldowns ?? []).filter((m) => m.until > now)
                     if (active.length === 0) {
                       return hint ? (
-                        <div className="text-muted-foreground mt-1 max-w-52 whitespace-nowrap text-[11.5px]" title={hint}>
+                        <div className="text-muted-foreground mt-1 max-w-52 truncate whitespace-nowrap text-[11.5px]" title={hint}>
                           {hint}
                         </div>
                       ) : null
@@ -748,14 +832,6 @@ export function AccountsTable({
                       </ul>
                     )
                   })()}
-                  {hint && (a.modelCooldowns ?? []).filter((m) => m.until > Date.now()).length === 0 && (
-                    // ⚠️ 加了「还剩 X」倒计时后这条提示会变长（如「上游封号，11/22 12:30恢复（还剩 7 分钟）」），
-                    // 原来的 `max-w-32` 会把倒计时整段截掉 ⇒ 等于没加。故放宽一档并补 `title`，
-                    // 极窄屏仍能悬停看到全文。
-                    <div className="text-muted-foreground mt-1 max-w-52 whitespace-nowrap text-[11.5px]" title={hint}>
-                      {hint}
-                    </div>
-                  )}
                 </TD>
                 <TD className="tabular text-right whitespace-nowrap">
                   <div className="font-medium text-foreground tabular-nums">{fmtInt(a.credits)}</div>
@@ -780,14 +856,6 @@ export function AccountsTable({
                     <span className="text-foreground">{fmtInt(a.successCount)}</span> / {fmtInt(a.errTotal)}
                   </TD>
                 )}
-                {/*
-                  ⚠️ 手机端**整列隐藏**（2026-11-07）。
-                  改前用的是 `hidden sm:table-cell`，而 sm=640px，390px 的手机上本就该隐藏 ——
-                  但它仍然是表格里的一个 `<td>`，colgroup 未定义时浏览器会按内容给列分配宽度，
-                  于是这列把表格撑到 612px（视口只有 390px），导致整页横向溢出 240px。
-                  现在靠表格外层 `overflow-x-auto` 兜住（见 Table 组件），
-                  同时这一列在手机上不参与布局。
-                */}
                 <TD className={`text-muted-foreground hidden whitespace-nowrap ${compact ? '2xl:table-cell' : 'sm:table-cell'}`}>{fmtRelative(a.lastSuccess)}</TD>
                 <TD>
                   <Menu>
@@ -817,7 +885,7 @@ export function AccountsTable({
                           <RefreshCw /> 刷新余额
                         </MenuItem>
                       )}
-                      {(s === 'cooling' || s === 'breaker' || s === 'model' || s === 'degraded' || s === 'restricted') && (
+                      {(s === 'cooling' || s === 'credit_exhausted' || s === 'breaker' || s === 'model' || s === 'degraded' || s === 'restricted') && (
                         <MenuItem onSelect={() => clearCd.mutate({ uid: a.uid, realm: a.realm })}>
                           <Snowflake /> 清除冷却
                         </MenuItem>

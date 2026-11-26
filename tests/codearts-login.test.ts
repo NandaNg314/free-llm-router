@@ -27,19 +27,27 @@ import assert from 'node:assert/strict'
 import {
   buildCodeArtsCallbackUrl,
   buildCodeArtsLoginUrl,
+  classifyCodeArtsError,
+  CodeArtsAuthError,
+  codeartsProvider,
   codeArtsTicketCredentialToProvider,
+  CODEARTS_EXPIRING_WINDOW_MS,
   CODEARTS_LOGIN_BASE,
   CODEARTS_LOGIN_CALLBACK_PATH,
   CODEARTS_LOGIN_PLUGIN_NAME,
   CODEARTS_LOGIN_PLUGIN_VERSION,
   CODEARTS_LOGIN_STATE_TTL_MS,
   CODEARTS_TICKET_ENDPOINT,
+  extractCodeArtsBalance,
   fetchCodeArtsTicket,
   generateCodeArtsLoginState,
   HUAWEI_AUTH_BASE,
+  isCodeArtsAuthFailure,
+  isCodeArtsNeedsReloginError,
   parseCodeArtsTicketResponse,
   pollCodeArtsTicket,
   readCodeArtsTicketError,
+  resetCodeArtsRefreshState,
   type CodeArtsTicketMaterial,
 } from '../src/providers/codearts.ts'
 import { findProvider } from '../src/providers/index.ts'
@@ -482,3 +490,186 @@ test('⚠️ 登录 URL 必须把我们的 callback 原样带上', () => {
   assert.ok(loginUrl.startsWith(`${HUAWEI_AUTH_BASE}?service=`), 'service 必须指向 redirectUrl')
   assert.ok(loginUrl.includes(encodeURIComponent(redirectUrl)), 'redirectUrl 必须整体编码进 service')
 })
+
+// ─────────────────── ⑧ v2.2.4 PR #35/#36：临期积分提取、精准鉴权分类与单飞续期 ───────────────────
+
+test('PR #35：extractCodeArtsBalance 兼容 metrics.package_credit_expiring_amount 与 7 天到期套餐包列表', () => {
+  const now = Date.parse('2026-11-26T00:00:00Z')
+  const in3Days = now + 3 * 24 * 60 * 60 * 1000
+  const in5Days = now + 5 * 24 * 60 * 60 * 1000
+  const in20Days = now + 20 * 24 * 60 * 60 * 1000
+  const expiredYesterday = now - 24 * 60 * 60 * 1000
+
+  // 形态 A：华为 statistics/plugin 在 metrics[] 中直接返回 package_credit_expiring_amount
+  const fromMetrics = extractCodeArtsBalance(
+    {
+      metrics: [
+        {
+          name: 'usageTotalPackageCredit',
+          package_credit_amount: 1000,
+          package_credit_remain: 680.5,
+          package_credit_expiring_amount: 180.25,
+        },
+        {
+          name: 'usageBonusPackageCredit',
+          package_credit_amount: 300,
+          package_credit_remain: 180.25,
+          package_credit_expiring_amount: 180.25,
+          expire_time: new Date(in3Days).toISOString(),
+        },
+        {
+          name: 'usageBasicPackageCredit',
+          package_credit_amount: 700,
+          package_credit_remain: 500.25,
+          expire_time: new Date(in20Days).toISOString(),
+        },
+      ],
+    },
+    now,
+  )
+  assert.equal(fromMetrics.total, 680.5)
+  assert.equal(fromMetrics.expiring, 180.25)
+  assert.equal(fromMetrics.earliestExpiry, in3Days)
+  assert.equal(fromMetrics.packages.length, 3)
+
+  // 形态 B：逐包明细列表（汇总 7 天内未过期包，跳过已过期与 >7 天远期包，并钳制 expiring <= total）
+  assert.equal(CODEARTS_EXPIRING_WINDOW_MS, 7 * 24 * 60 * 60 * 1000)
+  const fromPkgList = extractCodeArtsBalance(
+    {
+      package_list: [
+        { package_name: '每日签到包', remain_amount: 50, expire_time: Math.floor(in5Days / 1000) },
+        { package_name: '活动赠送包', remain_amount: 120, expire_time: new Date(in3Days).toISOString() },
+        { package_name: '月度基础包', remain_amount: 800, expire_time: new Date(in20Days).toISOString() },
+        { package_name: '历史过期包', remain_amount: 999, expire_time: new Date(expiredYesterday).toISOString() },
+      ],
+    },
+    now,
+  )
+  assert.equal(fromPkgList.total, 970)
+  assert.equal(fromPkgList.expiring, 170)
+  assert.equal(fromPkgList.earliestExpiry, in3Days, '最早到期时间应取 3 天后那包')
+})
+
+test('PR #34/#36：classifyCodeArtsError 严防非 401 响应体含 "401" 误判，并精准区分瞬时网关错误与 needsRelogin', () => {
+  // 1) HTTP 429 / 400 的 requestId 或错误码碰巧包含数字 "401" ⇒ 绝不能误判为鉴权失败！
+  const rateWith401RequestId = JSON.stringify({
+    error_code: 'APIG.0201',
+    error_msg: 'Too Many Requests',
+    request_id: 'a8f4019c-4010-4b11-9401-deadbeef0401',
+  })
+  assert.equal(isCodeArtsAuthFailure(429, rateWith401RequestId), false)
+  assert.equal(classifyCodeArtsError(rateWith401RequestId, 429).category, 'rate_limited')
+
+  const badReq14018 = JSON.stringify({ code: 14018, message: 'invalid parameter at index 401' })
+  assert.equal(isCodeArtsAuthFailure(400, badReq14018), false)
+  assert.equal(classifyCodeArtsError(badReq14018, 400).category, 'bad_request')
+
+  // 2) TM.00001041 并发会话上限（HTTP 400）⇒ rate_limited，不续期、不重登
+  const concurrentFull = classifyCodeArtsError('{"error_code":"TM.00001041","error_msg":"并发会话已达上限"}', 400)
+  assert.equal(concurrentFull.category, 'rate_limited')
+  assert.equal(concurrentFull.isAuthError, false)
+  assert.equal(concurrentFull.needsRelogin, false)
+
+  // 3) HTML 502 与 InvalidDPoPHeader ⇒ gateway_transient（可重试，绝不标 needsRelogin）
+  const html502 = classifyCodeArtsError('<html><body>502 Bad Gateway</body></html>', 502)
+  assert.equal(html502.category, 'gateway_transient')
+  assert.equal(html502.isAuthError, false)
+  assert.equal(html502.needsRelogin, false)
+
+  const dpopSkew = classifyCodeArtsError('HTTP 401: InvalidDPoPHeader proof clock skew', 401)
+  assert.equal(dpopSkew.category, 'gateway_transient')
+  assert.equal(dpopSkew.isAuthError, false)
+  assert.equal(dpopSkew.needsRelogin, false)
+  assert.equal(dpopSkew.retryable, true)
+
+  // 4) 常规 401 / APIG.0301 ⇒ auth_expired（应触发 refresh，暂不直接标 needsRelogin）
+  const apig401 = classifyCodeArtsError('{"error_code":"APIG.0301","error_msg":"verify ak sk signature fail"}', 401)
+  assert.equal(apig401.category, 'auth_expired')
+  assert.equal(apig401.isAuthError, true)
+  assert.equal(apig401.needsRelogin, false)
+
+  // 5) refresh_token 已失效 / STS5.1806 / invalid_grant ⇒ relogin_required（needsRelogin=true）
+  for (const fatal of [
+    '{"error":"invalid_grant","error_description":"refresh token expired"}',
+    '{"error_code":"STS5.1806","error_msg":"the refresh token has been used"}',
+    new CodeArtsAuthError({
+      message: 'CodeArts 登录态已过期（ExpiredRefreshToken）',
+      needsRelogin: true,
+      category: 'relogin_required',
+      retryable: false,
+    }),
+  ]) {
+    const res = classifyCodeArtsError(fatal, 400)
+    assert.equal(res.category, 'relogin_required')
+    assert.equal(res.needsRelogin, true)
+    assert.equal(isCodeArtsNeedsReloginError(fatal), true)
+  }
+})
+
+test('PR #36：codeartsProvider.refresh 按账号 singleflight 并发合并 + 刚轮换旧 token 短路复用（全 mock 零真实请求）', async () => {
+  resetCodeArtsRefreshState()
+  const keyPair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])
+  const privateJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey)
+
+  const staleCred = {
+    provider: 'codearts',
+    uid: 'ca-singleflight-user',
+    nickname: '测试码道号',
+    realm: 'cn' as const,
+    accessToken: 'ST-OLD-1',
+    refreshToken: 'RT-SINGLE-USE-1',
+    expiresAt: Date.now() - 1000,
+    extras: {
+      ak: 'AK-OLD-1',
+      sk: 'SK-OLD-1',
+      codeVerifier: 'pkce-code-verifier-xyz',
+      dpopPrivateKeyJwk: JSON.stringify(privateJwk),
+    },
+  }
+
+  let stsHits = 0
+  const prevFetch = globalThis.fetch
+  globalThis.fetch = (async () => {
+    stsHits += 1
+    // 模拟真实网络往返，确保 3 个并发 refresh 同时挂在同一趟在途 Promise 上
+    await new Promise((r) => setTimeout(r, 25))
+    if (stsHits > 1) {
+      return jsonResponse({ error_code: 'STS5.1806', error_msg: 'the refresh token has been used' }, 400)
+    }
+    return jsonResponse({
+      refresh_token: 'RT-ROTATED-2',
+      credentials: {
+        access_key_id: 'AK-NEW-2',
+        secret_access_key: 'SK-NEW-2',
+        security_token: 'ST-NEW-2',
+        expiration: '2030-06-01T00:00:00Z',
+      },
+    })
+  }) as unknown as typeof fetch
+
+  try {
+    assert.ok(codeartsProvider.refresh !== undefined)
+    const ac = new AbortController()
+
+    // ① 3 个并发调用同时带着同一份单次 refresh_token 进入：只允许打 1 次 STS！
+    const [r1, r2, r3] = await Promise.all([
+      codeartsProvider.refresh!(staleCred, ac.signal),
+      codeartsProvider.refresh!(staleCred, ac.signal),
+      codeartsProvider.refresh!(staleCred, ac.signal),
+    ])
+    assert.equal(stsHits, 1, '并发 singleflight 必须只发起 1 次真实 STS 换新')
+    assert.equal(r1.accessToken, 'ST-NEW-2')
+    assert.equal(r2.accessToken, 'ST-NEW-2')
+    assert.equal(r3.refreshToken, 'RT-ROTATED-2')
+
+    // ② 同一波 401 里稍晚 5ms 才带着旧 token 进来的第 4 个请求：直接命中短期轮换缓存，不触发 STS5.1806！
+    const r4 = await codeartsProvider.refresh!(staleCred, ac.signal)
+    assert.equal(stsHits, 1, '短期窗口内持已轮换旧 token 的请求必须直接复用新凭据')
+    assert.equal(r4.accessToken, 'ST-NEW-2')
+    assert.equal(r4.extras.ak, 'AK-NEW-2')
+  } finally {
+    globalThis.fetch = prevFetch
+    resetCodeArtsRefreshState()
+  }
+})
+

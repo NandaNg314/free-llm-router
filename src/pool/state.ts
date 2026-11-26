@@ -290,6 +290,17 @@ export interface AccountState {
    * ⚠️ 与 {@link safetyOverride} 同一纪律：未知时不落盘空键，避免将「未观测」误序列化成布尔值。
    */
   isPaid?: boolean
+  /**
+   * 凭据刷新链路已明确失效（如一次性 `refresh_token` 作废或缺少续期材料），需用户重新登录授权。
+   *
+   * ⚠️ 与手动停用 {@link disabled} **严格正交**：
+   * - `disabled` 表示管理员在面板**主动停用**（刷新凭据不会擅自重新启用）；
+   * - `needsRelogin` 表示账号因凭据彻底失效暂停派发，一旦凭据刷新成功或重登导入即**自动清零**恢复健康！
+   * - 未处于待重登状态时省略该键（不写 `undefined` 死键）。
+   */
+  needsRelogin?: boolean
+  /** 待重新登录的具体原因说明（仅在 `needsRelogin === true` 时携带）。 */
+  reloginReason?: string
 }
 
 /**
@@ -330,6 +341,9 @@ export function createAccountState(input: {
   provider?: string
   /** 可选付费状态（仅在已明确观测为 `boolean` 时写入；未知保持省略）。 */
   isPaid?: boolean
+  /** 可选待重登标记（仅在显式 `true` 时写入；正常状态保持省略）。 */
+  needsRelogin?: boolean
+  reloginReason?: string
 }): AccountState {
   return {
     uid: input.uid,
@@ -362,10 +376,14 @@ export function createAccountState(input: {
     creditsExpiring: 0,
     creditsEarliestExpiry: 0,
     samples: [],
-    // ⚠️ 刻意**不**初始化 `safetyOverride: {}` / `isPaid: undefined`：
-    // `undefined` 在语义上表示「沿用全局 / 尚未观测」，只有省略键才不会让
+    // ⚠️ 刻意**不**初始化 `safetyOverride: {}` / `isPaid: undefined` / `needsRelogin: undefined`：
+    // `undefined` 在语义上表示「沿用全局 / 尚未观测 / 无需重登」，只有省略键才不会让
     // `normalizeAccountState` 出现值为 `undefined` 的死键。
     ...(typeof input.isPaid === 'boolean' ? { isPaid: input.isPaid } : {}),
+    ...(input.needsRelogin === true ? { needsRelogin: true } : {}),
+    ...(input.needsRelogin === true && typeof input.reloginReason === 'string' && input.reloginReason.trim() !== ''
+      ? { reloginReason: input.reloginReason.trim() }
+      : {}),
   }
 }
 
@@ -479,6 +497,10 @@ export function normalizeAccountState(raw: unknown): AccountState | undefined {
       ? { safetyOverride: o.safetyOverride as SafetyOverride }
       : {}),
     ...(typeof o.isPaid === 'boolean' ? { isPaid: o.isPaid } : {}),
+    ...(o.needsRelogin === true ? { needsRelogin: true } : {}),
+    ...(o.needsRelogin === true && typeof o.reloginReason === 'string' && o.reloginReason.trim() !== ''
+      ? { reloginReason: o.reloginReason.trim() }
+      : {}),
   }
 }
 
@@ -522,6 +544,7 @@ export function hardCooldownActive(state: AccountState, now: number): boolean {
  */
 export function healthy(state: AccountState, now: number): boolean {
   if (state.disabled) return false
+  if (state.needsRelogin === true) return false
   if (isActive(state.until, now)) return false
   if (isActive(state.breakerUntil, now)) return false
   if (isActive(state.degradeUntil, now)) return false
@@ -529,6 +552,30 @@ export function healthy(state: AccountState, now: number): boolean {
   // 这条是上游**明确标记**过该账号，必须真的不派单，否则会持续撞同一堵墙。
   if (isActive(state.restrictedUntil, now)) return false
   return true
+}
+
+/**
+ * 免费零成本模型的健康判据（对标 `v2.2.2` PR #20）：
+ * - `disabled`、`needsRelogin`、`breaker`、`degrade`、`restricted` 以及 `soft` 限流冷却仍然拦截；
+ * - **唯一豁免**：因余额耗尽触发的 `hard` 冷却（积分保留线/零余额锁）不拦截免费模型，
+ *   因为确认零倍率的免费模型不扣减任何积分。
+ */
+export function healthyForFreeModel(
+  state: AccountState,
+  now: number,
+  model: string,
+  modelCooldownEnabled = true,
+): boolean {
+  if (state.disabled) return false
+  if (state.needsRelogin === true) return false
+  if (state.coolKind !== 'hard' && isActive(state.until, now)) return false
+  if (isActive(state.breakerUntil, now)) return false
+  if (isActive(state.degradeUntil, now)) return false
+  if (isActive(state.restrictedUntil, now)) return false
+  if (!modelCooldownEnabled || model === '') return true
+  const mc = state.modelCooldowns[model]
+  if (mc === undefined || mc.auditOnly) return true
+  return !isActive(mc.until, now)
 }
 
 /**
@@ -668,6 +715,9 @@ export interface AccountDiagnosis {
   }
   /** `AccountState.reason` 原文（上游/我们的最后一条原因）。 */
   reason: string
+  isPaid?: boolean
+  needsRelogin?: boolean
+  reloginReason?: string
 }
 
 /** 把毫秒转成人话（`42 秒` / `12 分钟` / `1 小时 58 分`）。 */
@@ -723,6 +773,7 @@ export function diagnoseAccount(state: AccountState, now: number): AccountDiagno
     .sort((a, b) => b.remainingMs - a.remainingMs)
 
   if (state.disabled) blockedBy.push('disabled')
+  if (state.needsRelogin === true) blockedBy.push('needs_relogin')
   if (accountCooldownRaw.active) blockedBy.push('account_cooldown')
   if (modelCooldowns.some((m) => m.active && !m.auditOnly)) blockedBy.push('model_cooldown')
   if (breaker.active) blockedBy.push('breaker')
@@ -742,6 +793,12 @@ export function diagnoseAccount(state: AccountState, now: number): AccountDiagno
   // 主因：取剩余时间最远的那个维度（恢复时刻由它决定）
   const candidates: Array<{ label: string; ms: number }> = []
   if (state.disabled) candidates.push({ label: '账号已停用', ms: Number.MAX_SAFE_INTEGER })
+  if (state.needsRelogin === true) {
+    candidates.push({
+      label: state.reloginReason ? `需重新登录（${state.reloginReason}）` : '需重新登录',
+      ms: Number.MAX_SAFE_INTEGER - 1,
+    })
+  }
   if (accountCooldownRaw.active) {
     const kindText = state.coolKind === 'hard' ? '余额耗尽' : '限流'
     candidates.push({ label: `账号冷却中（${kindText}），还剩 ${humanizeMs(accountCooldownRaw.remainingMs)}`, ms: accountCooldownRaw.remainingMs })
@@ -792,7 +849,124 @@ export function diagnoseAccount(state: AccountState, now: number): AccountDiagno
     },
     reason: state.reason,
     ...(typeof state.isPaid === 'boolean' ? { isPaid: state.isPaid } : {}),
+    ...(state.needsRelogin === true ? { needsRelogin: true } : {}),
+    ...(state.needsRelogin === true && typeof state.reloginReason === 'string' && state.reloginReason !== ''
+      ? { reloginReason: state.reloginReason }
+      : {}),
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 免费零成本模型确认与低余额保留线豁免（对标 `v2.2.2` PR #20 `2674e7d` / `bd45ad3`）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * 上游以 `free` 命名但未必出现在定价目录中的已确认零倍率免费模型名单。
+ *
+ * ⚠️ 安全铁律（对标 `bd45ad3`）：
+ * 1. **明确非零价格永远优先**：哪怕名字叫 `hy4flash-free`，只要 `catalogPrice` 明确给出 `> 0`（如 `"x0.30"` 或 `0.3`），
+ *    一律按付费模型处理，绝不允许绕过保留线/永久积分锁；
+ * 2. **绝不信任任意 `*free` 后缀名称**：只有 `catalogPrice === 0`（或 `"x0.00"`）或价格缺失且命中本确认白名单的模型才算免费。
+ */
+export const CONFIRMED_FREE_MODEL_IDS: ReadonlySet<string> = new Set(['hy4flash-free', 'hy4free'])
+
+/**
+ * 判断某模型是否为确认零积分消耗的免费模型（纯函数）。
+ *
+ * @param providerId 供应商 ID（如 `'buddy'`、`'workbuddy'`、`'codearts'`）
+ * @param modelId 模型 ID（可带 `expiring/` 或 `provider/` 前缀）
+ * @param catalogPrice 可选目录价格倍率（数字 `0` / `0.3`，或字符串 `'x0.00'` / `'x0.30'`）
+ */
+export function isConfirmedZeroCostModel(
+  providerId: string,
+  modelId: string,
+  catalogPrice?: number | string | null,
+): boolean {
+  if (typeof modelId !== 'string') return false
+  let bare = modelId.trim().toLowerCase()
+  const prov = typeof providerId === 'string' ? providerId.trim().toLowerCase() : ''
+
+  for (let i = 0; i < 4; i += 1) {
+    if (bare.startsWith('expiringonly/')) bare = bare.slice('expiringonly/'.length).trim()
+    else if (bare.startsWith('expiring/')) bare = bare.slice('expiring/'.length).trim()
+    else if (prov !== '' && bare.startsWith(`${prov}/`)) bare = bare.slice(prov.length + 1).trim()
+    else if (bare.startsWith('buddy/')) bare = bare.slice('buddy/'.length).trim()
+    else if (bare.startsWith('workbuddy/')) bare = bare.slice('workbuddy/'.length).trim()
+    else break
+  }
+  if (bare === '') return false
+
+  if (typeof catalogPrice === 'number') {
+    if (!Number.isFinite(catalogPrice) || catalogPrice < 0) {
+      // 非法数值按未知价格处理，继续看确认名单
+    } else {
+      return catalogPrice === 0
+    }
+  } else if (typeof catalogPrice === 'string') {
+    const raw = catalogPrice.trim().toLowerCase()
+    if (raw !== '') {
+      if (raw === 'free' || raw.includes('免费')) return true
+      const m = /^[x×]?\s*(\d+(?:\.\d+)?)$/.exec(raw)
+      if (m !== null && m[1] !== undefined) {
+        const parsed = Number(m[1])
+        if (Number.isFinite(parsed)) return parsed === 0
+      }
+      // 明确给出了非空但非零的价格描述：付费判定优先于名称
+      return false
+    }
+  }
+
+  return CONFIRMED_FREE_MODEL_IDS.has(bare)
+}
+
+export interface PickAccountOptions {
+  provider?: string
+  model?: string
+  exclude?: readonly string[]
+  now: number
+  isFreeModel?: boolean
+  permanentLocks?: Readonly<Record<string, boolean>>
+  expiringStrict?: boolean
+  modelCooldownEnabled?: boolean
+}
+
+/**
+ * 纯函数选号候选过滤（供无存储环境的单测直接验证免费模型保留线豁免、`needsRelogin` 与四维惩罚正交性）。
+ */
+export function pickAccount(
+  accounts: readonly AccountState[],
+  options: PickAccountOptions,
+): AccountState | undefined {
+  const wantProvider = options.provider ?? ''
+  const model = options.model ?? ''
+  const now = options.now
+  const excludeSet = new Set(options.exclude ?? [])
+  const permLocks = options.permanentLocks ?? {}
+  const modelCooldownOn = options.modelCooldownEnabled !== false
+  const free =
+    typeof options.isFreeModel === 'boolean'
+      ? options.isFreeModel
+      : isConfirmedZeroCostModel(wantProvider || 'buddy', model)
+
+  for (const state of accounts) {
+    const prov = state.provider ?? 'buddy'
+    if (wantProvider !== '' && prov !== wantProvider) continue
+    if (excludeSet.has(state.uid)) continue
+    const usable = free
+      ? healthyForFreeModel(state, now, model, modelCooldownOn)
+      : modelCooldownOn
+        ? healthyForModel(state, now, model)
+        : healthy(state, now)
+    if (!usable) continue
+    if (!free && options.expiringStrict === true) {
+      if (!(state.creditsExpiring > 0 && state.creditsEarliestExpiry > now)) continue
+    }
+    if (!free && permLocks[prov] === true && state.credits > 0 && state.creditsExpiring === 0) {
+      continue
+    }
+    return state
+  }
+  return undefined
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

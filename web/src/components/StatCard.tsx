@@ -5,11 +5,11 @@ import { Skeleton } from '@/components/ui/misc'
 import { cn } from '@/lib/utils'
 
 const tones = {
-  primary: 'bg-primary/10 text-primary',
-  success: 'bg-success/12 text-success',
-  warning: 'bg-warning/15 text-warning',
-  danger: 'bg-danger/12 text-danger',
-  neutral: 'bg-muted text-muted-foreground',
+  primary: 'bg-[#0071E3]/10 text-[#0071E3] dark:bg-[#0A84FF]/16 dark:text-[#409CFF]',
+  success: 'bg-[#30D158]/12 text-[#1D8338] dark:bg-[#30D158]/16 dark:text-[#30D158]',
+  warning: 'bg-[#FF9F0A]/14 text-[#B25E00] dark:bg-[#FF9F0A]/16 dark:text-[#FF9F0A]',
+  danger: 'bg-[#FF453A]/12 text-[#D70015] dark:bg-[#FF453A]/16 dark:text-[#FF453A]',
+  neutral: 'bg-black/[0.04] text-muted-foreground dark:bg-white/[0.06]',
 }
 
 export function StatCard({
@@ -32,34 +32,31 @@ export function StatCard({
   className?: string
 }) {
   return (
-    <Card className={cn('p-4', onClick && 'hover:border-ring/40 cursor-pointer transition-colors', className)} onClick={onClick}>
-      <div className="flex items-center justify-between">
-        <span className="text-muted-foreground text-[13px]">{label}</span>
-        <span className={cn('rounded-md p-1.5', tones[tone])}>
-          <Icon className="size-3.5" strokeWidth={2.2} />
+    <Card
+      className={cn(
+        'p-4 transition-[border-color,transform,box-shadow] duration-150 ease-[cubic-bezier(0.22,1,0.36,1)]',
+        onClick && 'cursor-pointer hover:border-[#0071E3]/35 active:scale-[0.99] dark:hover:border-[#0A84FF]/40',
+        className,
+      )}
+      onClick={onClick}
+    >
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span className="text-muted-foreground truncate text-[12.5px] font-medium">{label}</span>
+        <span className={cn('shrink-0 rounded-lg p-1.5', tones[tone])}>
+          <Icon className="size-[15px]" strokeWidth={1.75} />
         </span>
       </div>
       {loading ? (
         <Skeleton className="mt-3 h-7 w-16" />
       ) : (
-        <div className="tabular mt-2 text-[26px] leading-tight font-semibold tracking-tight">{value}</div>
+        <div className="mt-2 font-sans text-[25px] leading-tight font-semibold tracking-tight tabular-nums">{value}</div>
       )}
-      {sub && <div className="text-muted-foreground mt-1 truncate text-xs">{sub}</div>}
+      {sub && <div className="text-muted-foreground mt-1 truncate font-sans text-xs tabular-nums">{sub}</div>}
     </Card>
   )
 }
 
-/**
- * 手机上隐藏副标题的 `StatCard` 外壳。
- *
- * ## 为什么需要它（2026-11-07 手机端）
- * 「供应商与账号」页顶部有 6 张 KPI 卡，每张的副标题在 390px 下都被 `truncate`
- * 截成「分布在 2 家…」「最早 5 天后…」——信息量几乎为零，却每张多占 16px 高度，
- * 6 张就是 ~100px，直接把账号列表推到首屏之外。
- *
- * ⇒ 用 `[&_.truncate]:hidden sm:[&_.truncate]:visible` 精确命中 StatCard 内部的
- *   副标题（它是唯一带 `truncate` 的元素），不改组件本身的 API、不影响其他页面。
- */
+/** 手机端隐藏副标题的紧凑 `StatCard` 外壳，收紧首屏纵向占用。 */
 export function StatCardCompact(props: Parameters<typeof StatCard>[0]) {
-  return <StatCard {...props} className={cn('[&_.truncate]:hidden sm:[&_.truncate]:block', props.className)} />
+  return <StatCard {...props} className={cn('[&_.truncate:last-child]:hidden sm:[&_.truncate:last-child]:block', props.className)} />
 }

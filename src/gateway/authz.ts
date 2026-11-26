@@ -60,6 +60,15 @@ export function xApiKeyOf(request: Request): string {
   return (request.headers.get('x-api-key') ?? '').trim()
 }
 
+/** 从 URL 查询参数提取 `?key=<key>` 明文（仅允许在显式声明的只读端点上启用）。 */
+export function queryKeyOf(request: Request): string {
+  try {
+    return (new URL(request.url).searchParams.get('key') ?? '').trim()
+  } catch {
+    return ''
+  }
+}
+
 /** 是否属于数据面鉴权路径（`/v1/*`、`/messages*` 与 `/mcp` 同时接受 Bearer 与 `x-api-key`，且允许子密钥）。 */
 export function isDataPlaneAuthPath(pathname: string): boolean {
   return (
@@ -72,22 +81,62 @@ export function isDataPlaneAuthPath(pathname: string): boolean {
   )
 }
 
+export interface ApiKeyExtractOptions {
+  allowXApiKey?: boolean
+  /** 仅对显式白名单的只读路径（如 `GET /v1/balance-summary`）开启 `?key=` 支持。 */
+  allowQueryKey?: boolean
+}
+
 /**
- * 提取请求携带的 API 密钥。
+ * 提取请求携带的 API 密钥（同步版，供既有请求头提取与兼容调用）。
  *
  * - 优先 `Authorization: Bearer <key>`；若已显式提供非空 Bearer，绝不回退尝试第二个头
  *  （防止单次请求携带双头试探两把密钥或混淆主/子密钥身份）；
  * - 若未提供 Bearer 且 `allowXApiKey !== false`，兼容读取 `x-api-key: <key>`
- *  （Claude Code / Anthropic SDK 默认只发 `x-api-key`）。
+ *  （Claude Code / Anthropic SDK 默认只发 `x-api-key`）；
+ * - 若 `allowQueryKey === true`，在未提供请求头密钥时读取 `?key=<key>`；
+ *   若同时提供了请求头密钥与 `?key=` 且两者不同，同步返回空串视为冲突拒绝。
  */
-export function apiKeyOf(request: Request, options?: { allowXApiKey?: boolean }): string {
+export function apiKeyOf(request: Request, options?: ApiKeyExtractOptions): string {
   const bearer = bearerOf(request)
-  if (bearer !== '') return bearer
-  if (options?.allowXApiKey !== false) {
-    const xKey = xApiKeyOf(request)
-    if (xKey !== '') return xKey
+  let headerKey = bearer
+  if (headerKey === '' && options?.allowXApiKey !== false) {
+    headerKey = xApiKeyOf(request)
   }
-  return ''
+  if (options?.allowQueryKey === true) {
+    const qKey = queryKeyOf(request)
+    if (headerKey !== '' && qKey !== '') {
+      return headerKey === qKey ? headerKey : ''
+    }
+    if (headerKey !== '') return headerKey
+    return qKey
+  }
+  return headerKey
+}
+
+/**
+ * 恒定时间解析请求携带的 API 密钥（支持检测请求头与 `?key=` 不一致冲突）。
+ */
+export async function resolveRequestApiKey(
+  request: Request,
+  options?: ApiKeyExtractOptions,
+): Promise<{ key: string; conflict: boolean; fromQuery: boolean }> {
+  const bearer = bearerOf(request)
+  let headerKey = bearer
+  if (headerKey === '' && options?.allowXApiKey !== false) {
+    headerKey = xApiKeyOf(request)
+  }
+  if (options?.allowQueryKey === true) {
+    const qKey = queryKeyOf(request)
+    if (headerKey !== '' && qKey !== '') {
+      const same = await constantTimeEqual(headerKey, qKey)
+      if (!same) return { key: '', conflict: true, fromQuery: false }
+      return { key: headerKey, conflict: false, fromQuery: false }
+    }
+    if (headerKey !== '') return { key: headerKey, conflict: false, fromQuery: false }
+    if (qKey !== '') return { key: qKey, conflict: false, fromQuery: true }
+  }
+  return { key: headerKey, conflict: false, fromQuery: false }
 }
 
 /**
@@ -132,16 +181,17 @@ export async function authenticate(
   request: Request,
   env: Env,
   model: string,
-  options?: { allowXApiKey?: boolean },
+  options?: ApiKeyExtractOptions,
 ): Promise<AuthResult> {
-  const provided = apiKeyOf(request, options)
-  if (provided === '') {
-    // 仍跑一次空摘要比较以抹平缺头的时序形状
+  const resolved = await resolveRequestApiKey(request, options)
+  if (resolved.conflict || resolved.key === '') {
+    // 仍跑一次空摘要比较以抹平缺头或冲突早退的时序形状
     if (env.API_KEY !== undefined && env.API_KEY !== '') {
       await constantTimeEqual('', env.API_KEY)
     }
     return { kind: 'none' }
   }
+  const provided = resolved.key
 
   // ① 先比主密钥。⚠️ 顺序有意义：主密钥的处理**不碰 DO**
   //（省一次往返，且主密钥不依赖任何存储状态 —— 即使 DO 挂了管理端仍可用）。

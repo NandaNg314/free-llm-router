@@ -1355,61 +1355,232 @@ const CREDIT_METRIC_LABELS: Readonly<Record<string, string>> = {
 /** 总额 metric 名（`codearts-credits.ts:150`）。 */
 const TOTAL_CREDIT_METRIC = 'usageTotalPackageCredit'
 
+/** 默认「即将过期积分」判定窗口：7 天内到期包计入 `expiring`（对标 `v2.2.4` PR #35）。 */
+export const CODEARTS_EXPIRING_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+
+/** 解析任意时间戳或日期串为毫秒（秒级自动 ×1000；纯日期串按当日 `23:59:59` UTC+8 解析；无效返回 `0`）。 */
+function parseCodeArtsTimestampMs(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return raw > 1_000_000_000_000 ? Math.trunc(raw) : Math.trunc(raw * 1000)
+  }
+  if (typeof raw !== 'string') return 0
+  const trimmed = raw.trim()
+  if (trimmed === '') return 0
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number(trimmed)
+    if (!Number.isFinite(n) || n <= 0) return 0
+    return n > 1_000_000_000_000 ? Math.trunc(n) : Math.trunc(n * 1000)
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    const parsedDayEnd = Date.parse(`${trimmed}T23:59:59+08:00`)
+    return Number.isFinite(parsedDayEnd) && parsedDayEnd > 0 ? parsedDayEnd : 0
+  }
+  const parsed = Date.parse(trimmed)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+}
+
+function readRecordExpiryMs(record: Record<string, unknown>): number {
+  for (const key of [
+    'earliest_expiry',
+    'earliestExpiry',
+    'expiring_end_time',
+    'expiringEndTime',
+    'expire_time',
+    'expireTime',
+    'expired_at',
+    'expiredAt',
+    'expires_at',
+    'expiresAt',
+    'expiration',
+    'end_time',
+    'endTime',
+    'end_date',
+    'endDate',
+  ] as const) {
+    const ts = parseCodeArtsTimestampMs(record[key])
+    if (ts > 0) return ts
+  }
+  return 0
+}
+
+function roundCredit(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0
+  return Math.round(value * 100) / 100
+}
+
+/**
+ * 从 `/snap-manager/v1/statistics/plugin` 响应数据中提取总额、即将过期积分与最近到期时刻（纯函数，对标 `v2.2.4` PR #35）。
+ *
+ * 同时兼容华为云两种真实下发形态：
+ * 1. `metrics[]` 中的 `package_credit_expiring_amount` 聚合字段（`wb_codearts.py` PR #35 实测字段）；
+ * 2. 逐套餐包列表（`packages` / `package_list` / `credit_packages` / `resource_packages` 或带有效期的 `metrics` 子项），
+ *    自动汇总 **未来 7 天内（`0 < expiry - now <= 7d`）** 到期的剩余额度与最早到期时间 `earliestExpiry`。
+ */
+export function extractCodeArtsBalance(data: Record<string, unknown>, now = Date.now()): ProviderBalance {
+  const metrics = data.metrics
+  const packages: Array<{ name: string; amount: number; expiry: number }> = []
+  let totalRemain: number | undefined
+  let totalMetricExpiring = 0
+  let subMetricExpiringSum = 0
+  let datedWindowExpiringSum = 0
+  let earliestExpiry = 0
+  let sawAnyCreditMetric = false
+
+  const trackExpiry = (ts: number): void => {
+    if (ts > now && (earliestExpiry === 0 || ts < earliestExpiry)) {
+      earliestExpiry = ts
+    }
+  }
+
+  if (Array.isArray(metrics)) {
+    for (const item of metrics) {
+      if (typeof item !== 'object' || item === null || Array.isArray(item)) continue
+      const record = item as Record<string, unknown>
+      const metricName = readString(record, 'name')
+      const label = CREDIT_METRIC_LABELS[metricName]
+      if (label === undefined) continue
+      sawAnyCreditMetric = true
+
+      const amount = readNumber(record, 'package_credit_amount')
+      const remain = readNumber(record, 'package_credit_remain')
+      const metricExpiring =
+        readNumber(record, 'package_credit_expiring_amount') ||
+        readNumber(record, 'expiring_amount') ||
+        readNumber(record, 'expiring_credit') ||
+        readNumber(record, 'expiring')
+      const expiry = readRecordExpiryMs(record)
+
+      if (metricName === TOTAL_CREDIT_METRIC) {
+        totalRemain = remain
+        if (metricExpiring > 0) totalMetricExpiring = metricExpiring
+        if (expiry > now && (metricExpiring > 0 || expiry - now <= CODEARTS_EXPIRING_WINDOW_MS)) {
+          trackExpiry(expiry)
+        }
+      } else {
+        if (metricExpiring > 0) subMetricExpiringSum += metricExpiring
+        if (remain > 0 && expiry > now && expiry - now <= CODEARTS_EXPIRING_WINDOW_MS) {
+          datedWindowExpiringSum += remain
+          trackExpiry(expiry)
+        } else if (metricExpiring > 0 && expiry > now) {
+          trackExpiry(expiry)
+        }
+      }
+
+      if (amount <= 0 && remain <= 0) continue
+      packages.push({
+        name: label,
+        amount: roundCredit(remain),
+        expiry: expiry > 0 ? expiry : 0,
+      })
+    }
+  }
+
+  // 解析细粒度套餐包明细列表（若服务端同时下发逐包有效期）
+  const rawPkgLists = [
+    data.packages,
+    data.package_list,
+    data.packageList,
+    data.credit_packages,
+    data.creditPackages,
+    data.resource_packages,
+    data.resourcePackages,
+  ]
+  let detailListExpiring = 0
+  let sawDetailList = false
+  for (const list of rawPkgLists) {
+    if (!Array.isArray(list)) continue
+    for (const rawPkg of list) {
+      if (typeof rawPkg !== 'object' || rawPkg === null || Array.isArray(rawPkg)) continue
+      const rec = rawPkg as Record<string, unknown>
+      const status = readString(rec, 'status').toUpperCase()
+      if (status === 'EXPIRED' || status === 'DISABLED' || status === 'INVALID') continue
+
+      const remain =
+        readNumber(rec, 'package_credit_remain') ||
+        readNumber(rec, 'remain_amount') ||
+        readNumber(rec, 'remain') ||
+        readNumber(rec, 'balance') ||
+        readNumber(rec, 'amount')
+      const totalAmt = readNumber(rec, 'package_credit_amount') || readNumber(rec, 'total') || remain
+      const expiry = readRecordExpiryMs(rec)
+      // 已过期的历史包不计入可用或临期
+      if (expiry > 0 && expiry <= now) continue
+      if (totalAmt <= 0 && remain <= 0) continue
+
+      sawDetailList = true
+      const pkgName =
+        readString(rec, 'package_name') ||
+        readString(rec, 'packageName') ||
+        readString(rec, 'name') ||
+        readString(rec, 'type') ||
+        '积分套餐包'
+
+      if (!sawAnyCreditMetric) {
+        packages.push({
+          name: pkgName,
+          amount: roundCredit(remain),
+          expiry: expiry > 0 ? expiry : 0,
+        })
+      }
+      if (remain > 0 && expiry > now && expiry - now <= CODEARTS_EXPIRING_WINDOW_MS) {
+        detailListExpiring += remain
+        trackExpiry(expiry)
+      }
+    }
+    if (sawDetailList) break
+  }
+
+  if (!sawAnyCreditMetric && !sawDetailList) {
+    return { total: 0, expiring: 0, earliestExpiry: 0, packages: [] }
+  }
+
+  const total = roundCredit(totalRemain ?? packages.reduce((sum, pkg) => sum + pkg.amount, 0))
+  const rawExpiring =
+    totalMetricExpiring > 0
+      ? totalMetricExpiring
+      : subMetricExpiringSum > 0
+        ? subMetricExpiringSum
+        : detailListExpiring > 0
+          ? detailListExpiring
+          : datedWindowExpiringSum
+
+  const pkgMeta = readRecord(data, 'package')
+  const pkgMetaExpiry = readRecordExpiryMs(pkgMeta)
+  let expiring = rawExpiring
+  if (expiring <= 0 && total > 0 && pkgMetaExpiry > now && pkgMetaExpiry - now <= CODEARTS_EXPIRING_WINDOW_MS) {
+    expiring = total
+    trackExpiry(pkgMetaExpiry)
+  } else if (expiring > 0 && earliestExpiry === 0 && pkgMetaExpiry > now) {
+    trackExpiry(pkgMetaExpiry)
+  }
+
+  expiring = Math.min(total, roundCredit(expiring))
+  if (expiring <= 0) earliestExpiry = 0
+
+  return {
+    total,
+    expiring,
+    earliestExpiry,
+    packages,
+  }
+}
+
 /** 查余额。 */
 async function balance(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderBalance> {
   const url = `${CODEARTS_SNAP_ENGINE_BASE}${CODEARTS_PACKAGE_INFO_PATH}`
   const result = await signedSnapRequest('GET', url, credential, undefined, signal)
   if (!result.ok) {
-    throw new ProviderError({
-      provider: 'codearts',
+    const classified = classifyCodeArtsError(result.message, result.code > 0 ? result.code : undefined)
+    throw new CodeArtsAuthError({
       message: `CodeArts 账户信息查询失败：${result.message}`,
       httpStatus: result.code > 0 ? result.code : 0,
-      retryable: result.code === 429 || result.code === 402,
+      retryable: classified.retryable,
+      needsRelogin: classified.needsRelogin,
+      category: classified.category,
     })
   }
 
-  const metrics = result.data.metrics
-  const packages: Array<{ name: string; amount: number; expiry: number }> = []
-  let totalRemain: number | undefined
-  let sawAnyCreditMetric = false
-
-  if (Array.isArray(metrics)) {
-    for (const item of metrics) {
-      if (typeof item !== 'object' || item === null) continue
-      const record = item as Record<string, unknown>
-      const label = CREDIT_METRIC_LABELS[readString(record, 'name')]
-      if (label === undefined) continue
-      sawAnyCreditMetric = true
-      const amount = readNumber(record, 'package_credit_amount')
-      const remain = readNumber(record, 'package_credit_remain')
-      if (readString(record, 'name') === TOTAL_CREDIT_METRIC) totalRemain = remain
-      // 额度为 0 的分类不列为资源包：列出来只会让「N 个资源包」虚高。
-      if (amount <= 0 && remain <= 0) continue
-      packages.push({
-        name: label,
-        amount: remain,
-        // `statistics/plugin` **不下发**资源包的有效期字段（那是腾讯侧的形态）。
-        // 如实置 0（= 无到期信息），而不是臆造一个到期时间 ——
-        // 臆造会让面板显示错误的「即将过期」提醒。
-        expiry: 0,
-      })
-    }
-  }
-
-  if (!sawAnyCreditMetric) {
-    // 非积分计费账户（Token 计费）：没有积分口径。返回 0 而非抛错 ——
-    // 「这个账号没有积分账户」是正常业务状态，不是失败。
-    return { total: 0, expiring: 0, earliestExpiry: 0, packages: [] }
-  }
-
-  const total = totalRemain ?? packages.reduce((sum, pkg) => sum + pkg.amount, 0)
-  return {
-    total: Math.round(total * 100) / 100,
-    // 服务端不给到期时间，故「即将过期」与「最早到期」如实为 0。
-    expiring: 0,
-    earliestExpiry: 0,
-    packages,
-  }
+  return extractCodeArtsBalance(result.data)
 }
 
 /**
@@ -1601,42 +1772,241 @@ async function signDpopJws(jwk: DpopPrivateJwk, htm: string, htu: string): Promi
   return `${signingInput}.${base64UrlEncode(new Uint8Array(signature))}`
 }
 
+// ── 错误分类与单飞续期自愈（对标 `v2.2.4` PR #34 / #36） ──
+
+export type CodeArtsErrorCategory =
+  | 'relogin_required'
+  | 'auth_expired'
+  | 'rate_limited'
+  | 'credit_exhausted'
+  | 'gateway_transient'
+  | 'bad_request'
+
+export interface CodeArtsErrorClassification {
+  category: CodeArtsErrorCategory
+  /** 是否属于凭据/鉴权类错误（401 或明确的 IAM/STS/token 失效）。 */
+  isAuthError: boolean
+  /**
+   * 是否确认续期链路已无法恢复（需置 `AccountState.needsRelogin = true` 而**不是**手动 `disabled`）。
+   */
+  needsRelogin: boolean
+  /** 是否允许重试或换号。 */
+  retryable: boolean
+}
+
 /**
- * 用 `refresh_token` 换一份新凭据。
- *
- * ## 协议（`src/oauth.ts:96-176`，逐字对齐）
- *
- * ```
- * POST https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens
- * headers: DPoP: <ES256 dpop+jwt>   Content-Type: application/x-www-form-urlencoded
- * body:    client_id=codearts-agent&code_verifier=…&grant_type=refresh_token
- *          &refresh_token=…
- * → { credentials: { access_key_id, secret_access_key, security_token, expiration },
- *     refresh_token }
- * ```
- *
- * ⚠️ **`code_verifier` 必须重发**：服务端拿它的 S256 对上授权时的 challenge，
- * 少了它直接换不到 token。而它**不在** access token 里，只能靠
- * {@link parseCredential} 一起存进 `extras`（这就是上面要存它的原因）。
- *
- * ⚠️ **DPoP proof 的 `htu` 是完整 URL 且不带 query**（参考实现传的就是常量
- * `STS_TOKEN_ENDPOINT` 本身）。
- *
- * ## 终态判定（**只认 refresh_token 自己失效的信号**，`src/oauth.ts:122-141`）
- *
- * - `error === 'invalid_grant'` 或 `error_code` 含 `ExpiredRefreshToken` → 终态；
- * - ⚠️ **`InvalidDPoPHeader` 不算终态**：它说的是「这次 proof 没过校验」
- *   （时钟偏差、重放判定、网关抖动），与 refresh_token 还能不能用无关。
- *   把它当终态会把材料完好的账号一步标死，只能人工重登
- *   （参考项目为此专门记录了一次真实缺陷）。
- * - 网络异常 → `retryable: true`。
- *
- * ## 返回值
- *
- * 新 `security_token` 写进 `accessToken`；**AK/SK 被服务端轮换时用新值**，
- * 未下发时保留旧的（`extras.ak` / `extras.sk` 同时也是 uid 的来源，不能丢）。
+ * 携带结构化 `needsRelogin` 与 `category` 标记的 CodeArts 异常（继承 `ProviderError`，100% 兼容既有 `instanceof ProviderError`）。
  */
-async function refresh(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderCredential> {
+export class CodeArtsAuthError extends ProviderError {
+  readonly needsRelogin: boolean
+  readonly category: CodeArtsErrorCategory
+
+  constructor(input: {
+    message: string
+    httpStatus?: number
+    retryable?: boolean
+    needsRelogin: boolean
+    category: CodeArtsErrorCategory
+  }) {
+    super({
+      provider: 'codearts',
+      message: input.message,
+      httpStatus: input.httpStatus,
+      retryable: input.retryable,
+    })
+    this.needsRelogin = input.needsRelogin
+    this.category = input.category
+  }
+}
+
+/**
+ * 精准判定并分类 CodeArts 错误（对标 `v2.2.4` PR #34 `eb65c27` / `bff5a8a` 与 PR #36 `56c7e9f`）：
+ *
+ * 1. **严防非 401 误判**：当存在明确的非 401 HTTP 状态码（如 `429`、`400`、`402`、`502`）时，
+ *    即使响应体里的 `requestId` 或错误码（如 `14018`、`TM.00001041`）碰巧包含数字 `"401"` / `"403"`，
+ *    也**绝不**误判为鉴权失效！
+ * 2. **区分网关瞬时抖动与凭据彻底失效**：
+ *    - HTML 网关错误页、`5xx`、`InvalidDPoPHeader`、网络中断 ⇒ `gateway_transient`（可重试，不标 `needsRelogin`）；
+ *    - `429` 或 `TM.00001041` 并发会话达上限 ⇒ `rate_limited`（不触发续期、不标 `needsRelogin`）；
+ *    - `402` 或积分不足/耗尽文案 ⇒ `credit_exhausted`；
+ *    - 常规 `401` 或带 IAM/APIG 验签/token 过期标记的 `403` ⇒ `auth_expired`（应触发一次续期重试，不直接判死）；
+ *    - `invalid_grant`、`ExpiredRefreshToken`、`STS5.1806`（refresh_token 已被消费/作废）或缺少续期材料 ⇒
+ *      `relogin_required`（`needsRelogin: true`，供上层标记待重登而非永久 `disabled`！）。
+ */
+export function classifyCodeArtsError(input: unknown, explicitStatus?: number): CodeArtsErrorClassification {
+  if (input instanceof CodeArtsAuthError) {
+    return {
+      category: input.category,
+      isAuthError: input.category === 'auth_expired' || input.category === 'relogin_required',
+      needsRelogin: input.needsRelogin,
+      retryable: input.retryable,
+    }
+  }
+
+  const rawText = input instanceof Error ? input.message : String(input ?? '')
+  const lower = rawText.toLowerCase()
+
+  let status =
+    typeof explicitStatus === 'number' && Number.isFinite(explicitStatus) && explicitStatus > 0
+      ? Math.trunc(explicitStatus)
+      : input instanceof ProviderError && input.httpStatus > 0
+        ? input.httpStatus
+        : 0
+
+  if (status === 0) {
+    const m = /\bhttp(?:error)?\s+(\d{3})\b/i.exec(rawText) ?? /HTTP\s+(\d{3})[：:]/i.exec(rawText)
+    if (m !== null && m[1] !== undefined) {
+      status = Number.parseInt(m[1], 10)
+    }
+  }
+
+  // ① DPoP 本次 proof 校验抖动（常以 401 返回）：明确属于瞬时可重试，绝非凭据失效
+  if (lower.includes('invaliddpopheader')) {
+    return { category: 'gateway_transient', isAuthError: false, needsRelogin: false, retryable: true }
+  }
+
+  // ② 明确续期终态：refresh_token 作废 / 材料缺失 / DPoP 私钥损坏 ⇒ 需重新登录（不置手动 disabled）
+  if (
+    /\binvalid_grant\b/i.test(rawText) ||
+    lower.includes('expiredrefreshtoken') ||
+    lower.includes('sts5.1806') ||
+    lower.includes('refresh token has been used') ||
+    rawText.includes('缺少自动续期所需的材料') ||
+    rawText.includes('dpop_private_key_jwk 可能已损坏') ||
+    rawText.includes('refresh_token 已失效')
+  ) {
+    return { category: 'relogin_required', isAuthError: true, needsRelogin: true, retryable: false }
+  }
+
+  // ③ HTML 网关错误页（502/504/WAF 静态页）不是 token 失效
+  if (lower.includes('<html') || lower.includes('<!doctype html')) {
+    return { category: 'gateway_transient', isAuthError: false, needsRelogin: false, retryable: true }
+  }
+
+  // ④ 明确的积分耗尽 / 402
+  if (
+    status === 402 ||
+    rawText.includes('积分已耗尽') ||
+    rawText.includes('积分不足') ||
+    lower.includes('credit exhausted') ||
+    lower.includes('credits exhausted') ||
+    lower.includes('insufficient credit')
+  ) {
+    return { category: 'credit_exhausted', isAuthError: false, needsRelogin: false, retryable: true }
+  }
+
+  // ⑤ 明确的限流 / 并发会话满（即使 requestId 里碰巧含 "401" 也绝不当鉴权错误！）
+  if (
+    status === 429 ||
+    lower.includes('tm.00001041') ||
+    rawText.includes('并发会话') ||
+    lower.includes('concurrent session') ||
+    lower.includes('too many requests')
+  ) {
+    return { category: 'rate_limited', isAuthError: false, needsRelogin: false, retryable: true }
+  }
+
+  // ⑥ 5xx 或传输层网络超时
+  if (status >= 500 || rawText.includes('网络失败') || rawText.includes('请求失败（网络层）')) {
+    return { category: 'gateway_transient', isAuthError: false, needsRelogin: false, retryable: true }
+  }
+
+  const hasExplicitTokenFailurePhrase =
+    lower.includes('invalid_token') ||
+    lower.includes('invalid-token') ||
+    lower.includes('token expired') ||
+    lower.includes('security_token expired') ||
+    lower.includes('decrypt token fail') ||
+    lower.includes('incorrect iam authentication') ||
+    lower.includes('verify ak sk signature fail') ||
+    /\bapig\.030[12]\b/i.test(rawText) ||
+    /\bapig\.0602\b/i.test(rawText)
+
+  // ⑦ 当存在明确的非 401 状态码时，忽略裸 "401" 数字（防止 requestId / 14018 误触发）
+  if (status > 0) {
+    if (status === 401) {
+      return { category: 'auth_expired', isAuthError: true, needsRelogin: false, retryable: true }
+    }
+    if (status === 403) {
+      if (hasExplicitTokenFailurePhrase || /\bunauthorized\b/i.test(rawText)) {
+        return { category: 'auth_expired', isAuthError: true, needsRelogin: false, retryable: true }
+      }
+      return { category: 'gateway_transient', isAuthError: false, needsRelogin: false, retryable: true }
+    }
+    if (hasExplicitTokenFailurePhrase) {
+      return { category: 'auth_expired', isAuthError: true, needsRelogin: false, retryable: true }
+    }
+    return { category: 'bad_request', isAuthError: false, needsRelogin: false, retryable: false }
+  }
+
+  // 无显式 HTTP 状态码时：只认独立 401 状态词或明确鉴权短语，不匹配长串数字/hex 内部子串
+  const standalone401 = /(?:^|[\s:(])401(?:$|[\s:),.])/.test(lower)
+  if (hasExplicitTokenFailurePhrase || standalone401 || /\bunauthorized\b/i.test(rawText)) {
+    return { category: 'auth_expired', isAuthError: true, needsRelogin: false, retryable: true }
+  }
+
+  return { category: 'bad_request', isAuthError: false, needsRelogin: false, retryable: false }
+}
+
+/** 判断一次响应/异常是否属于需要触发 token 刷新的 CodeArts 鉴权错误（排除 429 与 `requestId` 含 `401` 误报）。 */
+export function isCodeArtsAuthFailure(status: number, bodyOrMessage: string): boolean {
+  return classifyCodeArtsError(bodyOrMessage, status).isAuthError
+}
+
+/** 判断异常是否明确要求将账号标记为 `needsRelogin = true`（而非永久 `disabled`）。 */
+export function isCodeArtsNeedsReloginError(error: unknown): boolean {
+  return classifyCodeArtsError(error).needsRelogin
+}
+
+/** 刚刚完成单飞刷新的短期结果缓存，供同一批并发 401 中稍晚到达的请求直接复用新凭据。 */
+const RECENT_REFRESH_TTL_MS = 15_000
+const MAX_RECENT_REFRESH_CACHE = 256
+const refreshInFlight = new Map<string, Promise<ProviderCredential>>()
+const recentRefreshCache = new Map<
+  string,
+  { prevAccessToken: string; prevRefreshToken: string; fresh: ProviderCredential; at: number }
+>()
+
+/** 清理进程内 CodeArts 单飞刷新去重缓存（供单测隔离使用）。 */
+export function resetCodeArtsRefreshState(): void {
+  refreshInFlight.clear()
+  recentRefreshCache.clear()
+}
+
+function refreshSingleflightKey(credential: ProviderCredential): string {
+  const uid = credential.uid.trim()
+  if (uid !== '') return uid
+  const ak = (credential.extras.ak ?? '').trim()
+  if (ak !== '') return `ak:${ak}`
+  return `rt:${credential.refreshToken.trim()}`
+}
+
+function raceWithAbortSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'))
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (val) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(val)
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(err)
+      },
+    )
+  })
+}
+
+/**
+ * 执行单次真实 STS `refresh_token` 换新请求（内部由 {@link refresh} 的 singleflight 包装调用）。
+ */
+async function performRefreshOnce(credential: ProviderCredential): Promise<ProviderCredential> {
   const refreshToken = credential.refreshToken.trim()
   const codeVerifier = (credential.extras[EXTRA_CODE_VERIFIER] ?? '').trim()
   const jwkRaw = credential.extras[EXTRA_DPOP_JWK] ?? ''
@@ -1647,14 +2017,11 @@ async function refresh(credential: ProviderCredential, signal: AbortSignal): Pro
   if (refreshToken === '') missing.push('refresh_token')
   if (codeVerifier === '') missing.push('code_verifier')
   if (jwk === undefined) missing.push('dpop_private_key_jwk')
-  // ⚠️ 把 `jwk === undefined` 放进同一个条件里（而不是单独一条 `if`）：
-  // 这样通过之后 TypeScript 能**收窄** `jwk` 的类型，否则下面签名处报
-  // 「可能为 undefined」—— 而那句本该不可达的判空只是为了让类型系统满意。
   if (jwk === undefined || missing.length > 0) {
-    // ⚠️ 这不是「网络抖动」，重试一万次也不会好 —— 明确让用户重新登录，
-    // 并说清缺什么（否则用户看到「续期失败」不知道该补哪个字段）。
-    throw new ProviderError({
-      provider: 'codearts',
+    throw new CodeArtsAuthError({
+      needsRelogin: true,
+      category: 'relogin_required',
+      retryable: false,
       message: `CodeArts 凭据缺少自动续期所需的材料（${missing.join('、')}），无法自动续期，`
         + '请重新登录「码道」并导出完整凭据（新版 IAM OAuth 凭据除三项 AK/SK/security_token 外，'
         + '还带 `refresh_token`、`code_verifier` 与 `dpop_private_key_jwk`）。',
@@ -1665,9 +2032,10 @@ async function refresh(credential: ProviderCredential, signal: AbortSignal): Pro
   try {
     dpop = await signDpopJws(jwk, 'POST', CODEARTS_STS_TOKEN_ENDPOINT)
   } catch (error) {
-    // 本地密码学失败（JWK 损坏等）→ 终态：换多少次请求都签不出来。
-    throw new ProviderError({
-      provider: 'codearts',
+    throw new CodeArtsAuthError({
+      needsRelogin: true,
+      category: 'relogin_required',
+      retryable: false,
       message: `CodeArts DPoP 签名失败（dpop_private_key_jwk 可能已损坏），请重新登录：`
         + `${error instanceof Error ? error.message : String(error)}`,
     })
@@ -1682,6 +2050,7 @@ async function refresh(credential: ProviderCredential, signal: AbortSignal): Pro
 
   let res: Response
   try {
+    // 底层共享请求只绑固定超时，不绑单个调用方的取消信号，避免并发调用方 A 断开时把一次性 refresh_token 轮换结果掐丢
     res = await fetch(CODEARTS_STS_TOKEN_ENDPOINT, {
       method: 'POST',
       headers: {
@@ -1689,12 +2058,12 @@ async function refresh(credential: ProviderCredential, signal: AbortSignal): Pro
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: form.toString(),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(TOKEN_TIMEOUT_MS)]),
+      signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
     })
   } catch (error) {
-    // 传输层失败：**不能**判为终态 —— 网络抖动不该让用户重新登录。
-    throw new ProviderError({
-      provider: 'codearts',
+    throw new CodeArtsAuthError({
+      needsRelogin: false,
+      category: 'gateway_transient',
       retryable: true,
       message: `CodeArts 续期网络失败：${error instanceof Error ? error.message : String(error)}`,
     })
@@ -1715,71 +2084,56 @@ async function refresh(credential: ProviderCredential, signal: AbortSignal): Pro
   const securityToken = readString(credentials, 'security_token')
   const errorCode = readString(parsed, 'error_code')
   const errorName = readString(parsed, 'error')
+  const errorMsg = readString(parsed, 'error_msg') || readString(parsed, 'error_description')
 
-  /**
-   * ⚠️ **`InvalidDPoPHeader` 必须先于「401/403 = 终态」被拦下，且判为可重试**。
-   *
-   * 参考项目为这条专门记了一次真实缺陷（`src/oauth.ts:124-141`）：把
-   * `InvalidDPoPHeader` 当终态，会把**材料完好**的账号（refresh_token 还有
-   * 十几天寿命、code_verifier 与 DPoP 私钥都在）一步标成「不可续期」，
-   * 重启也不自愈，用户只能重新登录。
-   *
-   * 它说的是「**这次** proof 没通过校验」—— 时钟偏差让 `iat` 落在窗口外、
-   * proof 被判重放、网关抖动，全都是**一次请求层面**的拒绝，
-   * 与「refresh_token 还能不能用」无关（该错误实测以 HTTP 401 下发，
-   * 故不能只看状态码）。
-   *
-   * 两边的代价不对称：判可重试最多再发一次 HTTP 请求；判终态则要人工重登。
-   */
-  if (errorName.includes('InvalidDPoPHeader')) {
-    throw new ProviderError({
-      provider: 'codearts',
+  if (errorName.includes('InvalidDPoPHeader') || errorCode.includes('InvalidDPoPHeader')) {
+    throw new CodeArtsAuthError({
       httpStatus: res.status,
       retryable: true,
-      // ⚠️ 文案里**刻意不出现**「重新登录」四个字：调用方按该子串判定终态
-      //（同 `raccoon.ts:1245-1247` 记录的判据形态）。写成「无需重新登录」
-      // 会被子串匹配**误判成终态**，正好把这条可重试的错误变成账号报废。
-      message: `CodeArts 续期被拒（${errorName}：本次 DPoP proof 未通过校验，多为时钟偏差或重放判定），`
+      needsRelogin: false,
+      category: 'gateway_transient',
+      message: `CodeArts 续期被拒（${errorName || errorCode}：本次 DPoP proof 未通过校验，多为时钟偏差或重放判定），`
         + '将重试；凭据本身仍然有效，无需人工干预',
     })
   }
 
-  // 终态判据**只认这两条**（见上方说明，`InvalidDPoPHeader` 已被上面的分支摘出）。
-  if (errorName === 'invalid_grant' || errorCode.includes('ExpiredRefreshToken')) {
-    throw new ProviderError({
-      provider: 'codearts',
+  if (
+    errorName === 'invalid_grant' ||
+    errorCode.includes('ExpiredRefreshToken') ||
+    errorCode.includes('STS5.1806') ||
+    errorMsg.toLowerCase().includes('refresh token has been used')
+  ) {
+    throw new CodeArtsAuthError({
       httpStatus: res.status,
-      message: `CodeArts 登录态已过期（refresh_token 已失效：${errorName || errorCode}），请重新登录`,
+      retryable: false,
+      needsRelogin: true,
+      category: 'relogin_required',
+      message: `CodeArts 登录态已过期（refresh_token 已失效：${errorName || errorCode || errorMsg}），请重新登录`,
     })
   }
 
   if (!res.ok || securityToken === '') {
-    // 非终态的失败（5xx / 429 / 网关错误）属可重试。
     const detail = text.trim() === '' ? '(空响应体)' : text.slice(0, 200)
-    throw new ProviderError({
-      provider: 'codearts',
+    const isRateLimited = res.status === 429
+    throw new CodeArtsAuthError({
       httpStatus: res.status,
-      retryable: res.status >= 500 || res.status === 429,
+      retryable: res.status >= 500 || isRateLimited || text.toLowerCase().includes('<html'),
+      needsRelogin: false,
+      category: isRateLimited ? 'rate_limited' : 'gateway_transient',
       message: `CodeArts 续期失败（HTTP ${res.status}）：${detail}`,
     })
   }
 
-  // AK/SK 被轮换时用新值；未下发时保留旧的（它们是签名必需，丢了整份凭据就废了）。
   const nextAk = readString(credentials, 'access_key_id')
   const nextSk = readString(credentials, 'secret_access_key')
   const nextRefreshRaw = readString(parsed, 'refresh_token')
-  // ⚠️ 服务端可能只回新的 access 三元组（不带新 refresh_token）——
-  // 此时必须保留旧值，否则续期一次就把账号变成不可续期。
   const nextRefresh = nextRefreshRaw !== '' ? nextRefreshRaw : credential.refreshToken
 
-  // 过期时间来自 `credentials.expiration`（ISO 串）；取不到则保留旧值，不编造。
   const expiration = readString(credentials, 'expiration')
   const parsedExpiry = expiration === '' ? Number.NaN : Date.parse(expiration)
   const expiresAt = Number.isFinite(parsedExpiry) ? parsedExpiry : credential.expiresAt
 
   return {
-    // ⚠️ `{...credential}` 展开保留 uid / nickname / extras（ak、sk 之外的
-    // code_verifier 与 dpop 私钥必须原样留着，否则**下一次**续期会失败）。
     ...credential,
     accessToken: securityToken,
     refreshToken: nextRefresh,
@@ -1792,6 +2146,64 @@ async function refresh(credential: ProviderCredential, signal: AbortSignal): Pro
       [EXTRA_DPOP_JWK]: JSON.stringify(jwk),
     },
   }
+}
+
+/**
+ * 用 `refresh_token` 换一份新凭据（内置按账号 singleflight 并发合并 + 刚轮换旧令牌短路复用）。
+ *
+ * 华为 STS 的 `refresh_token` 是一次性轮换型：同一账号多个请求同时撞上 401 时，
+ * 只向 STS 发一次换新请求；同批稍晚持旧 token 进入的调用直接复用刚换出的新凭据，
+ * 避免第二个请求因 `STS5.1806 the refresh token has been used` 把好账号误标成 `needsRelogin`。
+ */
+async function refresh(credential: ProviderCredential, signal: AbortSignal): Promise<ProviderCredential> {
+  const key = refreshSingleflightKey(credential)
+  const now = Date.now()
+
+  // 清理过期短期缓存
+  for (const [k, entry] of recentRefreshCache) {
+    if (now - entry.at > RECENT_REFRESH_TTL_MS) {
+      recentRefreshCache.delete(k)
+    }
+  }
+
+  const recent = recentRefreshCache.get(key)
+  if (
+    recent !== undefined &&
+    now - recent.at <= RECENT_REFRESH_TTL_MS &&
+    (credential.accessToken === recent.prevAccessToken || credential.refreshToken === recent.prevRefreshToken) &&
+    recent.fresh.accessToken !== credential.accessToken
+  ) {
+    return recent.fresh
+  }
+
+  let shared = refreshInFlight.get(key)
+  if (shared === undefined) {
+    const prevAccessToken = credential.accessToken
+    const prevRefreshToken = credential.refreshToken
+    shared = performRefreshOnce(credential).then(
+      (fresh) => {
+        if (recentRefreshCache.size >= MAX_RECENT_REFRESH_CACHE) {
+          const oldestKey = recentRefreshCache.keys().next().value
+          if (oldestKey !== undefined) recentRefreshCache.delete(oldestKey)
+        }
+        recentRefreshCache.set(key, {
+          prevAccessToken,
+          prevRefreshToken,
+          fresh,
+          at: Date.now(),
+        })
+        refreshInFlight.delete(key)
+        return fresh
+      },
+      (err) => {
+        refreshInFlight.delete(key)
+        throw err
+      },
+    )
+    refreshInFlight.set(key, shared)
+  }
+
+  return await raceWithAbortSignal(shared, signal)
 }
 
 // ── 供应商实例 ──

@@ -141,6 +141,7 @@ export function createNodeRuntime(databasePath?: string): NodeRuntimeContext {
     WORKBUDDY_DAILY_CHAT_MODEL: process.env.WORKBUDDY_DAILY_CHAT_MODEL?.trim(),
     CORS_ORIGINS: process.env.CORS_ORIGINS?.trim(),
     AUTO_CONTINUATION: process.env.AUTO_CONTINUATION?.trim(),
+    WARM_START_BALANCE: process.env.WARM_START_BALANCE?.trim(),
     THREE_D_AUTO_TOKEN: process.env.THREE_D_AUTO_TOKEN?.trim(),
     THREE_D_TEMP_TOKEN: process.env.THREE_D_TEMP_TOKEN?.trim(),
     THREE_D_TEMP_TOKENS: process.env.THREE_D_TEMP_TOKENS?.trim(),

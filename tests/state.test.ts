@@ -926,3 +926,121 @@ test('11140 波次闸门：随池规模动态缩放阈值 + 指数退避 + 30 �
   assert.equal(fresh2.next.streak, 1)
   assert.equal(fresh2.holdMs, RESTRICTION_HOLD_BASE_MS)
 })
+
+test('v2.2.2 PR #20：isConfirmedZeroCostModel 严格遵循「明确非零价格优先、未知 *free 不盲信」', async () => {
+  const { isConfirmedZeroCostModel } = await import('../src/pool/state.js')
+
+  // 确认零倍率：目录价为 0 / "x0.00" / "free"，或无目录价时命中确认名单
+  assert.equal(isConfirmedZeroCostModel('buddy', 'any-paid-looking-model', 0), true)
+  assert.equal(isConfirmedZeroCostModel('buddy', 'any-paid-looking-model', 'x0.00'), true)
+  assert.equal(isConfirmedZeroCostModel('codearts', 'glm-5', 'free'), true)
+  assert.equal(isConfirmedZeroCostModel('buddy', 'hy4flash-free'), true)
+  assert.equal(isConfirmedZeroCostModel('buddy', 'expiring/buddy/hy4free'), true)
+  assert.equal(isConfirmedZeroCostModel('workbuddy', 'expiringonly/workbuddy/hy4flash-free'), true)
+
+  // 安全红线 ①：明确给出了非零目录价（如上游临时改价 x0.30），必须覆盖 -free 名字判为 false
+  assert.equal(isConfirmedZeroCostModel('buddy', 'hy4flash-free', 'x0.30'), false)
+  assert.equal(isConfirmedZeroCostModel('buddy', 'hy4flash-free', 0.3), false)
+
+  // 安全红线 ②：未经确认的任意 *free 名字绝不盲信，防绕过永久积分锁
+  assert.equal(isConfirmedZeroCostModel('buddy', 'made-up-free'), false)
+  assert.equal(isConfirmedZeroCostModel('buddy', 'claude-sonnet-free'), false)
+  assert.equal(isConfirmedZeroCostModel('buddy', 'deepseek-v4.1-flash'), false)
+})
+
+test('v2.2.2/v2.2.4：免费模型豁免永久积分锁与余额耗尽 hard 冷却，但绝不绕过 disabled / needsRelogin / breaker / restricted', async () => {
+  const {
+    createAccountState,
+    diagnoseAccount,
+    healthy,
+    healthyForFreeModel,
+    normalizeAccountState,
+    pickAccount,
+  } = await import('../src/pool/state.js')
+
+  // 1) needsRelogin 状态独立于 disabled，且未激活时不污染默认键集合
+  const reloginAcc = normalizeAccountState({
+    uid: 'u-relogin',
+    provider: 'codearts',
+    needsRelogin: true,
+    reloginReason: 'refresh_token 已失效',
+  })!
+  assert.equal(reloginAcc.disabled, false, 'needsRelogin 不得篡改手动 disabled')
+  assert.equal(reloginAcc.needsRelogin, true)
+  assert.equal(reloginAcc.reloginReason, 'refresh_token 已失效')
+  assert.equal(healthy(reloginAcc, NOW), false, '待重登账号不得参与常规选号')
+  assert.equal(healthyForFreeModel(reloginAcc, NOW, 'hy4flash-free'), false, '待重登账号对免费模型也不可用')
+
+  const diag = diagnoseAccount(reloginAcc, NOW)
+  assert.equal(diag.healthy, false)
+  assert.ok(diag.blockedBy.includes('needs_relogin'))
+  assert.equal(diag.needsRelogin, true)
+  assert.match(diag.summary, /需重新登录/)
+
+  // 2) 仅剩永久积分（credits=500, creditsExpiring=0）且开启 permanentLocks，或处于 402 hard 冷却的账号：
+  //    常规模型拦截，确认免费模型（isFreeModel=true 或 hy4flash-free）放行！
+  const permOnlyAcc = createAccountState({ uid: 'u-perm', nickname: '永久积分号', realm: 'cn', provider: 'buddy' })
+  permOnlyAcc.credits = 500
+  permOnlyAcc.creditsExpiring = 0
+
+  const hardExhaustedAcc = createAccountState({ uid: 'u-hard', nickname: '额度耗尽号', realm: 'cn', provider: 'buddy' })
+  hardExhaustedAcc.until = NOW + 3_600_000
+  hardExhaustedAcc.coolKind = 'hard'
+  hardExhaustedAcc.reason = '402 credits exhausted'
+
+  assert.equal(
+    pickAccount([permOnlyAcc], { provider: 'buddy', model: 'deepseek-v4.1-flash', now: NOW, permanentLocks: { buddy: true } }),
+    undefined,
+    '付费模型必须受永久积分锁拦截',
+  )
+  assert.equal(
+    pickAccount([permOnlyAcc], {
+      provider: 'buddy',
+      model: 'deepseek-v4.1-flash',
+      now: NOW,
+      isFreeModel: true,
+      permanentLocks: { buddy: true },
+    })?.uid,
+    'u-perm',
+    'isFreeModel=true 豁免永久积分锁',
+  )
+  assert.equal(
+    pickAccount([hardExhaustedAcc], { provider: 'buddy', model: 'deepseek-v4.1-flash', now: NOW }),
+    undefined,
+    '付费模型受 hard 冷却拦截',
+  )
+  assert.equal(
+    pickAccount([hardExhaustedAcc], { provider: 'buddy', model: 'hy4flash-free', now: NOW })?.uid,
+    'u-hard',
+    '确认免费模型豁免 hard 额度耗尽冷却',
+  )
+
+  // 3) 免费模型遇到 disabled / breaker / degrade / restricted / soft 限流 / 模型自身冷却时仍必须严格拦截
+  for (const mutate of [
+    (s: AccountState) => { s.disabled = true },
+    (s: AccountState) => { s.needsRelogin = true },
+    (s: AccountState) => { s.breakerUntil = NOW + 60_000 },
+    (s: AccountState) => { s.degradeUntil = NOW + 60_000 },
+    (s: AccountState) => { s.restrictedUntil = NOW + 60_000 },
+    (s: AccountState) => { s.until = NOW + 60_000; s.coolKind = 'soft' },
+    (s: AccountState) => {
+      s.modelCooldowns['hy4flash-free'] = {
+        until: NOW + 60_000,
+        resetAt: 0,
+        reason: '6004',
+        hits: 1,
+        confirmed: 1,
+        cause: 'busy',
+        auditOnly: false,
+      }
+    },
+  ]) {
+    const blocked = createAccountState({ uid: 'u-blocked', nickname: '受限号', realm: 'cn', provider: 'buddy' })
+    mutate(blocked)
+    assert.equal(
+      pickAccount([blocked], { provider: 'buddy', model: 'hy4flash-free', now: NOW, isFreeModel: true }),
+      undefined,
+    )
+  }
+})
+

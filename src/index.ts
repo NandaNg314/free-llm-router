@@ -23,6 +23,11 @@ import { classify } from './upstream/client.js'
 import { diagnoseAccount, extractPaidStatusFromSummary, healthy } from './pool/state.js'
 import { AccountPoolDO, type PersistedCorsConfig } from './pool/AccountPoolDO.js'
 import { shouldSkipScheduledRun } from './taskrunner/dedup.js'
+import {
+  decideCnTaskDispatch,
+  isCnDailyScheduleHour,
+  isIntlDailyScheduleHour,
+} from './taskrunner/jitter.js'
 import { planByName, type PlanName } from './taskrunner/plans.js'
 import { cstDay } from './upstream/travel.js'
 import {
@@ -84,11 +89,18 @@ import { handleResponses } from './gateway/responses.js'
 import {
   handleChatCompletions,
   isAutoContinuationEnabled,
+  readUnifiedModelsConfig,
   refineModelScoped,
   resetAutoContinuationCache,
   resetMaxRotateCache,
+  resetUnifiedModelsConfigCache,
   setAutoContinuationOverride,
+  setUnifiedModelsConfigCache,
 } from './gateway/server.js'
+import {
+  buildUnifiedModelEntries,
+  isSubkeyModelAllowedWithUnified,
+} from './gateway/unified-models.js'
 import { handleMcp } from './gateway/mcp.js'
 import { WEB_TOOL_MODELS } from './gateway/web-tools.js'
 import {
@@ -121,13 +133,13 @@ import {
   toApiKeyView,
 } from './store/apikeys.js'
 import {
-  apiKeyOf,
   authenticate,
   clientIpOf,
   constantTimeEqual,
   countUse,
   isDataPlaneAuthPath,
   registerSubkeyUsage,
+  resolveRequestApiKey,
 } from './gateway/authz.js'
 import { authBlocked, noteAuthFailure, noteAuthSuccess } from './gateway/inbound-limit.js'
 import { BodyTooLargeError, MAX_IMPORT_BYTES, MAX_REQUEST_BYTES, readJsonCapped } from './gateway/body.js'
@@ -168,7 +180,7 @@ async function loadAggregateCatalogForModels(
         const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
         const accounts = await pool.listAccounts(realm, Date.now())
         const account = accounts.find(
-          (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled,
+          (a) => (a.provider ?? DEFAULT_PROVIDER) === providerId && !a.disabled && a.needsRelogin !== true,
         )
         if (account === undefined) continue
         const credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
@@ -223,6 +235,7 @@ import {
   buildVirtualModels,
   type ProviderCatalog,
 } from './gateway/aggregate.js'
+import { aggregateAliasForBareModel } from './providers/canonical-models.js'
 import {
   buildCodeArtsCallbackUrl,
   buildCodeArtsLoginUrl,
@@ -231,6 +244,8 @@ import {
   CODEARTS_LOGIN_STATE_TTL_MS,
   fetchCodeArtsTicket,
   generateCodeArtsLoginState,
+  isCodeArtsAuthFailure,
+  isCodeArtsNeedsReloginError,
   pollCodeArtsTicket,
 } from './providers/codearts.js'
 import {
@@ -270,11 +285,12 @@ function json(value: unknown, status = 200, extraHeaders: Record<string, string>
 const CORS_CACHE_TTL_MS = 10_000
 let corsConfigCache: { poolNs: unknown; at: number; value: PersistedCorsConfig | undefined } | undefined
 
-/** 重置运行时 CORS 与自动续写缓存（供写接口即时失效与单测隔离状态使用）。 */
+/** 重置运行时 CORS、自动续写与统一模型映射缓存（供写接口即时失效与单测隔离状态使用）。 */
 export function resetCorsConfigCache(): void {
   corsConfigCache = undefined
   setAutoContinuationOverride(undefined)
   resetAutoContinuationCache()
+  resetUnifiedModelsConfigCache()
 }
 
 async function readPersistedCorsConfig(env: Env, now = Date.now()): Promise<PersistedCorsConfig | undefined> {
@@ -334,14 +350,23 @@ async function authorized(request: Request, env: Env): Promise<boolean> {
   if (expected === undefined || expected === '') return false
 
   let allowXApiKey = false
+  let allowQueryKey = false
   try {
-    allowXApiKey = isDataPlaneAuthPath(new URL(request.url).pathname)
+    const u = new URL(request.url)
+    allowXApiKey = isDataPlaneAuthPath(u.pathname)
+    // 仅对只读额度汇总接口开放查询参数 ?key=<key>；请求头与 ?key= 同时给出且不一致直接拒绝
+    allowQueryKey = request.method === 'GET' && u.pathname === '/v1/balance-summary'
   } catch {
     allowXApiKey = false
+    allowQueryKey = false
   }
-  const provided = apiKeyOf(request, { allowXApiKey })
-  // 即使 provided 为空也执行恒定时间摘要比较，保持耗时形状一致
-  return await constantTimeEqual(provided, expected)
+  const resolved = await resolveRequestApiKey(request, { allowXApiKey, allowQueryKey })
+  if (resolved.conflict) {
+    await constantTimeEqual('', expected)
+    return false
+  }
+  // 即使 key 为空也执行恒定时间摘要比较，保持耗时形状一致
+  return await constantTimeEqual(resolved.key, expected)
 }
 
 /** 路由处理。 */
@@ -389,16 +414,37 @@ async function withRefreshRetry<T>(
     //
     // 宁可偶尔多试一次续期（续期失败会走 catch 落回原错误），
     // 也不要漏掉真正的鉴权失败。
-    const isAuth = /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|200003|APIG\.0602|\b401\b|\b403\b/i.test(
-      message,
-    )
+    const isAuth =
+      providerId === 'codearts'
+        ? isCodeArtsAuthFailure(0, message)
+        : /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|200003|APIG\.0602|\b401\b|\b403\b/i.test(
+            message,
+          )
     if (!isAuth) throw error
 
     const provider = findProvider(providerId)
     if (provider?.refresh === undefined) throw error
 
-    const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
-    await pool.putCredential(credential.uid, fresh, Date.now())
+    let fresh: ProviderCredential
+    try {
+      fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
+    } catch (refreshErr) {
+      if (providerId === 'codearts' && isCodeArtsNeedsReloginError(refreshErr)) {
+        const storageUid =
+          credential.uid.startsWith(`${providerId}:`) ? credential.uid : `${providerId}:${credential.uid}`
+        const reason = refreshErr instanceof Error ? refreshErr.message : String(refreshErr)
+        const marked = await pool.markNeedsRelogin(storageUid, reason, Date.now()).catch(() => false)
+        if (!marked && storageUid !== credential.uid) {
+          await pool.markNeedsRelogin(credential.uid, reason, Date.now()).catch(() => false)
+        }
+      }
+      throw refreshErr
+    }
+    const writeUid =
+      providerId === DEFAULT_PROVIDER || credential.uid.startsWith(`${providerId}:`)
+        ? credential.uid
+        : `${providerId}:${credential.uid}`
+    await pool.putCredential(writeUid, fresh, Date.now())
     console.warn(`[refresh] ${providerId} 续期成功，已回写凭据`)
     return { credential: fresh, value: await call(fresh) }
   }
@@ -1560,7 +1606,12 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     }
     // ⚠️ 此时还不知道模型，先传空串跳过模型检查；真正的模型校验在
     // 拿到请求体之后（见下方 `/v1/chat/completions`、`/v1/messages`、`/v1/responses` 等分支）。
-    const sub = await authenticate(request, env, '', { allowXApiKey: true })
+    // 仅对只读 `GET /v1/balance-summary` 支持 `?key=<key>`（若与请求头不一致已在 resolveRequestApiKey 中拒绝）。
+    const isBalanceSummaryGet = request.method === 'GET' && path === '/v1/balance-summary'
+    const sub = await authenticate(request, env, '', {
+      allowXApiKey: true,
+      allowQueryKey: isBalanceSummaryGet,
+    })
     if (sub.kind === 'none') {
       noteAuthFailure(clientIp)
       return json({ error: { message: 'Missing or invalid API key', type: 'authentication_error' } }, 401)
@@ -1573,14 +1624,14 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       return json({ error: { message: sub.reason, type: 'permission_error' } }, sub.status)
     }
     // 放行：占住请求数名额（token 在流结束时补）。
+    // ⚠️ `GET /v1/balance-summary` 是零上游开销的状态栏只读缓存查询，不扣减对话请求数配额。
     // ⚠️ 不 await —— 它不该拖慢首字节；失败只记日志。
     if (sub.kind === 'subkey') {
-      // ⚠️ 模型名此时还未知（在请求体里），传空串占名额即可；
-      // `countUse` 内部的 `recordApiKeyUse` 只累加请求数，不校验模型。
-      // 模型白名单改在拿到请求体后单独判（见下方 `subkeyRecord` 的用法）。
       subkeyRecord = sub.record
       registerSubkeyUsage(ctx, sub.record, clientIpOf(request))
-      ctx.waitUntil(countUse(env, sub.record, request, ''))
+      if (!isBalanceSummaryGet) {
+        ctx.waitUntil(countUse(env, sub.record, request, ''))
+      }
     }
   } else {
     noteAuthSuccess(clientIp)
@@ -1833,8 +1884,15 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
             }
             continue
           }
-          const b = await provider.balance(credential, AbortSignal.timeout(20_000))
-          const paid = extractPaidStatusFromSummary(b) ?? extractPaidStatusFromSummary(credential)
+          const { credential: activeCred, value: b } = await withRefreshRetry(
+            env,
+            pool,
+            providerId,
+            credential,
+            (c) => provider.balance!(c, AbortSignal.timeout(20_000)),
+          )
+          await pool.noteAuthSuccess(account.uid).catch(() => undefined)
+          const paid = extractPaidStatusFromSummary(b) ?? extractPaidStatusFromSummary(activeCred)
           await pool.updateBalance(account.uid, now, {
             credits: b.total,
             expiring: b.expiring,
@@ -1851,12 +1909,16 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
           })
           results.push({ uid: account.uid, provider: providerId, ok: true, credits: b.total })
         } catch (error) {
+          const errMsg = error instanceof Error ? error.message : String(error)
+          if (providerId === 'codearts' && isCodeArtsNeedsReloginError(error)) {
+            await pool.markNeedsRelogin(account.uid, errMsg, now).catch(() => false)
+          }
           // ⚠️ 失败**不写 0**：查不到 ≠ 没钱了。
           results.push({
             uid: account.uid,
             provider: providerId,
             ok: false,
-            error: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160),
+            error: errMsg.slice(0, 160),
           })
         }
       }
@@ -3585,6 +3647,36 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json({ ok: true, config: { ...config, autoContinuation: effectiveAutoCont } })
   }
 
+  // ── 出口感知统一模型映射配置（持久化至 cnPool + 镜像 globalPool + 短 TTL 缓存即时失效） ──
+  if (path === '/admin/config/unified-models' && request.method === 'GET') {
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const config = await cnPool.getUnifiedModelsConfig()
+    setUnifiedModelsConfigCache(env, config)
+    return json({ ok: true, config })
+  }
+  if (path === '/admin/config/unified-models' && request.method === 'POST') {
+    let body: unknown
+    try {
+      body = await readJsonCapped(request)
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        return jsonError(413, error.message, 'payload_too_large')
+      }
+      return jsonError(400, '请求体必须是合法 JSON', 'invalid_request_error')
+    }
+    if (body !== null && (typeof body !== 'object' || Array.isArray(body))) {
+      return jsonError(400, '统一模型配置必须是 JSON 对象或 null', 'invalid_request_error')
+    }
+    const payload =
+      body !== null && (body as { reset?: unknown }).reset === true ? null : body
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const saved = await cnPool.setUnifiedModelsConfig(payload)
+    const globalPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+    await globalPool.setUnifiedModelsConfig(saved)
+    setUnifiedModelsConfigCache(env, saved)
+    return json({ ok: true, config: saved })
+  }
+
   // ── 系统内置已知模型目录 ──
   if (path === '/admin/models/builtin' && request.method === 'GET') {
     const models = getBuiltinModels()
@@ -4662,6 +4754,10 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         provider: a.provider ?? DEFAULT_PROVIDER,
         nickname: a.nickname,
         disabled: a.disabled,
+        ...(a.needsRelogin === true ? { needsRelogin: true } : {}),
+        ...(typeof a.reloginReason === 'string' && a.reloginReason !== ''
+          ? { reloginReason: a.reloginReason }
+          : {}),
         reason: a.reason,
         credits: a.credits,
         creditsExpiring: a.creditsExpiring ?? 0,
@@ -4799,6 +4895,15 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     return json(result)
   }
 
+  // ── 轻量只读缓存额度汇总（供状态栏小组件高频轮询，绝不主动请求上游，保证 <5ms 返回） ──
+  if (path === '/v1/balance-summary') {
+    if (request.method !== 'GET') {
+      return jsonError(405, '/v1/balance-summary 仅支持 GET 请求', 'method_not_allowed')
+    }
+    const unifiedCfg = await readUnifiedModelsConfig(env)
+    return await handleBalanceSummary(url, env, subkeyRecord, unifiedCfg.enabled ? unifiedCfg.rules : [])
+  }
+
   // ── OpenAI 兼容：模型列表 ──
   if (path === '/v1/models' && request.method === 'GET') {
     // ⚠️ **必须遍历两个 realm**（实测踩到：WorkBuddy 国际版在目录里完全消失）。
@@ -4861,7 +4966,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
       if (userDisabledProviders.has(providerId)) continue
       const provider = findProvider(providerId)
       if (provider === undefined || !provider.capabilities.listModels) continue
-      const picked = list.find((x) => !x.account.disabled)
+      const picked = list.find((x) => !x.account.disabled && x.account.needsRelogin !== true)
       if (picked === undefined) continue
       // ⚠️ 用**该账号自己分片**的 stub 取凭据与停用列表
       const pool = pools.get(picked.realm)
@@ -4918,17 +5023,21 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     //
     // ⚠️ 单家失败只跳过它（`loadAggregateCatalogForModels` 内部逐家兜错）：
     // 聚合目录缺席不该让**整个** `/v1/models` 失败。
-    try {
-      // ⚠️ 读齐**每家的停用模型**（与主目录同源：都存在各自 realm 的分片里）。
-      // 两个 realm 都要读，否则「国际版关掉的模型」在国内分片里查不到、会冒出来。
-      const disabledModels = new Map<string, Set<string>>()
-      for (const providerId of providerIds()) {
-        const set = new Set<string>()
-        for (const p of pools.values()) {
+    // ⚠️ 读齐**每家的停用模型**（与主目录同源：都存在各自 realm 的分片里；供聚合目录与统一模型共用）。
+    const disabledModels = new Map<string, Set<string>>()
+    for (const providerId of providerIds()) {
+      const set = new Set<string>()
+      for (const p of pools.values()) {
+        try {
           for (const id of await p.getDisabledModels(providerId)) set.add(id)
+        } catch {
+          // ignore
         }
-        if (set.size > 0) disabledModels.set(providerId, set)
       }
+      if (set.size > 0) disabledModels.set(providerId, set)
+    }
+
+    try {
       const virtuals = await loadAggregateCatalogForModels(
         env, realms, userDisabledProviders, disabledModels,
       )
@@ -4980,6 +5089,25 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
         provider: AGGREGATE_PROVIDER_ID,
         error: error instanceof Error ? error.message : String(error),
       })
+    }
+
+    // ── 出口感知统一模型映射条目（仅当 enabled 且至少 1 个目标出口存在可用账号时追加） ──
+    const unifiedCfg = await readUnifiedModelsConfig(env)
+    if (unifiedCfg.enabled && unifiedCfg.rules.length > 0) {
+      const onlineProviders = new Set<string>()
+      for (const [providerId, list] of byProvider) {
+        if (userDisabledProviders.has(providerId)) continue
+        if (list.some((x) => !x.account.disabled && x.account.needsRelogin !== true)) {
+          onlineProviders.add(providerId)
+        }
+      }
+      const unifiedEntries = buildUnifiedModelEntries(unifiedCfg, onlineProviders, {
+        existingModels: data as any,
+        disabledModels,
+      })
+      for (const entry of unifiedEntries) {
+        data.push(annotateModelEntry({ ...(entry as unknown as Record<string, unknown>) }, 'unified'))
+      }
     }
 
     if (data.length === 0 && errors.length === 0) {
@@ -5039,7 +5167,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const allowlist = subkeyRecord?.limits.models ?? []
     const visible = allowlist.length === 0
       ? data
-      : data.filter((m) => modelAllowed(String(m.id ?? ''), allowlist))
+      : data.filter((m) => isSubkeyModelAllowedWithUnified(String(m.id ?? ''), allowlist, unifiedCfg))
 
     return json({
       object: 'list',
@@ -5054,7 +5182,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
     const realm = url.searchParams.get('realm') ?? 'cn'
     // 🔴 子密钥的**模型白名单**在这里判（2026-10-21 审查补，M6 指出高危）。
     // 详见下方 `subkeyModelDenied` 的说明。
-    const denied = await subkeyModelDenied(request, subkeyRecord)
+    const denied = await subkeyModelDenied(request, env, subkeyRecord)
     if (denied !== undefined) return denied
     const result = await handleChatCompletions(request, env, realm, ctx)
     // ⚠️ 流式响应必须**原样返回** —— 不要在这里包装或缓冲，
@@ -5072,7 +5200,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   if (path === '/v1/responses' && request.method === 'POST') {
     const realm = url.searchParams.get('realm') ?? 'cn'
     // 同 Chat 路径：子密钥的模型白名单在这条协议上也要判（否则换个协议就绕过）。
-    const denied = await subkeyModelDenied(request, subkeyRecord)
+    const denied = await subkeyModelDenied(request, env, subkeyRecord)
     if (denied !== undefined) return denied
     const result = await handleResponses(request, env, realm, ctx)
     // 同 Chat 路径：流式响应**原样返回**，不在这里包装或缓冲。
@@ -5083,7 +5211,8 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   if ((path === '/v1/messages/count_tokens' || path === '/messages/count_tokens') && request.method === 'POST') {
     if (subkeyRecord !== undefined && subkeyRecord.limits.models.length > 0) {
       const m = await peekOptionalModel(request)
-      if (m !== '' && !modelAllowed(m, subkeyRecord.limits.models)) {
+      const unifiedCfg = m === '' ? undefined : await readUnifiedModelsConfig(env)
+      if (m !== '' && !isSubkeyModelAllowedWithUnified(m, subkeyRecord.limits.models, unifiedCfg)) {
         return anthropicErrorJson(`该 API Key 不被允许使用模型「${m}」`, 403, 'permission_error')
       }
     }
@@ -5093,7 +5222,7 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
 
   if ((path === '/v1/messages' || path === '/messages') && request.method === 'POST') {
     const realm = url.searchParams.get('realm') ?? 'cn'
-    const denied = await subkeyModelDenied(request, subkeyRecord, { anthropic: true })
+    const denied = await subkeyModelDenied(request, env, subkeyRecord, { anthropic: true })
     if (denied !== undefined) return denied
     const result = await handleMessages(request, env, realm, ctx)
     return result.response
@@ -5264,6 +5393,259 @@ async function handleInner(request: Request, env: Env, ctx: ExecutionContext): P
   return json({ error: { message: 'not found', path } }, 404)
 }
 
+interface UnifiedRuleLike {
+  alias: string
+  targets: Record<string, string>
+}
+
+/**
+ * 推导受限子密钥允许访问的供应商集合（纯内存计算，零网络请求）。
+ *
+ * - 主密钥或 `limits.models` 为空数组 ⇒ 返回 `undefined`（允许全池未关闭供应商）；
+ * - `limits.models` 非空 ⇒ 精确收敛至白名单条目指向的供应商（含已启用统一模型别名的映射目标）。
+ */
+function resolveAllowedProvidersForSubkey(
+  record: ApiKeyRecord | undefined,
+  unifiedRules: readonly UnifiedRuleLike[] = [],
+): Set<string> | undefined {
+  if (record === undefined || record.limits.models.length === 0) return undefined
+  const allowed = new Set<string>()
+  const known = new Set(providerIds())
+  const builtins = getBuiltinModels()
+
+  for (const rawRule of record.limits.models) {
+    let r = rawRule.trim()
+    if (r === '') continue
+    const rl = r.toLowerCase()
+    if (rl.startsWith('expiringonly/')) r = r.slice('expiringonly/'.length).trim()
+    else if (rl.startsWith('expiring/')) r = r.slice('expiring/'.length).trim()
+    if (r === '') continue
+
+    // 1. 若命中已启用的统一模型别名，仅授权该别名配置的真实目标供应商
+    const unifiedHit = unifiedRules.find(
+      (u) => u.alias === r || u.alias.toLowerCase() === r.toLowerCase(),
+    )
+    if (unifiedHit !== undefined) {
+      for (const [pid, targetModel] of Object.entries(unifiedHit.targets)) {
+        if (known.has(pid) && typeof targetModel === 'string' && targetModel.trim() !== '') {
+          allowed.add(pid)
+        }
+      }
+      continue
+    }
+
+    // 2. 聚合模型规则（aggregate/auto 或 aggregate/<规范名>）
+    const lower = r.toLowerCase()
+    if (lower === AGGREGATE_PROVIDER_ID || lower.startsWith(`${AGGREGATE_PROVIDER_ID}/`)) {
+      const aggKey = lower.includes('/') ? lower.slice(lower.indexOf('/') + 1).trim() : AGGREGATE_AUTO
+      if (aggKey === '' || aggKey === AGGREGATE_AUTO) {
+        for (const p of PROVIDERS) {
+          if (p.capabilities.listModels) allowed.add(p.id)
+        }
+      } else {
+        for (const b of builtins) {
+          if (b.provider === AGGREGATE_PROVIDER_ID) continue
+          const bBare = b.id.includes('/') ? b.id.slice(b.id.indexOf('/') + 1) : b.id
+          if (aggregateAliasForBareModel(bBare) === aggKey) {
+            allowed.add(b.provider)
+          }
+        }
+      }
+      continue
+    }
+
+    // 3. 显式携带已知供应商前缀（如 codearts/deepseek-v4.1-flash、modelscope/Qwen/...）
+    const slash = r.indexOf('/')
+    if (slash > 0) {
+      const prefix = r.slice(0, slash).toLowerCase()
+      if (known.has(prefix)) {
+        allowed.add(prefix)
+        continue
+      }
+    }
+
+    // 4. 媒体 / 网页 / 语音固定裸模型名
+    if (
+      lower === 'wb-search' ||
+      lower === 'wb-fetch' ||
+      lower === 'wb-search-fetch' ||
+      lower === 'hy-3d' ||
+      lower === 'hy-3d-3.0' ||
+      lower === 'hy-3d-3.1'
+    ) {
+      allowed.add(WORKBUDDY_INTL.id)
+      allowed.add(DEFAULT_PROVIDER)
+      continue
+    }
+    if (
+      lower === 'hy-image-3.5' ||
+      lower === 'kling-video-v3' ||
+      lower === 'minimax-video-h3' ||
+      lower === 'hunyuan-tts-2.5' ||
+      lower === 'hunyuan-asr'
+    ) {
+      allowed.add(WORKBUDDY_INTL.id)
+      continue
+    }
+
+    // 5. 常规对话裸模型名：匹配内置目录与规范裸名别名，兜底默认供应商与国际互备池
+    let matchedBuiltin = false
+    for (const b of builtins) {
+      if (b.provider === AGGREGATE_PROVIDER_ID) continue
+      const bBare = b.id.includes('/') ? b.id.slice(b.id.indexOf('/') + 1) : b.id
+      if (bBare === r || bBare.toLowerCase() === lower) {
+        allowed.add(b.provider)
+        matchedBuiltin = true
+      }
+    }
+    const bareAgg = aggregateAliasForBareModel(r)
+    if (bareAgg !== undefined) {
+      for (const b of builtins) {
+        if (b.provider === AGGREGATE_PROVIDER_ID) continue
+        const bBare = b.id.includes('/') ? b.id.slice(b.id.indexOf('/') + 1) : b.id
+        if (aggregateAliasForBareModel(bBare) === bareAgg) {
+          allowed.add(b.provider)
+          matchedBuiltin = true
+        }
+      }
+    }
+    if (!matchedBuiltin) {
+      allowed.add(DEFAULT_PROVIDER)
+      allowed.add(WORKBUDDY_INTL.id)
+    }
+  }
+
+  return allowed
+}
+
+export interface ProviderBalanceBucket {
+  totalCredits: number
+  expiringCredits: number
+  earliestExpiry: number
+  healthyAccounts: number
+  totalAccounts: number
+  unknownBalanceAccounts: number
+}
+
+/**
+ * 处理 `GET /v1/balance-summary`：只读汇总缓存余额快照，绝不触发任何上游网络调用。
+ */
+async function handleBalanceSummary(
+  url: URL,
+  env: Env,
+  subkeyRecord: ApiKeyRecord | undefined,
+  unifiedRules: readonly UnifiedRuleLike[] = [],
+): Promise<Response> {
+  const now = Date.now()
+  const requestedRealm = url.searchParams.get('realm')
+  const realms = requestedRealm === null || requestedRealm === '' ? ['cn', 'global'] : [requestedRealm]
+
+  const userDisabledProviders = new Set<string>()
+  try {
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    for (const id of (await cnPool.getProviderSettings()).disabled) userDisabledProviders.add(id)
+  } catch {
+    // 偏好读取异常时不阻断只读汇总
+  }
+
+  const allowedProviders = resolveAllowedProvidersForSubkey(subkeyRecord, unifiedRules)
+  const round4 = (n: number): number => Math.round(n * 10_000) / 10_000
+
+  let totalCredits = 0
+  let expiringCredits = 0
+  let earliestExpiry = 0
+  let healthyAccounts = 0
+  let totalAccounts = 0
+  let unknownBalanceAccounts = 0
+  let latestUpdatedAt = 0
+  const byProvider: Record<string, ProviderBalanceBucket> = {}
+
+  for (const r of realms) {
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(r))
+    const accounts = await pool.listAccounts(r, now)
+    for (const a of accounts) {
+      const needsRelogin = (a as { needsRelogin?: boolean }).needsRelogin === true
+      if (a.disabled || needsRelogin) continue
+
+      const providerId = a.provider ?? DEFAULT_PROVIDER
+      if (userDisabledProviders.has(providerId)) continue
+      if (allowedProviders !== undefined && !allowedProviders.has(providerId)) continue
+
+      let bucket = byProvider[providerId]
+      if (bucket === undefined) {
+        bucket = {
+          totalCredits: 0,
+          expiringCredits: 0,
+          earliestExpiry: 0,
+          healthyAccounts: 0,
+          totalAccounts: 0,
+          unknownBalanceAccounts: 0,
+        }
+        byProvider[providerId] = bucket
+      }
+
+      totalAccounts += 1
+      bucket.totalAccounts += 1
+
+      if (healthy(a, now)) {
+        healthyAccounts += 1
+        bucket.healthyAccounts += 1
+      }
+
+      const samples = Array.isArray(a.samples) ? a.samples : []
+      const lastSampleAt = samples.length > 0 ? (samples[samples.length - 1]?.at ?? 0) : 0
+      if (lastSampleAt > latestUpdatedAt) latestUpdatedAt = lastSampleAt
+
+      const creditsVal =
+        typeof a.credits === 'number' && Number.isFinite(a.credits) && a.credits >= 0 ? a.credits : 0
+      const rawExp =
+        typeof a.creditsExpiring === 'number' && Number.isFinite(a.creditsExpiring) && a.creditsExpiring > 0
+          ? a.creditsExpiring
+          : 0
+      const rawExpAt =
+        typeof a.creditsEarliestExpiry === 'number' &&
+        Number.isFinite(a.creditsEarliestExpiry) &&
+        a.creditsEarliestExpiry > 0
+          ? a.creditsEarliestExpiry
+          : 0
+
+      // 从未采样且所有额度快照均为初始 0 时归入 unknownBalanceAccounts，不伪装成已确证 0 余额
+      const hasSnapshot = samples.length > 0 || creditsVal > 0 || rawExp > 0 || rawExpAt > 0
+      if (!hasSnapshot) {
+        unknownBalanceAccounts += 1
+        bucket.unknownBalanceAccounts += 1
+        continue
+      }
+
+      totalCredits = round4(totalCredits + creditsVal)
+      bucket.totalCredits = round4(bucket.totalCredits + creditsVal)
+
+      const validExpiring = rawExp > 0 && (rawExpAt === 0 || rawExpAt > now) ? rawExp : 0
+      expiringCredits = round4(expiringCredits + validExpiring)
+      bucket.expiringCredits = round4(bucket.expiringCredits + validExpiring)
+
+      if (rawExpAt > now) {
+        earliestExpiry = earliestExpiry === 0 ? rawExpAt : Math.min(earliestExpiry, rawExpAt)
+        bucket.earliestExpiry =
+          bucket.earliestExpiry === 0 ? rawExpAt : Math.min(bucket.earliestExpiry, rawExpAt)
+      }
+    }
+  }
+
+  return json({
+    object: 'balance.summary',
+    realm: realms.length === 1 ? realms[0] : 'all',
+    totalCredits,
+    expiringCredits,
+    earliestExpiry,
+    healthyAccounts,
+    totalAccounts,
+    unknownBalanceAccounts,
+    updatedAt: latestUpdatedAt > 0 ? latestUpdatedAt : null,
+    byProvider,
+  })
+}
+
 function isImageModelId(model: string): boolean {
   return model !== '' && /image|flux|dall-e|seedream|kolors|wanx/i.test(model)
 }
@@ -5381,6 +5763,7 @@ async function peekOptionalModel(request: Request): Promise<string> {
 
 async function subkeyModelDenied(
   request: Request,
+  env: Env,
   record: ApiKeyRecord | undefined,
   options?: { anthropic?: boolean },
 ): Promise<Response | undefined> {
@@ -5401,7 +5784,8 @@ async function subkeyModelDenied(
       400,
     )
   }
-  if (modelAllowed(model, rules)) return undefined
+  const unifiedCfg = await readUnifiedModelsConfig(env)
+  if (isSubkeyModelAllowedWithUnified(model, rules, unifiedCfg)) return undefined
   if (options?.anthropic === true) {
     return anthropicErrorJson(`该 API Key 不被允许使用模型「${model}」`, 403, 'permission_error')
   }
@@ -5450,6 +5834,8 @@ async function startRun(
     plan: PlanName
     /** ⚠️ 显式开启才会跑「需要真实对话」的任务（会消耗配额）。 */
     includeRealChat?: boolean
+    /** 可选预约触发时间戳（epoch ms，用于国内任务 08:00–10:00 确定性错峰排程）。 */
+    scheduledAt?: number
   },
 ): Promise<{ ok: boolean; queued: number; note?: string }> {
   const steps: TaskStep[] = planByName(input.plan, {
@@ -5462,7 +5848,7 @@ async function startRun(
     accessToken: input.accessToken,
   }
   const stub = env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(input.uid))
-  await stub.start(input.uid, steps, context, Date.now(), input.plan)
+  await stub.start(input.uid, steps, context, input.scheduledAt ?? Date.now(), input.plan)
   return {
     ok: true,
     queued: steps.length,
@@ -5597,6 +5983,7 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
     for (const account of accounts) {
       // ⚠️ 停用的账号不动它 —— 用户明确说不用了，续期是多余的上游请求。
       if (account.disabled) continue
+      if (account.needsRelogin === true) continue
       const providerId = account.provider ?? DEFAULT_PROVIDER
       const provider = findProvider(providerId)
       // ⚠️ 没有 `refresh` 的家直接跳过（见函数注释的说明）。
@@ -5664,6 +6051,9 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
         // 而请求路径的 401 兜底仍会兜住真正失效的凭据。
         const message = error instanceof Error ? error.message : String(error)
         console.error(`[cron] ${providerId} ${account.uid} 主动续期失败：`, message)
+        if (providerId === 'codearts' && isCodeArtsNeedsReloginError(error)) {
+          await pool.markNeedsRelogin(account.uid, message, now).catch(() => false)
+        }
         // 🔴 同时写进面板日志（否则用户只能去 `docker logs` 里找）。
         logBackgroundFailure(pool, {
           uid: account.uid,
@@ -5701,7 +6091,41 @@ async function refreshExpiringCredentials(env: Env, now: number): Promise<void> 
  * - **停用账号也刷新**：用户可能只是临时停用，余额仍需准确（且不消耗请求配额
  *   —— 这是只读端点）。但为省上游调用，**优先只刷启用中的**。
  */
-async function refreshAccountBalances(env: Env, now: number): Promise<void> {  let refreshed = 0
+export interface WarmBalanceCandidate {
+  pool: DurableObjectStub<AccountPoolDO>
+  account: AccountState
+  providerId: string
+  provider: NonNullable<ReturnType<typeof findProvider>>
+  credential: ProviderCredential
+}
+
+/**
+ * 检查单个账号是否满足后台余额预热条件（纯本地存储读取，零网络调用）。
+ */
+export async function checkWarmBalanceEligibility(
+  env: Env,
+  pool: DurableObjectStub<AccountPoolDO>,
+  account: AccountState,
+): Promise<WarmBalanceCandidate | undefined> {
+  if (account.disabled || account.needsRelogin === true) return undefined
+  const providerId = account.provider ?? DEFAULT_PROVIDER
+  const template = findProvider(providerId)
+  const provider = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : template
+  if (provider === undefined || provider.balance === undefined) return undefined
+
+  let credential: ProviderCredential | undefined
+  try {
+    credential = (await pool.getCredential(account.uid)) as ProviderCredential | undefined
+  } catch {
+    return undefined
+  }
+  if (credential === undefined) return undefined
+  if (credential.extras?.['authMode'] === 'api_key') return undefined
+  return { pool, account, providerId, provider, credential }
+}
+
+async function refreshAccountBalances(env: Env, now: number): Promise<void> {
+  let refreshed = 0
   let failed = 0
   let skipped = 0
 
@@ -5709,11 +6133,11 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {  l
     const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
     const accounts = await pool.listAccounts(realm, now)
     for (const account of accounts) {
+      if (account.needsRelogin === true) {
+        skipped += 1
+        continue
+      }
       const providerId = account.provider ?? DEFAULT_PROVIDER
-      // ⚠️ **必须用绑定版**：`findProvider()` 返回的是未绑定的模板，
-      // 而 buddy（国内版）的 `balance()` 闭包捕获了 `env`（用来决定计费域）。
-      // 拿模板去调会抛 `Cannot read properties of undefined (reading 'UPSTREAM_CHAT_BASE')`
-      // —— 实测踩到：3 个 buddy 账号的余额刷新全部失败。
       const template = findProvider(providerId)
       const provider = providerId === DEFAULT_PROVIDER ? bindBuddy(env) : template
       if (provider?.balance === undefined) {
@@ -5728,114 +6152,18 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {  l
         skipped += 1
         continue
       }
-      if (credential === undefined) {
-        skipped += 1
-        continue
-      }
-      if (credential.extras?.['authMode'] === 'api_key') {
+      if (credential === undefined || credential.extras?.['authMode'] === 'api_key') {
         skipped += 1
         continue
       }
 
-      try {
-        /**
-         * 🔴 **余额刷新也要走续期重试**（2026-11-05 补，线上实测事故）。
-         *
-         * ## 事故
-         *
-         * AMD VPS 上的国内账号 `2f7e22bc`（Enki）**连续 13 天**每小时报
-         * `余额查询失败（auth_error）：upstream 401`，共 **293 次**：
-         * - `expiresAt` 写着 **11-14 才过期** ⇒ `refreshExpiringCredentials` 永远跳过；
-         * - 它当时**没有流量**（`lastSuccess` 停在 10-23），所以请求路径的
-         *   `withRefreshRetry` 也永远轮不到它；
-         * - 余额刷新**只打请求、不试续期** ⇒ 它就这样空转了两周，面板显示「正常」。
-         *
-         * ## 根因（比「refresh token 失效」更普遍）
-         *
-         * **「只看本地记录的时间」这个判据本身是错的**：`expiresAt` 是本地记的，
-         * 上游完全可能**提前吊销**（实测就是）。只要这样，续期就永远不会触发。
-         *
-         * ⇒ 正确判据是**由实际失败驱动**：撞到鉴权错误就先续期一次再重试。
-         * 这与请求路径 `withRefreshRetry` 是同一条纪律，只是这里原来漏了。
-         *
-         * ⚠️ 只对**鉴权类**错误续期（429/5xx 续期没意义，只会白打上游）。
-         * ⚠️ 续期失败**不惩罚账号**（可能是网络抖动），仍按「本轮失败」记录。
-         */
-        let b: Awaited<ReturnType<typeof provider.balance>>
-        try {
-          b = await provider.balance(credential, AbortSignal.timeout(20_000))
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          const isAuth = /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|\b401\b|\b403\b/i.test(message)
-          if (!isAuth || provider.refresh === undefined) throw error
-          console.warn(`[cron] ${providerId} ${account.uid} 余额刷新撞鉴权错误，尝试续期：${message}`)
-          const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
-          await pool.putCredential(account.uid, fresh, now)
-          console.log(`[cron] ${providerId} ${account.uid} 续期成功，重试余额查询`)
-          credential = fresh
-          b = await provider.balance(fresh, AbortSignal.timeout(20_000))
-        }
-        // ⚠️ 走到这里说明「续期也救不回来」或「本来就不是鉴权错误」——
-        // 成功路径必须清零鉴权失败计数（否则偶发失败会累积成误判）。
-        await pool.noteAuthSuccess(account.uid).catch(() => undefined)
-        const paid = extractPaidStatusFromSummary(b) ?? extractPaidStatusFromSummary(credential)
-        await pool.updateBalance(account.uid, now, {
-          credits: b.total,
-          expiring: b.expiring,
-          earliestExpiry: b.earliestExpiry,
-          ...(typeof paid === 'boolean' ? { isPaid: paid } : {}),
-        })
-        // 🔴 余额恢复 ⇒ 解冻 `hard`（402 余额耗尽）冷却（与 `/admin/accounts/balance`
-        // 同一段逻辑，两处各写一份必然分叉）。余额为 0 / 仍在冷却的其它维度一律不动，
-        // 细节见 `AccountPoolDO.clearHardIfRecovered`。
-        // ⚠️ 失败不影响本轮「刷新成功」的结论：余额已经落盘了。
-        await pool.clearHardIfRecovered(account.uid, b.total, now).catch((error: unknown) => {
-          console.warn(`[cron] ${providerId} ${account.uid} 解冻 hard 冷却失败：`, error instanceof Error ? error.message : String(error))
-        })
-        refreshed += 1
-      } catch (error) {
-        // ⚠️ 如实记录，且**不写 0** —— 查不到 ≠ 没钱了。
-        failed += 1
-        const message = error instanceof Error ? error.message : String(error)
-        console.warn(`[cron] ${providerId} ${account.uid} 余额刷新失败（保持原值）：`, message)
-
-        /**
-         * 🔴 **鉴权失败连续 3 次 ⇒ 自动标记「需重新登录」**（2026-11-05 补）。
-         *
-         * 事故：账号 `2f7e22bc` 连续 13 天每小时 401（293 次），
-         * 面板一直显示「正常」—— 没有任何机制把「一直 401」变成可见状态。
-         *
-         * ⚠️ 只在**已经尝试过续期**（上面那段）仍然鉴权失败时才走到这里 ⇒
-         * 「能自动续期的过期」不会被误杀，只有续期也救不回来的才判死。
-         * ⚠️ 阈值 3 与 `session_dead` 同口径（单次多为网络抖动）。
-         * ⚠️ 只禁用、**不删除凭据** —— 用户重新登录即可恢复，积分也还在。
-         */
-        const isAuth = /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|\b401\b|\b403\b/i.test(message)
-        if (isAuth && provider.refresh !== undefined) {
-          const verdict = await pool
-            .noteAuthFailure(account.uid, now, `${providerId} 鉴权失败（续期后仍失败）`)
-            .catch(() => undefined)
-          if (verdict?.disabled === true) {
-            console.warn(
-              `[cron] ${providerId} ${account.uid} 连续 ${verdict.streak} 次鉴权失败，已自动停用（需重新登录）`,
-            )
-            logBackgroundFailure(pool, {
-              uid: account.uid,
-              provider: providerId,
-              action: 'cron:auth',
-              message: `连续 ${verdict.streak} 次鉴权失败（续期也无法恢复），已自动停用，请到面板重新登录`,
-            })
-          }
-        }
-
-        // 🔴 同时写进面板日志（与续期失败同处理）。
-        logBackgroundFailure(pool, {
-          uid: account.uid,
-          provider: providerId,
-          action: 'cron:balance',
-          message: `余额刷新失败（保持原值）：${message}`,
-        })
-      }
+      const outcome = await executeAccountBalanceRefresh(
+        { pool, account, providerId, provider, credential },
+        now,
+        { logTag: 'cron' },
+      )
+      if (outcome.ok) refreshed += 1
+      else failed += 1
     }
   }
 
@@ -5844,14 +6172,124 @@ async function refreshAccountBalances(env: Env, now: number): Promise<void> {  l
   }
 }
 
+/**
+ * 执行单个已就绪账号的余额刷新（含 401/403 自动续期重试、`updateBalance` 与 `clearHardIfRecovered`）。
+ * 供整点 `scheduled()`（`refreshAccountBalances`）与 Node 启动后 `warm_sweep` 共用同一份判据。
+ */
+export async function executeAccountBalanceRefresh(
+  candidate: WarmBalanceCandidate,
+  now: number,
+  options: { signal?: AbortSignal; logTag?: 'cron' | 'warm' } = {},
+): Promise<{ ok: true; credits: number } | { ok: false; error: string }> {
+  const { pool, account, providerId, provider } = candidate
+  let { credential } = candidate
+  const tag = options.logTag ?? 'cron'
+  if (provider.balance === undefined) {
+    return { ok: false, error: '该供应商无余额端点' }
+  }
+  const makeSignal = (ms: number): AbortSignal => {
+    const t = AbortSignal.timeout(ms)
+    return options.signal !== undefined && typeof AbortSignal.any === 'function'
+      ? AbortSignal.any([options.signal, t])
+      : t
+  }
+
+  try {
+    let b: Awaited<ReturnType<typeof provider.balance>>
+    try {
+      b = await provider.balance(credential, makeSignal(20_000))
+    } catch (error) {
+      if (options.signal?.aborted) throw error
+      const message = error instanceof Error ? error.message : String(error)
+      const isAuth =
+        providerId === 'codearts'
+          ? isCodeArtsAuthFailure(0, message)
+          : /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|APIG\.0602|APIG\.0301|\b401\b|\b403\b/i.test(
+              message,
+            )
+      if (!isAuth || provider.refresh === undefined) throw error
+      console.warn(`[${tag}] ${providerId} ${account.uid} 余额刷新撞鉴权错误，尝试续期：${message}`)
+      const fresh =
+        options.signal === undefined
+          ? await provider.refresh(credential, AbortSignal.timeout(30_000))
+          : await provider.refresh(credential, makeSignal(30_000))
+      await pool.putCredential(account.uid, fresh, now)
+      console.log(`[${tag}] ${providerId} ${account.uid} 续期成功，重试余额查询`)
+      credential = fresh
+      b = await provider.balance(fresh, makeSignal(20_000))
+    }
+
+    await pool.noteAuthSuccess(account.uid).catch(() => undefined)
+    const paid = extractPaidStatusFromSummary(b) ?? extractPaidStatusFromSummary(credential)
+    await pool.updateBalance(account.uid, now, {
+      credits: b.total,
+      expiring: b.expiring,
+      earliestExpiry: b.earliestExpiry,
+      ...(typeof paid === 'boolean' ? { isPaid: paid } : {}),
+    })
+    await pool.clearHardIfRecovered(account.uid, b.total, now).catch((error: unknown) => {
+      console.warn(
+        `[${tag}] ${providerId} ${account.uid} 解冻 hard 冷却失败：`,
+        error instanceof Error ? error.message : String(error),
+      )
+    })
+    return { ok: true, credits: b.total }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (options.signal?.aborted) {
+      return { ok: false, error: message }
+    }
+    console.warn(`[${tag}] ${providerId} ${account.uid} 余额刷新失败（保持原值）：`, message)
+
+    if (providerId === 'codearts' && isCodeArtsNeedsReloginError(error)) {
+      await pool.markNeedsRelogin(account.uid, message, now).catch(() => false)
+    } else {
+      const isAuth =
+        providerId === 'codearts'
+          ? isCodeArtsAuthFailure(0, message)
+          : /auth_error|unauthor|forbidden|invalid.?token|token.?expir|expired|APIG\.0602|APIG\.0301|\b401\b|\b403\b/i.test(
+              message,
+            )
+      if (isAuth && provider.refresh !== undefined) {
+        const verdict = await pool
+          .noteAuthFailure(account.uid, now, `${providerId} 鉴权失败（续期后仍失败）`)
+          .catch(() => undefined)
+        if (verdict?.disabled === true) {
+          console.warn(
+            `[${tag}] ${providerId} ${account.uid} 连续 ${verdict.streak} 次鉴权失败，已自动停用（需重新登录）`,
+          )
+          logBackgroundFailure(pool, {
+            uid: account.uid,
+            provider: providerId,
+            action: `${tag}:auth`,
+            message: `连续 ${verdict.streak} 次鉴权失败（续期也无法恢复），已自动停用，请到面板重新登录`,
+          })
+        }
+      }
+    }
+
+    logBackgroundFailure(pool, {
+      uid: account.uid,
+      provider: providerId,
+      action: `${tag}:balance`,
+      message: `余额刷新失败（保持原值）：${message}`,
+    })
+    return { ok: false, error: message }
+  }
+}
+
 async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   const now = Date.now()
 
-  // 面板「路由与调度」里的两个开关。读失败按默认（都开）处理，绝不因此整轮跳过。
-  let routing = { autoTaskCron: true, autoRefreshCredential: true }
+  // 面板「路由与调度」里的开关。读失败按默认处理，绝不因此整轮跳过。
+  let routing = { autoTaskCron: true, autoRefreshCredential: true, cnTaskJitter: false }
   try {
     const cfg = await env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn')).getRoutingConfig()
-    routing = { autoTaskCron: cfg.autoTaskCron !== false, autoRefreshCredential: cfg.autoRefreshCredential !== false }
+    routing = {
+      autoTaskCron: cfg.autoTaskCron !== false,
+      autoRefreshCredential: cfg.autoRefreshCredential !== false,
+      cnTaskJitter: cfg.cnTaskJitter === true,
+    }
   } catch (error) {
     console.error('[cron] 读路由配置失败，按默认处理：', error instanceof Error ? error.message : String(error))
   }
@@ -5911,8 +6349,22 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
   }
 
   const hour = hourUtc8(now)
-  const job = SCHEDULE_UTC8[hour]
-  const plan = job?.plan
+  const fixedJob = SCHEDULE_UTC8[hour]
+  const isGrowthHour = fixedJob?.plan === 'growth'
+  const cnDailyDue = !isGrowthHour && isCnDailyScheduleHour(hour, routing.cnTaskJitter)
+  const intlDailyDue = !isGrowthHour && isIntlDailyScheduleHour(hour)
+  const plan: PlanName | undefined = isGrowthHour
+    ? fixedJob.plan
+    : cnDailyDue
+      ? 'daily'
+      : intlDailyDue
+        ? 'intlDaily'
+        : undefined
+  const activeJob: ScheduleJob | undefined = isGrowthHour
+    ? fixedJob
+    : cnDailyDue
+      ? { plan: 'daily' }
+      : undefined
 
   // 非任务时点：**续期已经做过了**，这里再返回。
   // ⚠️ 注意：续期在 return **之前** —— 这正是「非任务时点也保持登录态」的关键。
@@ -5924,72 +6376,72 @@ async function scheduled(event: ScheduledController, env: Env): Promise<void> {
     console.log(`[cron] ${event.cron} UTC+8 ${hour} 时点有任务（${plan}），但「自动每日任务」已在面板关闭，跳过`)
     return
   }
-  if (job === undefined) return
 
-  const realm = 'cn'
-  const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
-  const accounts = await stub.listAccounts(realm, now)
+  if (activeJob !== undefined) {
+    const realm = 'cn'
+    const stub = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const accounts = await stub.listAccounts(realm, now)
 
-  console.log(
-    `[cron] ${event.cron} UTC+8 ${hour} 时点 → plan=${job.plan} includeRealChat=${job.includeRealChat ?? false}，扇出 ${accounts.length} 个账号`,
-  )
+    console.log(
+      `[cron] ${event.cron} UTC+8 ${hour} 时点 → plan=${activeJob.plan}`
+        + ` includeRealChat=${activeJob.includeRealChat ?? false}`
+        + ` cnTaskJitter=${routing.cnTaskJitter}，扫描 ${accounts.length} 个国内池账号`,
+    )
 
-  for (const account of accounts) {
-    if (account.disabled) continue
-    const isBuddy = (account.provider ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER
-    // 只有 Buddy 账号支持完整的成长与对话任务；其余账号若遇 growth 自动降级为 daily 签到
-    const planToRun = job.plan === 'growth' && !isBuddy ? 'daily' : job.plan
-    const includeRealChat = isBuddy ? (job.includeRealChat ?? false) : false
+    for (const account of accounts) {
+      if (account.disabled || account.needsRelogin === true) continue
+      const isBuddy = (account.provider ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER
+      // 只有 Buddy 账号支持完整的成长与对话任务；其余账号若遇 growth 自动降级为 daily 签到
+      const planToRun = activeJob.plan === 'growth' && !isBuddy ? 'daily' : activeJob.plan
+      const includeRealChat = isBuddy ? (activeJob.includeRealChat ?? false) : false
 
-    try {
-      /**
-       * 🔴 **按日去重**（2026-10-21 审查补，M6 指出「同一函数两套判据」）。
-       *
-       * 国际版的扇出（`fanOutIntlDailyChat`）会跳过「今天已成功」的账号，
-       * 而**国内这条循环没有**。于是只要 cron 在同一个小时窗口里被触发两次
-       *（进程恰在整点后 2 分钟内重启 —— `lastDispatchedHour` 是**进程内**变量，
-       * 重启即归零），`growth` 计划（含 5 个真实对话）就会**再烧一遍配额**。
-       *
-       * 修法：与「上一次已跑完同一计划且落在今天（UTC+8）」的账号直接跳过。
-       * 日键用固定 UTC+8 —— 与项目其它日界（签到、额度）同一条纪律，
-       * 不能用本机时区。
-       *
-       * ⚠️ 只对 **cron 扇出**去重，**不影响**面板上的「手动执行」：
-       * 用户点了就是要现在再跑一遍，那是显式意图。
-       */
-      // ⚠️ **读状态失败不得阻止任务**：去重是「优化」，漏跑才是「故障」。
-      // 若这里抛错并被外层 catch 吞掉，该账号今天就不会跑了 —— 方向反了。
-      let alreadyDoneToday = false
+      // 国内每日签到任务支持 08:00–10:00 确定性随机错峰排程（`jitter.ts`）；01:00/03:00 growth 保持整点执行
+      let delayMs = 0
+      if (!isGrowthHour) {
+        const decision = decideCnTaskDispatch({
+          uid: account.uid,
+          now,
+          hourUtc8: hour,
+          cnTaskJitter: routing.cnTaskJitter,
+        })
+        if (!decision.shouldRun) continue
+        delayMs = decision.delayMs
+      }
+
       try {
-        const status = await env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(account.uid)).status(account.uid)
-        alreadyDoneToday = shouldSkipScheduledRun({ status, plan: planToRun, now })
+        let alreadyDoneToday = false
+        try {
+          const status = await env.TASK_RUNNER.get(env.TASK_RUNNER.idFromName(account.uid)).status(account.uid)
+          alreadyDoneToday = shouldSkipScheduledRun({ status, plan: planToRun, now })
+        } catch (error) {
+          console.warn(
+            `[cron] 读 ${account.uid} 的运行状态失败，改为直接入队（去重让位于不漏跑）：`,
+            error instanceof Error ? error.message : String(error),
+          )
+        }
+        if (alreadyDoneToday) {
+          console.log(`[cron] 账号 ${account.uid} 今天已跑完 ${planToRun}，跳过（防重复烧配额）`)
+          continue
+        }
+        await startRun(env, {
+          uid: account.uid,
+          nickname: account.nickname,
+          realm: account.realm,
+          accessToken: '',
+          plan: planToRun,
+          includeRealChat,
+          scheduledAt: now + delayMs,
+        })
       } catch (error) {
-        console.warn(
-          `[cron] 读 ${account.uid} 的运行状态失败，改为直接入队（去重让位于不漏跑）：`,
-          error instanceof Error ? error.message : String(error),
-        )
+        // 单个账号失败不影响其他账号；如实记录原因（不静默）
+        console.error(`[cron] 账号 ${account.uid} 入队失败：`, error instanceof Error ? error.message : String(error))
       }
-      if (alreadyDoneToday) {
-        console.log(`[cron] 账号 ${account.uid} 今天已跑完 ${planToRun}，跳过（防重复烧配额）`)
-        continue
-      }
-      await startRun(env, {
-        uid: account.uid,
-        nickname: account.nickname,
-        realm: account.realm,
-        accessToken: '',
-        plan: planToRun,
-        includeRealChat,
-      })
-    } catch (error) {
-      // 单个账号失败不影响其他账号；如实记录原因（不静默）
-      console.error(`[cron] 账号 ${account.uid} 入队失败：`, error instanceof Error ? error.message : String(error))
     }
   }
 
-  // 国际版（workbuddy.ai）每日活跃打卡：只在签到时点（9/21）跑，当天已成功的跳过。
+  // 国际版（workbuddy.ai）每日活跃打卡：只在国际签到时点（9/21）跑，当天已成功的跳过。
   // 两个时点 = 一次重试机会；按北京时间日去重，无论上游按哪个时区换日都每天至多一次。
-  if (job.plan === 'daily') {
+  if (intlDailyDue) {
     try {
       await fanOutIntlDailyChat(env, now)
     } catch (error) {

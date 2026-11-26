@@ -96,6 +96,12 @@ export interface Env {
    */
   AUTO_CONTINUATION?: string
 
+  /**
+   * Node.js 服务启动后账号余额错峰温和预热开关（默认 `true` 开启；
+   * 显式设为 `0` / `false` / `off` / `no` 关闭）。
+   */
+  WARM_START_BALANCE?: string
+
   /** 混元 3D 临时云凭证自动签发与手工 STS / Token 覆盖（见 `upstream/three-d.ts`）。 */
   THREE_D_AUTO_TOKEN?: string
   THREE_D_TEMP_TOKEN?: string
@@ -351,4 +357,18 @@ export function resolveCorsOrigins(env: Env): string[] {
 /** 从 `Env` 解析流式自动续写默认开关（默认 `false` 保守策略）。 */
 export function resolveAutoContinuation(env: Env): boolean {
   return parseEnabled(env.AUTO_CONTINUATION, false)
+}
+
+/** Node 启动后延迟多久触发首次温和余额预热（20 秒，避开启动瞬态高峰）。 */
+export const WARM_START_DELAY_MS = 20_000
+
+/** 启动预热仅刷新距上次采样超过该时长（15 分钟）的账号，避免短时间内重启重复打上游。 */
+export const WARM_START_STALE_MS = 15 * 60 * 1000
+
+/** 启动预热逐账号串行刷新的间隔（2 秒，温和错峰）。 */
+export const WARM_START_GAP_MS = 2_000
+
+/** 从 `Env` 解析启动余额温和预热开关（默认 `true` 开启，`0/false/off/no` 关闭）。 */
+export function resolveWarmStartBalance(env: Pick<Env, 'WARM_START_BALANCE'>): boolean {
+  return parseEnabled(env.WARM_START_BALANCE, true)
 }

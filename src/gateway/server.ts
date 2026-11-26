@@ -76,10 +76,56 @@ import {
   type ProviderCatalog,
 } from './aggregate.js'
 import { splitModelName, type ProviderCredential } from '../providers/types.js'
+import { isCodeArtsAuthFailure, isCodeArtsNeedsReloginError } from '../providers/codearts.js'
 import type { LoginCredential } from '../upstream/auth.js'
 import type { AccountPoolDO, PickResult } from '../pool/AccountPoolDO.js'
-import { healthyForModel, isExclusiveProModel } from '../pool/state.js'
+import {
+  healthyForFreeModel,
+  healthyForModel,
+  isConfirmedZeroCostModel,
+  isExclusiveProModel,
+} from '../pool/state.js'
 import type { SafetyOverride } from '../pool/state.js'
+import {
+  defaultUnifiedModelsConfig,
+  findUnifiedModelRule,
+  resolveUnifiedModel,
+  type UnifiedModelRule,
+  type UnifiedModelsConfig,
+} from './unified-models.js'
+
+/** 统一模型映射配置（`systemUnifiedModels`）的进程内短 TTL 缓存，按 `poolNs` 隔离多套运行时。 */
+const UNIFIED_MODELS_TTL_MS = 10_000
+let unifiedModelsConfigCache:
+  | { poolNs: unknown; at: number; value: UnifiedModelsConfig }
+  | undefined
+
+export function resetUnifiedModelsConfigCache(): void {
+  unifiedModelsConfigCache = undefined
+}
+
+export function setUnifiedModelsConfigCache(env: Env, config: UnifiedModelsConfig, now = Date.now()): void {
+  unifiedModelsConfigCache = { poolNs: env.ACCOUNT_POOL, at: now, value: config }
+}
+
+export async function readUnifiedModelsConfig(env: Env, now = Date.now()): Promise<UnifiedModelsConfig> {
+  if (
+    unifiedModelsConfigCache !== undefined &&
+    unifiedModelsConfigCache.poolNs === env.ACCOUNT_POOL &&
+    now - unifiedModelsConfigCache.at < UNIFIED_MODELS_TTL_MS
+  ) {
+    return unifiedModelsConfigCache.value
+  }
+  if (env.ACCOUNT_POOL === undefined) return defaultUnifiedModelsConfig()
+  try {
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const cfg = await cnPool.getUnifiedModelsConfig()
+    unifiedModelsConfigCache = { poolNs: env.ACCOUNT_POOL, at: now, value: cfg }
+    return cfg
+  } catch {
+    return defaultUnifiedModelsConfig()
+  }
+}
 
 /** 单测直注覆盖开关（生产路径以 `AccountPoolDO` 的 `RoutingConfig.autoContinuation` 持久化为准，未设置时回落 `env.AUTO_CONTINUATION`）。 */
 let runtimeAutoContinuationOverride: boolean | undefined
@@ -185,6 +231,7 @@ const MAX_ROTATE_TTL_MS = 30_000
 export function resetMaxRotateCache(): void {
   maxRotateCache = undefined
   autoContinuationCache = undefined
+  unifiedModelsConfigCache = undefined
 }
 
 /**
@@ -772,6 +819,8 @@ async function pickCandidate(
   expiringOnly?: boolean,
   /** 严格临期模式（`expiringonly/` 前缀）：用完就停，绝不烧永久积分。 */
   expiringStrict?: boolean,
+  /** 确认零倍率免费模型：豁免永久积分锁保留线、严格临期拦截与 hard 冷却。 */
+  isFreeModel?: boolean,
 ): Promise<Candidate | PinBlocked | undefined> {
   const result = await pool.pick({
     realm, provider, model, exclude, now,
@@ -779,6 +828,7 @@ async function pickCandidate(
     ...(pinned !== undefined && pinned !== '' ? { pinned } : {}),
     ...(expiringOnly === true ? { expiringOnly: true } : {}),
     ...(expiringStrict === true ? { expiringStrict: true } : {}),
+    ...(isFreeModel === true ? { isFreeModel: true } : {}),
   })
   if (result !== undefined && result.pinnedUnavailable === true) {
     return { pinBlocked: true, picked: result }
@@ -1092,6 +1142,26 @@ export async function handleChatCompletions(
       : rawModel
   const effectiveModel = strippedModel
   const effectiveLower = effectiveModel.toLowerCase()
+
+  // ── 出口感知统一模型映射（`unified-models.ts`，对标 `v2.2.2`）──
+  // 仅在顶层请求（`failoverDepth === 0`）解析自定义统一别名，按在线可用供应商顺序路由至真实 `provider/model`，
+  // 并在候选预检失败（HTTP >= 400）时自动切换到下一个可用出口；子密钥 `limits.models` 严格下沉过滤防跨渠道越权。
+  if (failoverDepth === 0) {
+    const unifiedConfig = await readUnifiedModelsConfig(env)
+    const matchedUnified = findUnifiedModelRule(rawModel, unifiedConfig)
+    if (matchedUnified !== undefined) {
+      return await handleUnifiedModelChat({
+        rawModel,
+        rule: matchedUnified,
+        unifiedConfig,
+        rawBody,
+        request,
+        env,
+        realm,
+        ...(ctx !== undefined ? { ctx } : {}),
+      })
+    }
+  }
 
   // 🔴 **裸名别名必须先判**（同步自上游 `598eaa0`）——
   // 顺序不可改：命中后 `providerId` 会被设成 `aggregate`，而它**不在注册表里**
@@ -1503,13 +1573,29 @@ export async function handleChatCompletions(
     // 会话粘性：只首轮用（换号后还粘回去会死循环）
     const buddyPreferred =
       tried.length === 0 && sessionKey !== '' ? await pool.getSession(sessionKey, now) : ''
-    const candidate = await pickCandidate(
-      pool, realm, model, tried, now, DEFAULT_PROVIDER,
-      buddyPreferred === undefined ? '' : buddyPreferred,
-      pinnedHeader,
-      isExpiringOnly,
-      isExpiringStrict,
-    )
+    const isBuddyFreeModel = isConfirmedZeroCostModel(DEFAULT_PROVIDER, model)
+    let candidate: Awaited<ReturnType<typeof pickCandidate>>
+    try {
+      candidate = await pickCandidate(
+        pool, realm, model, tried, now, DEFAULT_PROVIDER,
+        buddyPreferred === undefined ? '' : buddyPreferred,
+        pinnedHeader,
+        isExpiringOnly,
+        isExpiringStrict,
+        isBuddyFreeModel,
+      )
+    } catch (pickErr) {
+      const msg = pickErr instanceof Error ? pickErr.message : String(pickErr)
+      discardBlame(blame, msg)
+      const status = msg.includes('严格临期模式') ? 402 : 429
+      return {
+        response: jsonError(
+          status,
+          msg,
+          status === 402 ? 'insufficient_quota' : 'rate_limit_error',
+        ),
+      }
+    }
     // ── 只用指定账号但它不可用：直接报它的原因（不换号、不跨渠道容灾）──
     if (candidate !== undefined && 'pinBlocked' in candidate) {
       // ⚠️ **早退出口也要丢弃 blame**（S11）：指定账号在本次请求里已经失败过
@@ -1533,8 +1619,11 @@ export async function handleChatCompletions(
       if (failoverDepth === 0 && model !== '') {
         try {
           const intlPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('global'))
+          const intlFree = isConfirmedZeroCostModel('workbuddy', model)
           const hasIntlUsable = (await intlPool.listAccounts('global', now)).some(
-            (a) => (a.provider ?? DEFAULT_PROVIDER) === 'workbuddy' && healthyForModel(a, now, model),
+            (a) =>
+              (a.provider ?? DEFAULT_PROVIDER) === 'workbuddy' &&
+              (intlFree ? healthyForFreeModel(a, now, model) : healthyForModel(a, now, model)),
           )
           if (hasIntlUsable) {
             console.log(`[failover] 国内版 ${DEFAULT_PROVIDER} 全部不可用或已限流，自动无缝跨渠道容灾至国际版 workbuddy (模型: ${model})`)
@@ -2821,12 +2910,14 @@ export async function handleProviderChat(input: {
     // `preferred` 只是「排到最前」，不可用时自然回落 —— 不会因为它挂了就报「无可用账号」。
     // ⚠️ 只在**首轮**（`tried` 为空）用粘性：已经在换号了还粘回去会死循环。
     const preferred = tried.length === 0 ? (sessionKey === '' ? '' : await pool.getSession(sessionKey, now)) : ''
+    const isProviderFreeModel = isConfirmedZeroCostModel(providerId, model)
     const picked = await pool.pick({
       realm: activeRealm, provider: providerId, model, exclude: tried, now,
       ...(preferred !== undefined && preferred !== '' ? { preferred } : {}),
       ...(pinnedHeader !== '' ? { pinned: pinnedHeader } : {}),
       ...(expiringOnly === true ? { expiringOnly: true } : {}),
       ...(expiringStrict === true ? { expiringStrict: true } : {}),
+      ...(isProviderFreeModel ? { isFreeModel: true } : {}),
     })
     // ── 只用指定账号但它不可用：显式报原因，**不换号、不跨渠道容灾** ──
     if (picked !== undefined && picked.pinnedUnavailable === true) {
@@ -2946,6 +3037,8 @@ export async function handleProviderChat(input: {
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      const pe = error as { name?: string; httpStatus?: number; code?: unknown; retryable?: unknown }
+      const peStatus = typeof pe?.httpStatus === 'number' ? pe.httpStatus : 0
 
       // ⚠️ **续期也要在 catch 分支里做**（实测踩到的架构不一致）。
       //
@@ -2955,7 +3048,7 @@ export async function handleProviderChat(input: {
       // 表现为「cline 的 token 明明可以续期，却一直报 401」。
       //
       // 这里按同样的判据（鉴权类错误）尝试续期并重放一次。
-      if (isAuthLikeFailure(0, message) && provider.refresh !== undefined && !refreshed) {
+      if (isProviderAuthFailure(providerId, peStatus, message) && provider.refresh !== undefined && !refreshed) {
         try {
           refreshed = true
           const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
@@ -3044,11 +3137,16 @@ export async function handleProviderChat(input: {
             }
           }
         } catch (refreshError) {
-          console.error(
-            `[refresh] ${providerId} 续期失败：`,
-            refreshError instanceof Error ? refreshError.message : String(refreshError),
-          )
+          const refreshErrMsg = refreshError instanceof Error ? refreshError.message : String(refreshError)
+          console.error(`[refresh] ${providerId} 续期失败：`, refreshErrMsg)
+          if (providerId === 'codearts' && isCodeArtsNeedsReloginError(refreshError)) {
+            await pool
+              .markNeedsRelogin(picked.uid, refreshErrMsg, Date.now())
+              .catch(logPoolError('markNeedsRelogin'))
+          }
         }
+      } else if (providerId === 'codearts' && isCodeArtsNeedsReloginError(error)) {
+        await pool.markNeedsRelogin(picked.uid, message, Date.now()).catch(logPoolError('markNeedsRelogin'))
       }
 
       // ══════════════════════════════════════════════════════════════════
@@ -3070,8 +3168,6 @@ export async function handleProviderChat(input: {
       //
       // 修法：把 `ProviderError` 的原始 message 交给 `classify()`（它本来就是
       // 按文本解析业务码的），只有**确实解析不出业务码**时才退回传输层语义。
-      const pe = error as { name?: string; httpStatus?: number; code?: unknown; retryable?: unknown }
-      const peStatus = typeof pe?.httpStatus === 'number' ? pe.httpStatus : 0
       const isProviderErr = pe?.name === 'ProviderError'
       if (isProviderErr) {
         const c = classify(peStatus, message)
@@ -3269,7 +3365,7 @@ export async function handleProviderChat(input: {
       // `{"error_code":"APIG.0602","error_msg":"...security token has expired"}`。
       // 只看状态码的话，这个分支根本不进 —— 续期逻辑形同虚设，
       // 而 catch 分支（另一条路）已经改成按内容判了，两条路判据必须一致。
-      if (isAuthLikeFailure(upstream.status, text) && provider.refresh !== undefined && !refreshed) {
+      if (isProviderAuthFailure(providerId, upstream.status, text) && provider.refresh !== undefined && !refreshed) {
         try {
           refreshed = true
           const fresh = await provider.refresh(credential, AbortSignal.timeout(30_000))
@@ -3364,20 +3460,13 @@ export async function handleProviderChat(input: {
             }
           }
         } catch (error) {
-          // ## 🔴 续期失败的原因**必须带到用户可见的错误里**
-          //
-          // 实测缺陷（用户报「商汤和 zcode 的账号怎么了，为什么调用不了」）：
-          // 续期失败的原因此前只 `console.error` 到日志，用户看到的仍是
-          // **上游的原始错误** —— 例如 codearts 那条：
-          // ```
-          // APIG.0301 Incorrect IAM authentication information: Unauthorized
-          // ```
-          // ⚠️ 那句极具误导性：它说的是「IAM 鉴权不对」，让人以为**账号被封**，
-          // 而真实原因是**这个凭据缺自动续期所需的材料**（见下）。
-          //
-          // ⇒ 把续期失败的原因**记下来**，附在最终错误里。
           refreshFailure = error instanceof Error ? error.message : String(error)
           console.error(`[refresh] ${providerId} 续期失败：`, refreshFailure)
+          if (providerId === 'codearts' && isCodeArtsNeedsReloginError(error)) {
+            await pool
+              .markNeedsRelogin(picked.uid, refreshFailure, Date.now())
+              .catch(logPoolError('markNeedsRelogin'))
+          }
         }
       }
 
@@ -4012,6 +4101,13 @@ export async function describeNoAccount(
   }
 
   return `供应商「${provider}」暂时没有可用账号（请稍后重试或查看面板状态）`
+}
+
+function isProviderAuthFailure(providerId: string, status: number, detail: string): boolean {
+  if (providerId === 'codearts') {
+    return isCodeArtsAuthFailure(status, detail)
+  }
+  return isAuthLikeFailure(status, detail)
 }
 
 export function isAuthLikeFailure(status: number, detail: string): boolean {
@@ -4756,4 +4852,161 @@ async function probeExpiries(
     out.set(key, expiry)
   }
   return out
+}
+
+/**
+ * 出口感知统一模型映射请求的派发（`unified-models.ts`）。
+ *
+ * 1. 扫描 `cn` / `global` 池内未停用且非 `needsRelogin` 的在线供应商；
+ * 2. 结合用户停用供应商、模型停用表以及子密钥 `limits.models` 解析候选列表；
+ * 3. 按规则目标顺序逐个派发（委托 `handleChatCompletions(..., failoverDepth=1)` 完整复用
+ *    `buddy` 原生链路与各具名 `provider` 链路），仅在尚未开流且返回 HTTP >= 400 时切换下一出口。
+ */
+async function handleUnifiedModelChat(input: {
+  rawModel: string
+  rule: UnifiedModelRule
+  unifiedConfig: UnifiedModelsConfig
+  rawBody: unknown
+  request: Request
+  env: Env
+  realm: string
+  ctx?: ExecutionContext
+}): Promise<GatewayResult> {
+  const { rawModel, rule, unifiedConfig, rawBody, request, env, realm, ctx } = input
+  const now = Date.now()
+
+  let providerOrder: string[] = []
+  const closedProviders = new Set<string>()
+  try {
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    const settings = await cnPool.getProviderSettings()
+    providerOrder = settings.order
+    for (const id of settings.disabled) closedProviders.add(id)
+  } catch {
+    // ignore
+  }
+
+  const onlineProviders = new Set<string>()
+  for (const r of ['cn', 'global'] as const) {
+    try {
+      const p = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(r))
+      for (const a of await p.listAccounts(r, now)) {
+        if (a.disabled || a.needsRelogin === true) continue
+        const pid = a.provider ?? DEFAULT_PROVIDER
+        if (!closedProviders.has(pid)) onlineProviders.add(pid)
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const disabledModels = new Map<string, Set<string>>()
+  for (const pid of Object.keys(rule.targets)) {
+    const set = new Set<string>()
+    for (const r of ['cn', 'global'] as const) {
+      try {
+        const p = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(r))
+        for (const m of await p.getDisabledModels(pid)) set.add(m)
+      } catch {
+        // ignore
+      }
+    }
+    if (set.size > 0) disabledModels.set(pid, set)
+  }
+
+  const subkeyModels = subkeyOf(ctx)?.limits.models
+  const candidates = resolveUnifiedModel(rawModel, unifiedConfig, onlineProviders, {
+    ...(subkeyModels !== undefined && subkeyModels.length > 0 ? { allowedModels: subkeyModels } : {}),
+    disabledModels,
+    providerOrder,
+  })
+
+  if (candidates.length === 0) {
+    if (subkeyModels !== undefined && subkeyModels.length > 0) {
+      const withoutSubkey = resolveUnifiedModel(rawModel, unifiedConfig, onlineProviders, {
+        disabledModels,
+        providerOrder,
+      })
+      if (withoutSubkey.length > 0) {
+        return {
+          response: jsonError(
+            403,
+            `该 API Key 不被允许使用统一模型「${rule.alias}」当前在线的目标渠道`,
+            'permission_error',
+          ),
+        }
+      }
+    }
+    const withoutDisabled = resolveUnifiedModel(rawModel, unifiedConfig, onlineProviders, {
+      providerOrder,
+    })
+    if (withoutDisabled.length > 0) {
+      return {
+        response: jsonError(
+          403,
+          `统一模型「${rule.alias}」当前在线的目标模型均已被你在面板中停用`,
+          'model_disabled',
+        ),
+      }
+    }
+    return {
+      response: jsonError(
+        503,
+        `统一模型「${rule.alias}」当前没有在线可用的目标渠道（已配置：${Object.keys(rule.targets).join('、')}）`,
+        'no_available_account',
+      ),
+    }
+  }
+
+  let lastError: { status: number; message: string } | undefined
+  const triedProviders: string[] = []
+
+  for (const cand of candidates) {
+    const nextBody =
+      rawBody !== null && typeof rawBody === 'object' && !Array.isArray(rawBody)
+        ? { ...(rawBody as Record<string, unknown>), model: cand.routedModel }
+        : rawBody
+
+    const headers = new Headers(request.headers)
+    headers.delete('content-length')
+    headers.set('content-type', 'application/json')
+
+    const subReq = new Request(request.url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(nextBody),
+      signal: request.signal,
+    })
+
+    let result: GatewayResult
+    try {
+      result = await handleChatCompletions(subReq, env, realm, ctx, 1)
+    } catch (error) {
+      lastError = {
+        status: 502,
+        message: error instanceof Error ? error.message : String(error),
+      }
+      triedProviders.push(cand.providerId)
+      continue
+    }
+
+    if (result.response.status < 400) return result
+
+    let message = `http=${result.response.status}`
+    try {
+      message = (await result.response.clone().text()).slice(0, 240)
+    } catch {
+      // ignore
+    }
+    lastError = { status: result.response.status, message }
+    triedProviders.push(cand.providerId)
+  }
+
+  return {
+    response: jsonError(
+      lastError?.status ?? 503,
+      `统一模型「${rule.alias}」的全部在线出口均失败（已试：${triedProviders.join('、')}）。最后一次：${lastError?.message ?? '无可用候选'}`,
+      'provider_error',
+    ),
+  }
 }

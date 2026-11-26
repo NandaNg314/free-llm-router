@@ -38,6 +38,10 @@ export interface Account {
   restrictedUntil: number
   /** 降权（能发但慢/易失败）的解除时刻；后端 `healthy()` 把它当不可用。 */
   degradeUntil: number
+  /** 凭据失效需重新登录（区别于手动停用 disabled；重登或导入凭据后自动清零）。 */
+  needsRelogin?: boolean
+  reloginReason?: string
+  isPaid?: boolean
   modelCooldowns: { model: string; until: number }[]
 }
 

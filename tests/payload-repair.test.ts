@@ -10,6 +10,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   OFFICIAL_CLI_REPLACEMENT,
+  TRAECODE_REPLACEMENT,
   WORKBUDDY_FALLBACK_SYSTEM_PROMPT,
   backfillReasoningContent,
   cleanupOrphanToolCalls,
@@ -802,3 +803,134 @@ test('🔴 工具 schema pattern 代理区双反斜杠 \\\\uD800–\\\\uDFFF 与
     assert.deepEqual(prop, { type: 'string', minLength: 1 })
   }
 })
+
+// ─────────────────────── v2.2.2～v2.2.3 增量加固（Issue #25 / #26 / PR #30） ───────────────────────
+
+test('🔴 Issue #26：并行工具批次同 tool_call_id 重复结果去重 + 夹杂孤儿/developer 消息穿透归拢', () => {
+  // 1) 同批出现重复 tool_call_id 的多条 role:'tool' 结果：只保留第一条，防止上游报 400 / 11148
+  const dupBatch = [
+    { role: 'user', content: 'run both' },
+    { role: 'assistant', content: '', tool_calls: [call('c0', 'bash'), call('c1', 'grep')] },
+    { role: 'tool', tool_call_id: 'c0', content: 'first-c0' },
+    { role: 'tool', tool_call_id: 'c0', content: 'duplicate-c0-retry' },
+    { role: 'tool', tool_call_id: 'c1', content: 'first-c1' },
+    { role: 'tool', tool_call_id: 'c1', content: 'duplicate-c1-retry' },
+  ]
+  const cleanedDup = cleanupToolPairing(dupBatch) as M[]
+  assert.deepEqual(
+    cleanedDup.map((m) => (m.role === 'tool' ? `tool:${m.tool_call_id}:${m.content}` : m.role)),
+    ['user', 'assistant', 'tool:c0:first-c0', 'tool:c1:first-c1'],
+  )
+
+  // 跨轮复用同名 call_0（常见于本地 Agent 每轮从 0 编号）：两轮各自保留，绝不跨轮误删
+  const multiTurnReuse = [
+    { role: 'user', content: 'turn 1' },
+    { role: 'assistant', content: '', tool_calls: [call('call_0', 'ls')] },
+    { role: 'tool', tool_call_id: 'call_0', content: 'res-turn-1' },
+    { role: 'user', content: 'turn 2' },
+    { role: 'assistant', content: '', tool_calls: [call('call_0', 'pwd')] },
+    { role: 'tool', tool_call_id: 'call_0', content: 'res-turn-2' },
+  ]
+  assert.equal(cleanupOrphanToolCalls(multiTurnReuse), multiTurnReuse, '跨轮合法复用 call_0 应零改动')
+
+  // 2) 并行批次中间同时夹入孤儿 tool 结果 + developer 系统插话：c0 与 c1 仍被紧贴归拢到 assistant 之后
+  for (const interleaved of [
+    [
+      { role: 'user', content: 'parallel' },
+      { role: 'assistant', content: '', tool_calls: [call('c0', 'read'), call('c1', 'search')] },
+      { role: 'tool', tool_call_id: 'c0', content: 'ok-0' },
+      { role: 'tool', tool_call_id: 'ghost_orphan', content: 'stale' },
+      { role: 'developer', content: 'context reminder' },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok-1' },
+    ],
+    [
+      { role: 'user', content: 'parallel' },
+      { role: 'assistant', content: '', tool_calls: [call('c0', 'read'), call('c1', 'search')] },
+      { role: 'tool', tool_call_id: 'c0', content: 'ok-0' },
+      { role: 'developer', content: 'context reminder' },
+      { role: 'tool', tool_call_id: 'ghost_orphan', content: 'stale' },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok-1' },
+    ],
+  ]) {
+    const repacked = repackToolResultBlocks(interleaved) as M[]
+    assert.equal(repacked[1]!.role, 'assistant')
+    assert.equal(repacked[2]!.tool_call_id, 'c0')
+    assert.equal(repacked[3]!.tool_call_id, 'c1', '合法同批结果不得被孤儿 tool 阻断归拢')
+
+    const finalOut = cleanupToolPairing(interleaved) as M[]
+    assert.deepEqual(
+      finalOut.map((m) => (m.role === 'tool' ? `tool:${m.tool_call_id}` : m.role)),
+      ['user', 'assistant', 'tool:c0', 'tool:c1', 'system'],
+    )
+  }
+})
+
+test('🔴 PR #30：TraeCode 指纹消毒仅改 system/developer/assistant，user/tool 逐字节保留且严格幂等', () => {
+  const traePrompt = 'You are an interactive agent in TraeCode designed to assist developers.'
+  const expected = `${TRAECODE_REPLACEMENT} designed to assist developers.`
+
+  assert.equal(scrubFingerprintText(traePrompt), expected)
+  assert.equal(
+    scrubFingerprintText('you are an interactive agent in   traecode.'),
+    `${TRAECODE_REPLACEMENT}.`,
+    '大小写不敏感且多空格可归一',
+  )
+  assert.equal(scrubFingerprintText(expected), expected, '二次调用必须严格幂等')
+
+  // 不误伤普通提及与其他短语
+  for (const untouched of [
+    'TraeCode is an IDE plugin.',
+    'You are an interactive agent in Trae IDE.',
+    'You are an interactive agent in Cursor.',
+  ]) {
+    assert.equal(scrubFingerprintText(untouched), untouched)
+  }
+
+  const prepared = prepareChatBody({
+    model: 'deepseek-v4.1-flash',
+    messages: [
+      { role: 'system', content: traePrompt },
+      { role: 'developer', content: [{ type: 'text', text: traePrompt }] },
+      { role: 'assistant', content: traePrompt },
+      { role: 'user', content: traePrompt },
+      { role: 'assistant', content: '', tool_calls: [call('t1', 'read_file')] },
+      { role: 'tool', tool_call_id: 't1', content: traePrompt },
+    ],
+  })
+  const msgs = (JSON.parse(prepared.body) as M).messages as M[]
+  assert.equal(msgs[0]!.content, expected)
+  assert.equal(((msgs[1]!.content as M[])[0] as M).text, expected)
+  assert.equal(msgs[2]!.content, expected)
+  assert.equal(msgs[3]!.content, traePrompt, 'user 消息必须逐字节不碰')
+  assert.equal(msgs[5]!.content, traePrompt, 'tool 结果必须逐字节不碰')
+})
+
+test('🔴 Issue #25：超长首行计费头（>400 字符）精准剥离头部与 cc_*/cch=，完整保留同行子代理提示词', () => {
+  const subagentPrompt = (
+    'You are a specialized code review subagent; inspect edge cases carefully; verify SQLite migrations, ' +
+    'Web Crypto signatures, SSE framing, and subkey model allowlists without modifying unrelated files. '
+  ).repeat(3)
+  assert.ok(subagentPrompt.length > 450, '测试样本必须覆盖 >400 字符超长首行')
+
+  // 1) 分号分隔计费头 + 同行紧跟含分号的超长子代理提示词
+  const inlineHeader =
+    `x-anthropic-billing-header: cc_version=2.1.76.abc; cc_entrypoint=sdk-cli; cch=deadbeef01; ${subagentPrompt}`
+  const scrubbedInline = scrubFingerprintText(inlineHeader)
+  assert.equal(scrubbedInline, subagentPrompt.trim(), '同行后续提示词（含分号）必须逐字完整保留')
+  assert.ok(!scrubbedInline.includes('x-anthropic-billing'), scrubbedInline)
+  assert.ok(!scrubbedInline.includes('cch='), scrubbedInline)
+
+  // 2) x-anthropic-billing-hdr 变体 + 空格分隔
+  const hdrVariant =
+    `x-anthropic-billing-hdr: cc_version=2.1.80 cch=00ff11aa ${subagentPrompt}`
+  assert.equal(scrubFingerprintText(hdrVariant), subagentPrompt.trim())
+
+  // 3) 纯计费元数据行（含多行 cc_*/cch= 续行）+ 下一行正文
+  const multilineHeader = [
+    'x-anthropic-billing-header: cc_version=2.1.76; cc_entrypoint=cli;',
+    '  cc_workload=subagent; cch=99887766',
+    'Follow the repository guidelines strictly.',
+  ].join('\n')
+  assert.equal(scrubFingerprintText(multilineHeader), 'Follow the repository guidelines strictly.')
+})
+

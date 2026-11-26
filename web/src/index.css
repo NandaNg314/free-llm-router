@@ -22,52 +22,64 @@
   --color-danger: var(--danger);
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
-  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
-  --font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', ui-sans-serif, system-ui, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-mono: 'SF Mono', 'JetBrains Mono', ui-monospace, Menlo, Consolas, monospace;
 }
 
 :root {
-  --background: oklch(0.982 0.003 255);
-  --foreground: oklch(0.2 0.02 262);
-  --card: oklch(1 0 0);
-  --popover: oklch(1 0 0);
-  --muted: oklch(0.965 0.004 260);
-  --muted-foreground: oklch(0.54 0.02 262);
-  --border: oklch(0.915 0.006 260);
-  --input: oklch(0.89 0.008 260);
-  --ring: oklch(0.6 0.18 255);
-  --primary: oklch(0.55 0.2 257);
-  --primary-foreground: oklch(0.99 0 0);
-  --accent: oklch(0.955 0.012 255);
-  --accent-foreground: oklch(0.42 0.17 257);
-  --sidebar: oklch(1 0 0);
-  --success: oklch(0.6 0.15 155);
-  --warning: oklch(0.7 0.15 65);
-  --danger: oklch(0.58 0.21 25);
-  --chart-1: oklch(0.58 0.19 257);
-  --chart-2: oklch(0.72 0.14 200);
+  --ease-fluid: cubic-bezier(0.22, 1, 0.36, 1);
+  --background: #F5F5F7;
+  --foreground: #1D1D1F;
+  --card: #FFFFFF;
+  --popover: #FFFFFF;
+  --muted: #ECECEF;
+  --muted-foreground: #6E6E73;
+  --border: rgba(0, 0, 0, 0.06);
+  --input: rgba(0, 0, 0, 0.09);
+  --ring: #0071E3;
+  --primary: #0071E3;
+  --primary-foreground: #FFFFFF;
+  --accent: rgba(0, 113, 227, 0.09);
+  --accent-foreground: #0071E3;
+  --sidebar: #FAFAFC;
+  --success: #30D158;
+  --warning: #FF9F0A;
+  --danger: #FF453A;
+  --chart-1: #0071E3;
+  --chart-2: #30D158;
 }
 
 .dark {
-  --background: oklch(0.16 0.008 260);
-  --foreground: oklch(0.95 0.005 260);
-  --card: oklch(0.2 0.009 260);
-  --popover: oklch(0.22 0.01 260);
-  --muted: oklch(0.24 0.01 260);
-  --muted-foreground: oklch(0.68 0.015 260);
-  --border: oklch(0.285 0.012 260);
-  --input: oklch(0.32 0.012 260);
-  --ring: oklch(0.65 0.17 255);
-  --primary: oklch(0.63 0.18 256);
-  --primary-foreground: oklch(0.99 0 0);
-  --accent: oklch(0.27 0.03 258);
-  --accent-foreground: oklch(0.85 0.09 255);
-  --sidebar: oklch(0.18 0.009 260);
-  --success: oklch(0.7 0.15 155);
-  --warning: oklch(0.78 0.14 70);
-  --danger: oklch(0.68 0.19 25);
-  --chart-1: oklch(0.66 0.17 256);
-  --chart-2: oklch(0.75 0.13 200);
+  --background: #09090B;
+  --foreground: #EDEDEF;
+  --card: #121215;
+  --popover: #16161A;
+  --muted: #1A1A1F;
+  --muted-foreground: #8E8E93;
+  --border: rgba(255, 255, 255, 0.07);
+  --input: rgba(255, 255, 255, 0.11);
+  --ring: #0A84FF;
+  --primary: #0A84FF;
+  --primary-foreground: #FFFFFF;
+  --accent: rgba(10, 132, 255, 0.15);
+  --accent-foreground: #409CFF;
+  --sidebar: #0D0D10;
+  --success: #30D158;
+  --warning: #FF9F0A;
+  --danger: #FF453A;
+  --chart-1: #0A84FF;
+  --chart-2: #30D158;
+}
+
+@keyframes view-enter {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 @layer base {
@@ -77,15 +89,50 @@
   html {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    font-optical-sizing: auto;
   }
   body {
     @apply bg-background text-foreground font-sans text-sm;
   }
   ::selection {
-    background: color-mix(in oklch, var(--primary) 25%, transparent);
+    background: color-mix(in oklab, var(--primary) 22%, transparent);
   }
 }
 
 @utility tabular {
   font-variant-numeric: tabular-nums;
+}
+
+@utility view-transition {
+  animation: view-enter 150ms var(--ease-fluid);
+}
+
+@utility glass-surface {
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+}
+
+/* 防止 Recharts 在视口从桌面缩窄至 390px 手机端时因上一帧内联像素宽撑破布局视口 */
+.recharts-responsive-container {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .view-transition {
+    animation: none !important;
+  }
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass-surface {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
 }

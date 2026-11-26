@@ -19,18 +19,157 @@
 import http from 'node:http'
 import { Readable } from 'node:stream'
 import { gzipSync } from 'node:zlib'
+import {
+  resolveWarmStartBalance,
+  WARM_START_DELAY_MS,
+  WARM_START_GAP_MS,
+  WARM_START_STALE_MS,
+  type Env,
+} from '../env.js'
 import { createNodeRuntime } from './env.js'
-import worker from '../index.js'
+import worker, { checkWarmBalanceEligibility, executeAccountBalanceRefresh } from '../index.js'
 
 export interface ServerOptions {
   port?: number
   host?: string
   databasePath?: string
   autoCron?: boolean
+  /** 启动后是否触发一次温和余额预热（默认跟随 `WARM_START_BALANCE` 环境变量，仅在 `autoCron: true` 时生效）。 */
+  warmStartBalance?: boolean
+  /** 启动温和预热的初始等待毫秒数（默认 `WARM_START_DELAY_MS` = 20000ms，单测可覆写）。 */
+  warmStartDelayMs?: number
+  /** 启动温和预热的账号间串行间隔毫秒数（默认 `WARM_START_GAP_MS` = 2000ms，单测可覆写）。 */
+  warmStartGapMs?: number
   /** 是否信任反向代理追加的 `X-Forwarded-For`（见 {@link resolveClientIp}）。 */
   trustProxy?: boolean
   /** 本地桌面模式（精简 VPS 横幅并启用控制台友好退出）。 */
   localMode?: boolean
+}
+
+export interface WarmBalanceSweepOptions {
+  /** 每两个账号之间的串行间隔毫秒数（默认 2000ms）。 */
+  gapMs?: number
+  /** 距上次余额采样超过该时长才刷新（默认 15 分钟）。 */
+  staleMs?: number
+  /** 当前时钟函数（便于单测确定性断言）。 */
+  now?: () => number
+  /** 停机信号（触发时立即中断等待与在途网络请求）。 */
+  signal?: AbortSignal
+  /** 停机状态探针。 */
+  isStopped?: () => boolean
+}
+
+export interface WarmBalanceSweepResult {
+  refreshed: number
+  failed: number
+  skipped: number
+  aborted: boolean
+}
+
+/** 可被 `AbortSignal` 立即唤醒的温和延时，且 `unref()` 绝不阻止进程退出。 */
+function interruptibleSleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false)
+  if (ms <= 0) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve(false)
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve(true)
+    }, ms)
+    timer.unref?.()
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * 启动后账号余额错峰温和预热（`warm_sweep`，对标 `v2.2.2` PR #21）。
+ *
+ * 仅针对池内启用（`!disabled && !needsRelogin`）、非静态 API Key、且距上次余额采样超过
+ * `staleMs`（默认 15 分钟）的账号，按每号间隔 `gapMs`（默认 2 秒）串行刷新一次余额快照；
+ * 遇到停机或 `signal` 中止立即中断，绝不阻塞 HTTP 启动或挂死退出流程。
+ */
+export async function runWarmBalanceSweep(
+  env: Env,
+  options: WarmBalanceSweepOptions = {},
+): Promise<WarmBalanceSweepResult> {
+  if (!resolveWarmStartBalance(env)) {
+    return { refreshed: 0, failed: 0, skipped: 0, aborted: false }
+  }
+  const gapMs = Math.max(0, options.gapMs ?? WARM_START_GAP_MS)
+  const staleMs = Math.max(0, options.staleMs ?? WARM_START_STALE_MS)
+  const nowFn = options.now ?? Date.now
+  const isStopped = (): boolean => Boolean(options.isStopped?.()) || Boolean(options.signal?.aborted)
+
+  if (isStopped()) {
+    return { refreshed: 0, failed: 0, skipped: 0, aborted: true }
+  }
+
+  let refreshed = 0
+  let failed = 0
+  let skipped = 0
+  let attempted = 0
+
+  const disabledProviders = new Set<string>()
+  try {
+    const cnPool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName('cn'))
+    for (const id of (await cnPool.getProviderSettings()).disabled) disabledProviders.add(id)
+  } catch {
+    // ignore
+  }
+
+  for (const realm of ['cn', 'global'] as const) {
+    if (isStopped()) return { refreshed, failed, skipped, aborted: true }
+    const pool = env.ACCOUNT_POOL.get(env.ACCOUNT_POOL.idFromName(realm))
+    const snapshotNow = nowFn()
+    const accounts = await pool.listAccounts(realm, snapshotNow)
+
+    for (const account of accounts) {
+      if (isStopped()) return { refreshed, failed, skipped, aborted: true }
+      const providerId = account.provider ?? 'buddy'
+      if (disabledProviders.has(providerId)) {
+        skipped += 1
+        continue
+      }
+
+      const samples = Array.isArray(account.samples) ? account.samples : []
+      const lastSampleAt = samples.length > 0 ? (samples[samples.length - 1]?.at ?? 0) : 0
+      if (lastSampleAt > 0 && nowFn() - lastSampleAt <= staleMs) {
+        skipped += 1
+        continue
+      }
+
+      const eligible = await checkWarmBalanceEligibility(env, pool, account)
+      if (eligible === undefined) {
+        skipped += 1
+        continue
+      }
+
+      if (attempted > 0 && gapMs > 0) {
+        const slept = await interruptibleSleep(gapMs, options.signal)
+        if (!slept || isStopped()) {
+          return { refreshed, failed, skipped, aborted: true }
+        }
+      }
+      if (isStopped()) return { refreshed, failed, skipped, aborted: true }
+
+      attempted += 1
+      const outcome = await executeAccountBalanceRefresh(eligible, nowFn(), {
+        signal: options.signal,
+        logTag: 'warm',
+      })
+      if (isStopped()) return { refreshed, failed, skipped, aborted: true }
+      if (outcome.ok) refreshed += 1
+      else failed += 1
+    }
+  }
+
+  if (refreshed + failed > 0) {
+    console.log(`🔥 [WarmSweep] 启动余额温和预热完成：刷新 ${refreshed} / 失败 ${failed} / 跳过 ${skipped}`)
+  }
+  return { refreshed, failed, skipped, aborted: false }
 }
 
 /**
@@ -295,9 +434,41 @@ export function startServer(options: ServerOptions = {}) {
     }
   })
 
-  // 3. 常驻后台计划任务（模拟 Cloudflare Cron，每小时整点分发）
+  // 3. 常驻后台计划任务（模拟 Cloudflare Cron，每小时整点分发）与启动温和余额预热
   let cronInterval: NodeJS.Timeout | undefined
+  let warmTimeout: NodeJS.Timeout | undefined
+  const warmAbortCtrl = new AbortController()
+  let shuttingDown = false
+
+  const stopWarmSweep = () => {
+    if (warmTimeout !== undefined) {
+      clearTimeout(warmTimeout)
+      warmTimeout = undefined
+    }
+    if (!warmAbortCtrl.signal.aborted) {
+      warmAbortCtrl.abort()
+    }
+  }
+
   if (autoCron) {
+    const warmEnabled = options.warmStartBalance ?? resolveWarmStartBalance(env)
+    if (warmEnabled) {
+      const delayMs = Math.max(0, options.warmStartDelayMs ?? WARM_START_DELAY_MS)
+      warmTimeout = setTimeout(() => {
+        warmTimeout = undefined
+        if (shuttingDown || warmAbortCtrl.signal.aborted) return
+        void runWarmBalanceSweep(env, {
+          gapMs: options.warmStartGapMs ?? WARM_START_GAP_MS,
+          signal: warmAbortCtrl.signal,
+          isStopped: () => shuttingDown || warmAbortCtrl.signal.aborted,
+        }).catch((err) => {
+          if (!shuttingDown && !warmAbortCtrl.signal.aborted) {
+            console.error('⚠️ [WarmSweep] 启动余额预热异常:', err)
+          }
+        })
+      }, delayMs)
+      warmTimeout.unref?.()
+    }
     /**
      * 🔴 **用 UTC+8 的小时戳做键，绝不能用本地时区**（2026-11-05 修）。
      *
@@ -386,6 +557,7 @@ export function startServer(options: ServerOptions = {}) {
 
   // 4. 监听错误保护（避免 EADDRINUSE / EACCES 抛裸未捕获异常堆栈）
   server.on('error', (err: NodeJS.ErrnoException) => {
+    stopWarmSweep()
     if (cronInterval) clearInterval(cronInterval)
     clearInterval(pruneInterval)
     // 若测试或外部调用方额外挂了自己的 error 监听器，交由调用方断言处理
@@ -440,11 +612,11 @@ export function startServer(options: ServerOptions = {}) {
   })
 
   // 6. 优雅退出（防重入 + Windows 控制台关闭/Ctrl+Break SIGBREAK 落盘保护）
-  let shuttingDown = false
   const shutdown = () => {
     if (shuttingDown) return
     shuttingDown = true
     console.log('\n🛑 正在停止 free-llm-router 服务...')
+    stopWarmSweep()
     if (cronInterval) clearInterval(cronInterval)
     clearInterval(pruneInterval)
     /**
@@ -490,6 +662,7 @@ export function startServer(options: ServerOptions = {}) {
 
   // 测试反复创建/关闭 server 时自动卸载信号监听与定时器，防止 MaxListenersExceededWarning
   server.once('close', () => {
+    stopWarmSweep()
     if (cronInterval) clearInterval(cronInterval)
     clearInterval(pruneInterval)
     process.off('SIGINT', shutdown)

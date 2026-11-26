@@ -15,6 +15,61 @@ export interface RoutingConfig {
   autoTaskCron: boolean
   autoRefreshCredential: boolean
   autoContinuation?: boolean
+  cnTaskJitter?: boolean
+}
+
+export interface UnifiedModelRule {
+  alias: string
+  targets: Record<string, string>
+  description?: string
+}
+
+export interface UnifiedModelsConfig {
+  enabled: boolean
+  rules: UnifiedModelRule[]
+}
+
+function unwrapUnifiedModelsConfig(raw: UnifiedModelsConfig | { config?: UnifiedModelsConfig }): UnifiedModelsConfig {
+  const cfg = 'config' in raw && raw.config ? raw.config : (raw as UnifiedModelsConfig)
+  return {
+    enabled: Boolean(cfg?.enabled),
+    rules: Array.isArray(cfg?.rules)
+      ? cfg.rules.map((r) => ({
+          alias: String(r.alias ?? ''),
+          targets: r.targets && typeof r.targets === 'object' ? { ...r.targets } : {},
+          ...(r.description ? { description: String(r.description) } : {}),
+        }))
+      : [],
+  }
+}
+
+export function useUnifiedModelsConfig() {
+  return useQuery({
+    queryKey: ['unified-models'],
+    queryFn: () =>
+      api<{ ok?: boolean; config?: UnifiedModelsConfig } | UnifiedModelsConfig>('/admin/config/unified-models').then(
+        unwrapUnifiedModelsConfig,
+      ),
+    staleTime: 60_000,
+  })
+}
+
+export function useSaveUnifiedModels() {
+  const qc = useQueryClient()
+  return useMutation<UnifiedModelsConfig, Error, UnifiedModelsConfig>({
+    mutationFn: (v) =>
+      api<{ ok?: boolean; config?: UnifiedModelsConfig } | UnifiedModelsConfig>('/admin/config/unified-models', {
+        json: { enabled: v.enabled, rules: v.rules },
+      }).then(unwrapUnifiedModelsConfig),
+    onSuccess: (cfg) => {
+      qc.setQueryData(['unified-models'], cfg)
+      qc.invalidateQueries({ queryKey: ['models'] })
+      toast.success('统一模型映射已保存', {
+        description: cfg.enabled ? `已启用 ${cfg.rules.length} 条出口感知别名规则。` : '统一模型映射当前处于关闭状态。',
+      })
+    },
+    onError: (e) => toast.error('保存统一模型映射失败', { description: e.message }),
+  })
 }
 
 export function useRoutingConfig() {

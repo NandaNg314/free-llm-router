@@ -29,6 +29,11 @@ import { resolveBurnRate, resolveMaxContextMessages } from '../env.js'
 // ⚠️ 限速参数解析放在 `gateway/safety.ts`（与 `envFallback` 同处），
 // 由 DO 在"面板没存值"时回落到此 —— 这是限速唯一的开启途径。
 import { resolveRateJitterMs, resolveRateLimitQps, resolveSafetyFor } from '../gateway/safety.js'
+import {
+  defaultUnifiedModelsConfig,
+  sanitizeUnifiedModelsConfig,
+  type UnifiedModelsConfig,
+} from '../gateway/unified-models.js'
 import { appendBalanceSample, detectBurnRate } from './burn-rate.js'
 import {
   type AccountState,
@@ -39,8 +44,10 @@ import {
   filterCandidatesByPaidTier,
   hardCooldownActive,
   healthy,
+  healthyForFreeModel,
   healthyForModel,
   isActive,
+  isConfirmedZeroCostModel,
   isExclusiveProModel,
   modelExempt,
   normalizeAccountState,
@@ -381,6 +388,14 @@ export interface PickRequest {
    * - `undefined`：对 `buddy` / `workbuddy` 自动按已同步的 `exclusiveModels` 或冷启动兜底表判定。
    */
   requiresPaid?: boolean
+  /**
+   * 目标模型是否为已确认的 `0` 倍率免费模型（对标 `v2.2.2` PR #20）。
+   *
+   * - `true`：豁免 `permanentLocks`（永久积分锁）与 `hard` 余额耗尽保留线，只要账号未 `disabled`、
+   *   未 `needsRelogin`、未 `breaker`/`degrade`、未 `restricted`、未 `soft` 限流即可派发；
+   * - `undefined`：自动通过 `isConfirmedZeroCostModel(provider, model)` 识别（如 `hy4flash-free`、`hy4free`）。
+   */
+  isFreeModel?: boolean
 }
 
 /** 选号结果。 */
@@ -464,12 +479,21 @@ function unavailableReason(
   state: AccountState,
   now: number,
   model: string,
-  opts: { excluded: boolean; permLocked: boolean },
+  opts: { excluded: boolean; permLocked: boolean; isFreeModel?: boolean },
 ): string {
   if (opts.excluded) return '这次请求里它已经失败过'
   if (state.disabled) return '已停用'
+  if (state.needsRelogin === true) {
+    return state.reloginReason ? `需重新登录（${state.reloginReason}）` : '凭据已过期，需重新登录'
+  }
+  const accountCoolUntil =
+    opts.isFreeModel === true && state.coolKind === 'hard'
+      ? 0
+      : isActive(state.until, now)
+        ? state.until
+        : 0
   const cool = Math.max(
-    isActive(state.until, now) ? state.until : 0,
+    accountCoolUntil,
     isActive(state.breakerUntil, now) ? state.breakerUntil : 0,
     isActive(state.degradeUntil, now) ? state.degradeUntil : 0,
     isActive(state.restrictedUntil, now) ? state.restrictedUntil : 0,
@@ -496,6 +520,10 @@ export interface RoutingConfig {
    * 截断续写与动作预告悬停救援开关覆盖（`undefined` = 未覆盖，跟随 `AUTO_CONTINUATION` 环境变量）。
    */
   autoContinuation?: boolean
+  /**
+   * 国内版每日福利随机错峰窗口开关（默认 `false` 保持 `09:00` / `21:00`；开启后在 `08:00–10:00` 按账号确定性打散）。
+   */
+  cnTaskJitter?: boolean
 }
 
 /** 持久化在 DO 存储中的数据面 CORS 白名单配置（多 isolate 共享、重启不丢）。 */
@@ -798,6 +826,10 @@ export class AccountPoolDO extends DurableObject<Env> {
     /** 指定账号不在候选里的原因（找到该账号才会被赋值）。 */
     let pinReason: string | undefined
     let pinLabel = ''
+    const effectiveIsFreeModel =
+      typeof request.isFreeModel === 'boolean'
+        ? request.isFreeModel
+        : isConfirmedZeroCostModel(wantProvider || 'buddy', model)
 
     let candidates: AccountState[] = []
     for (const raw of raws) {
@@ -815,67 +847,45 @@ export class AccountPoolDO extends DurableObject<Env> {
       }
       if (isPin) pinLabel = state.nickname
       if (excludeSet.has(state.uid)) {
-        if (isPin) pinReason = unavailableReason(state, now, model, { excluded: true, permLocked: false })
+        if (isPin) {
+          pinReason = unavailableReason(state, now, model, {
+            excluded: true,
+            permLocked: false,
+            isFreeModel: effectiveIsFreeModel,
+          })
+        }
         continue
       }
       pruneExpired(state, now, MODEL_COST_TTL_MS)
       // ⚠️ 模型冷却关闭时，**已存在的**旧冷却条目也必须一并忽略
       //（用户关开关那一刻，池里已经挂着 5 小时的条目；只挡新写入不够）。
       // 判据：`modelCooldownEnabled ? healthyForModel(...) : healthy(...)` ——
-      // 即「账号级 5 维照旧，模型级 1 维跳过」。
-      //
-      // ⚠️ 这里必须用**该账号自己的**配置（`globalSafety` + 它的 override）。
-      // 用全局值会让"只给 qodercn 放开"失效 —— 那正是用户要的。
+      // 即「账号级 5 维照旧，模型级 1 维跳过」；免费模型额外豁免 `hard` 余额耗尽锁（PR #20）。
       const acctSafety = resolveSafetyFor(globalSafety, state.safetyOverride)
-      const usable = acctSafety.modelCooldownEnabled
-        ? healthyForModel(state, now, model)
-        : healthy(state, now)
+      const usable = effectiveIsFreeModel
+        ? healthyForFreeModel(state, now, model, acctSafety.modelCooldownEnabled)
+        : acctSafety.modelCooldownEnabled
+          ? healthyForModel(state, now, model)
+          : healthy(state, now)
       if (!usable) {
-        if (isPin) pinReason = unavailableReason(state, now, model, { excluded: false, permLocked: false })
+        if (isPin) {
+          pinReason = unavailableReason(state, now, model, {
+            excluded: false,
+            permLocked: false,
+            isFreeModel: effectiveIsFreeModel,
+          })
+        }
         continue
       }
 
-      // ── 临期专享保护：**只影响排序，不做硬性过滤** ──
-      //
-      // ## 🔴 为什么原来是硬过滤、后来必须改成软降级（2026-11-07 线上事故）
-      //
-      // 第一版把「没有临期额度的账号」**直接 continue 掉**。上线后表现为：
-      // ```
-      // Error: 当前所有可用账号的快过期积分均已耗尽。已自动停止派发以保护您的永久积分。
-      // ```
-      // 而账号池里明明还挂着 2109 / 2613 / 1446 的 `creditsExpiring`。
-      //
-      // 根因是**两个快照语义叠加**：
-      // 1. `creditsExpiring` 是**上次刷新余额时的快照**（整点 cron 才更新）；
-      // 2. 临期额度可能**已经烧光但快照还没回写** ⇒ 硬过滤把整池判成「无临期额度」。
-      //
-      // ⇒ 硬过滤的正确性依赖「快照永远新鲜」，而那个前提在本项目**不成立**。
-      // ⇒ 改成**软降级**：临期账号在排序里优先（`expiry` 策略已实现），
-      //   但**绝不因为这一条把池子清空** —— 宁可少省一点，也不能整条链路不可用。
-      //
-      // ⚠️ 真正「不许烧永久积分」的诉求由**永久积分锁**（下面那段）负责，
-      // 那是用户显式打开的开关，语义明确、判据稳定。
-      // 本处只记录「有多少账号没有临期额度」，供日志/诊断使用。
       if (request.expiringOnly === true) {
         const hasExpiring = state.creditsExpiring > 0 && state.creditsEarliestExpiry > now
         if (!hasExpiring) expiringOnlySkipped += 1
       }
 
-      // ── 严格临期模式：**硬过滤**（`expiringonly/` 前缀）──
-      //
-      // 与上面的「软降级」是**两种不同语义**，由用户选择的**前缀**决定：
-      //   `expiring/`     ⇒ 优先烧临期，烧完继续烧永久（不打断工作）
-      //   `expiringonly/` ⇒ 只烧临期，烧完就停（绝不碰永久积分）
-      //
-      // ⚠️ 这里必须 `continue`（硬过滤），这正是用户显式要求的语义。
-      //    `expiringOnly` 当初硬过滤会炸，是因为用户以为它只是「优先」；
-      //    严格模式不存在这个歧义 —— 名字就叫 only。
-      //
-      // 判据要求**双重证据**（见 `PickRequest.expiringStrict` 的说明）：
-      // 既要 `creditsExpiring > 0`，又要 `creditsEarliestExpiry > now`。
-      // 宁可早停，不可误烧永久积分。
       if (request.expiringStrict === true) {
-        const hasExpiring = state.creditsExpiring > 0 && state.creditsEarliestExpiry > now
+        const hasExpiring =
+          effectiveIsFreeModel || (state.creditsExpiring > 0 && state.creditsEarliestExpiry > now)
         if (!hasExpiring) {
           expiringStrictSkipped += 1
           if (isPin) pinReason = '该账号已无即将过期的积分（严格临期模式）'
@@ -883,17 +893,21 @@ export class AccountPoolDO extends DurableObject<Env> {
         }
       }
 
-      // ── 永久积分锁过滤 ──
-      //
-      // 判定「只剩永久额度」用**快照三元组**（AccountState 已有，无需再打上游）：
-      //   creditsExpiring === 0 且 credits > 0
-      //   ⇒ 没有任何临期/赠送额度，剩下的全是永久积分。
-      //
-      // ⚠️ credits === 0 时**不滤**：那是「没钱了」，走的是 402 硬冷却路径，
-      // 不是「只剩永久」—— 混淆会把真正的额度耗尽误报成锁。
-      if (permLocks[state.provider ?? 'buddy'] === true && state.credits > 0 && state.creditsExpiring === 0) {
+      // ── 永久积分锁过滤（确认零倍率免费模型不扣积分，自动豁免保留线） ──
+      if (
+        !effectiveIsFreeModel &&
+        permLocks[state.provider ?? 'buddy'] === true &&
+        state.credits > 0 &&
+        state.creditsExpiring === 0
+      ) {
         permLockSkipped += 1
-        if (isPin) pinReason = unavailableReason(state, now, model, { excluded: false, permLocked: true })
+        if (isPin) {
+          pinReason = unavailableReason(state, now, model, {
+            excluded: false,
+            permLocked: true,
+            isFreeModel: false,
+          })
+        }
         continue
       }
 
@@ -1067,6 +1081,7 @@ export class AccountPoolDO extends DurableObject<Env> {
   private cachedSafetyConfig?: SafetyConfig
   private cachedExclusiveModels?: string[] | null
   private cachedCorsConfig?: PersistedCorsConfig | null
+  private cachedUnifiedModelsConfig?: UnifiedModelsConfig
 
   /** 读取当前分片已同步的动态 Pro 专属模型列表（未同步过返回 `undefined`，触发冷启动兜底表）。 */
   async getExclusiveModels(): Promise<string[] | undefined> {
@@ -1233,6 +1248,7 @@ export class AccountPoolDO extends DurableObject<Env> {
       softCooldownSeconds: typeof raw?.softCooldownSeconds === 'number' && raw.softCooldownSeconds >= 10 && raw.softCooldownSeconds <= 3600 ? raw.softCooldownSeconds : 60,
       autoTaskCron: raw?.autoTaskCron !== false,
       autoRefreshCredential: raw?.autoRefreshCredential !== false,
+      cnTaskJitter: raw?.cnTaskJitter === true,
       ...(typeof raw?.autoContinuation === 'boolean' ? { autoContinuation: raw.autoContinuation } : {}),
     }
     this.cachedRoutingConfig = config
@@ -1256,10 +1272,51 @@ export class AccountPoolDO extends DurableObject<Env> {
       softCooldownSeconds: typeof input.softCooldownSeconds === 'number' && input.softCooldownSeconds >= 10 && input.softCooldownSeconds <= 3600 ? input.softCooldownSeconds : cur.softCooldownSeconds,
       autoTaskCron: typeof input.autoTaskCron === 'boolean' ? input.autoTaskCron : cur.autoTaskCron,
       autoRefreshCredential: typeof input.autoRefreshCredential === 'boolean' ? input.autoRefreshCredential : cur.autoRefreshCredential,
+      cnTaskJitter: typeof input.cnTaskJitter === 'boolean' ? input.cnTaskJitter : (cur.cnTaskJitter === true),
       ...(typeof nextAutoCont === 'boolean' ? { autoContinuation: nextAutoCont } : {}),
     }
     await this.ctx.storage.put('systemRoutingConfig', next)
     this.cachedRoutingConfig = next
+    return next
+  }
+
+  /**
+   * 读取持久化的出口感知「统一模型映射表」（`systemUnifiedModels`）。
+   *
+   * 默认 `enabled: false, rules: []`，空表绝不自动回填示例数据。
+   */
+  async getUnifiedModelsConfig(): Promise<UnifiedModelsConfig> {
+    if (this.cachedUnifiedModelsConfig !== undefined) {
+      return this.cachedUnifiedModelsConfig
+    }
+    const raw = await this.ctx.storage.get<unknown>('systemUnifiedModels')
+    const config = raw === undefined ? defaultUnifiedModelsConfig() : sanitizeUnifiedModelsConfig(raw)
+    this.cachedUnifiedModelsConfig = config
+    return config
+  }
+
+  /**
+   * 写入持久化的出口感知「统一模型映射表」（`systemUnifiedModels`），支持整表更新或局部切换 `enabled`。
+   */
+  async setUnifiedModelsConfig(input: unknown): Promise<UnifiedModelsConfig> {
+    if (input === null) {
+      const empty = defaultUnifiedModelsConfig()
+      await this.ctx.storage.put('systemUnifiedModels', empty)
+      this.cachedUnifiedModelsConfig = empty
+      return empty
+    }
+    const cur = await this.getUnifiedModelsConfig()
+    let mergedInput: unknown = input
+    if (input !== undefined && typeof input === 'object' && !Array.isArray(input)) {
+      const obj = input as Record<string, unknown>
+      mergedInput = {
+        enabled: 'enabled' in obj ? obj.enabled : cur.enabled,
+        rules: 'rules' in obj ? obj.rules : cur.rules,
+      }
+    }
+    const next = sanitizeUnifiedModelsConfig(mergedInput)
+    await this.ctx.storage.put('systemUnifiedModels', next)
+    this.cachedUnifiedModelsConfig = next
     return next
   }
 
@@ -2044,6 +2101,10 @@ export class AccountPoolDO extends DurableObject<Env> {
      * ⚠️ 与 `setAccountDisabled` 无关：`disabled` 不在本方法里动（见上面的 `reason` 守卫）。
      */
     state.restrictedUntil = 0
+    // 重新导入凭据或解冻时一并清除待重登标记（保留手动 disabled 不变）
+    delete state.needsRelogin
+    delete state.reloginReason
+    state.authFailStreak = 0
     // ⚠️ **必须一起清空采样历史**：revive 的语义是「人工判定这个号是好的，解冻」。
     // 若不清，上一轮触发熔断前的高消耗采样仍在观察窗口内（默认 1 小时），
     // 下一次 `updateBalance` 会拿它当基准**立刻再锁一次** ——
@@ -2186,6 +2247,49 @@ export class AccountPoolDO extends DurableObject<Env> {
       state.softStreak = 0
       state.consecutiveFails = 0
       state.sessionDeadFails = 0
+      delete state.needsRelogin
+      delete state.reloginReason
+      state.authFailStreak = 0
+    }
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    return true
+  }
+
+  /**
+   * 标记账号需要重新登录（`needsRelogin = true`），区别于手动停用 `disabled`（对标 `v2.2.4` PR #34/#36）。
+   *
+   * 仅设置 `needsRelogin` 与 `reloginReason`，**绝不置 `disabled = true`**；
+   * 后续一旦凭据刷新成功（`putCredential`）或重登导入（`revive`），将自动清零恢复派发。
+   */
+  async markNeedsRelogin(uid: string, reason: string, now = Date.now()): Promise<boolean> {
+    const state = this.readState(uid)
+    if (state === undefined) return false
+    const cleanReason = reason.trim() || '凭据已过期，请重新登录'
+    state.needsRelogin = true
+    state.reloginReason = cleanReason
+    if (!state.disabled) {
+      state.reason = cleanReason
+    }
+    state.lastErr = now
+    writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
+    return true
+  }
+
+  /**
+   * 清除账号的 `needsRelogin` 待重登标记（保留手动停用 `disabled` 原样不变）。
+   */
+  async clearNeedsRelogin(uid: string, now = Date.now()): Promise<boolean> {
+    const state = this.readState(uid)
+    if (state === undefined) return false
+    if (state.needsRelogin !== true && state.reloginReason === undefined && state.authFailStreak === 0) {
+      return false
+    }
+    const prevReloginReason = state.reloginReason ?? ''
+    delete state.needsRelogin
+    delete state.reloginReason
+    state.authFailStreak = 0
+    if (!state.disabled && (state.reason === prevReloginReason || state.reason.includes('重新登录'))) {
+      state.reason = ''
     }
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
     return true
@@ -2248,10 +2352,25 @@ export class AccountPoolDO extends DurableObject<Env> {
     writeCredential(this.ctx.storage.sql, uid, ciphertext, now)
 
     const inferredPaid = extractPaidStatusFromSummary(credential)
-    if (typeof inferredPaid === 'boolean') {
-      const state = this.readState(uid)
-      if (state !== undefined && state.isPaid !== inferredPaid) {
+    const state = this.readState(uid)
+    if (state !== undefined) {
+      let stateChanged = false
+      if (typeof inferredPaid === 'boolean' && state.isPaid !== inferredPaid) {
         state.isPaid = inferredPaid
+        stateChanged = true
+      }
+      // 凭据刷新成功或重新登录导入新凭据时，自动清除 needsRelogin 与鉴权连败计数（绝不解除手动 disabled！）
+      if (state.needsRelogin === true || state.reloginReason !== undefined || state.authFailStreak !== 0) {
+        const prevReloginReason = state.reloginReason ?? ''
+        delete state.needsRelogin
+        delete state.reloginReason
+        state.authFailStreak = 0
+        if (!state.disabled && (state.reason === prevReloginReason || state.reason.includes('重新登录'))) {
+          state.reason = ''
+        }
+        stateChanged = true
+      }
+      if (stateChanged) {
         writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), now)
       }
     }
@@ -2281,8 +2400,14 @@ export class AccountPoolDO extends DurableObject<Env> {
   async noteAuthSuccess(uid: string): Promise<void> {
     const state = this.readState(uid)
     if (state === undefined) return
-    if (state.authFailStreak === 0) return
+    if (state.authFailStreak === 0 && state.needsRelogin !== true && state.reloginReason === undefined) return
+    const prevReloginReason = state.reloginReason ?? ''
     state.authFailStreak = 0
+    delete state.needsRelogin
+    delete state.reloginReason
+    if (!state.disabled && (state.reason === prevReloginReason || state.reason.includes('重新登录'))) {
+      state.reason = ''
+    }
     writeAccount(this.ctx.storage.sql, state.uid, state.realm, JSON.stringify(state), Date.now())
   }
 

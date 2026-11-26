@@ -1,4 +1,4 @@
-import { Boxes, Copy, FlaskConical, Info, Loader2, Search, Square, Trash2 } from 'lucide-react'
+import { Boxes, Copy, FlaskConical, Info, Loader2, MessageSquare, Search, Square, Trash2, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/layout/PageHeader'
@@ -11,6 +11,7 @@ import { Empty, Progress, Segmented, Skeleton } from '@/components/ui/misc'
 import { Table, TD, TH, THead, TR } from '@/components/ui/table'
 import { type GatewayModel, isAggregate, isFreeModel, priceOf, probeModel, useModelCatalog, useProbeCache } from '@/lib/models'
 import { useProviders } from '@/lib/queries'
+import { navigateToPlayground } from '@/lib/router'
 import { fmtInt } from '@/lib/utils'
 
 type Price = 'all' | 'free'
@@ -37,7 +38,10 @@ export function ModelsPage() {
   const stop = useRef(false)
 
   const names = useMemo(() => {
-    const m = new Map<string, string>([['aggregate', '聚合路由']])
+    const m = new Map<string, string>([
+      ['aggregate', '聚合路由'],
+      ['unified', '统一别名'],
+    ])
     for (const p of providers.data?.providers ?? []) m.set(p.id, p.name)
     return m
   }, [providers.data])
@@ -93,21 +97,21 @@ export function ModelsPage() {
     <>
       <PageHeader
         title="模型"
-        description="网关对外提供的模型，客户端把模型 ID 填进 model 字段即可。"
+        description="网关对外提供的模型目录，客户端把模型 ID 填进 model 字段即可，或点击「试聊」直接在试炼场验证。"
         actions={
           <>
             {cachedCount > 0 && !batch && (
               <Button variant="ghost" onClick={() => (clear(), toast.success('已清除检测结果'))}>
-                <Trash2 /> 清除检测结果
+                <Trash2 strokeWidth={1.75} /> 清除检测结果
               </Button>
             )}
             {batch ? (
               <Button variant="outline" onClick={() => (stop.current = true)}>
-                <Square /> 停止（{batch.done}/{batch.total}）
+                <Square strokeWidth={1.75} /> 停止（{batch.done}/{batch.total}）
               </Button>
             ) : (
               <Button onClick={() => setConfirm(true)} disabled={!probeTargets.length || catalog.data?.fallback}>
-                <FlaskConical /> 检测资费
+                <FlaskConical strokeWidth={1.75} /> 检测资费
               </Button>
             )}
           </>
@@ -115,24 +119,24 @@ export function ModelsPage() {
       />
 
       {catalog.data?.fallback && (
-        <div className="border-primary/25 bg-primary/[0.05] mb-4 flex items-start gap-2.5 rounded-lg border px-4 py-3 text-[13px] leading-relaxed">
-          <Info className="text-primary mt-0.5 size-4 shrink-0" />
+        <div className="border-primary/25 bg-primary/[0.05] mb-4 flex items-start gap-2.5 rounded-xl border px-4 py-3 text-[13px] leading-relaxed">
+          <Info className="text-primary mt-0.5 size-4 shrink-0" strokeWidth={1.75} />
           <span>网关还没拉到任何上游模型（账号未就绪，或上游暂时不可达），下面是内置的已知模型清单，仅供参考。添加可用账号后会显示真实列表。</span>
         </div>
       )}
       {!!catalog.data?.errors.length && !catalog.data.fallback && (
-        <div className="bg-warning/10 text-warning mb-4 rounded-lg px-4 py-3 text-[13px] leading-relaxed">
+        <div className="bg-warning/10 text-warning mb-4 rounded-xl px-4 py-3 text-[13px] leading-relaxed">
           有 {catalog.data.errors.length} 家拉取模型失败：
           {catalog.data.errors.map((e) => `${nameOf(e.provider)}（${e.error}）`).join('；')}
         </div>
       )}
       {batch && (
-        <div className="mb-4 rounded-lg border px-4 py-3">
+        <div className="mb-4 rounded-xl border px-4 py-3">
           <div className="mb-2 flex items-center justify-between text-[13px]">
             <span className="flex items-center gap-2 font-medium">
-              <Loader2 className="size-4 animate-spin" /> 正在逐个检测资费…
+              <Loader2 className="size-4 animate-spin" strokeWidth={1.75} /> 正在逐个检测资费…
             </span>
-            <span className="text-muted-foreground tabular">
+            <span className="text-muted-foreground tabular font-sans tabular-nums">
               {batch.done} / {batch.total}
             </span>
           </div>
@@ -140,14 +144,32 @@ export function ModelsPage() {
         </div>
       )}
 
-      <Card>
-        <div className="flex flex-col gap-2 border-b p-3 sm:flex-row sm:items-center">
-          <div className="relative flex-1">
-            <Search className="text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
-            <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索模型 ID / 名称" className="h-8 pl-8 text-[13px]" />
+      <Card className="min-w-0 overflow-hidden">
+        <div className="flex flex-col gap-2 border-b px-4 py-3 sm:flex-row sm:items-center">
+          <div className="relative min-w-0 flex-1">
+            <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" strokeWidth={1.75} />
+            <Input
+              type="search"
+              autoComplete="off"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="搜索模型 ID / 名称"
+              aria-label="搜索模型"
+              className="h-8 pr-7 pl-8 text-[13px]"
+            />
+            {q && (
+              <button
+                type="button"
+                onClick={() => setQ('')}
+                aria-label="清空模型搜索词"
+                className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2 cursor-pointer rounded p-0.5"
+              >
+                <X className="size-3.5" strokeWidth={1.75} />
+              </button>
+            )}
           </div>
-          <div className="flex gap-2">
-            <Select value={owner} onChange={(e) => setOwner(e.target.value)} className="h-8 min-w-36 text-[13px]" aria-label="供应商">
+          <div className="flex flex-wrap items-center gap-2">
+            <Select value={owner} onChange={(e) => setOwner(e.target.value)} className="h-8 w-auto min-w-36 text-[13px]" aria-label="供应商">
               <option value="">全部供应商（{all.length}）</option>
               {owners.map(([id, n]) => (
                 <option key={id} value={id}>
@@ -174,17 +196,17 @@ export function ModelsPage() {
             ))}
           </div>
         ) : !rows.length ? (
-          <Empty icon={<Boxes />} title={all.length ? '没有匹配的模型' : '暂无模型'}>
+          <Empty icon={<Boxes strokeWidth={1.75} />} title={all.length ? '没有匹配的模型' : '暂无模型'}>
             {all.length ? '换个关键词或筛选条件试试。' : '添加账号后，各家可用模型会出现在这里。'}
           </Empty>
         ) : (
-          <Table>
-            <THead className="border-t-0">
+          <Table containerClassName="max-h-[calc(100dvh-260px)] overflow-y-auto">
+            <THead sticky className="border-t-0">
               <tr>
-                <TH className="w-[60%]">模型</TH>
+                <TH className="w-full">模型</TH>
                 <TH className="hidden md:table-cell">供应商</TH>
                 <TH>资费</TH>
-                <TH className="w-px" />
+                <TH className="w-px text-right">操作</TH>
               </tr>
             </THead>
             <tbody>
@@ -193,8 +215,9 @@ export function ModelsPage() {
                 const busy = probing.has(m.id)
                 return (
                   <TR key={m.id}>
-                    <TD className="max-w-0 min-w-0">
+                    <TD className="w-full max-w-0 min-w-0">
                       <button
+                        type="button"
                         className="group block max-w-full cursor-pointer text-left"
                         onClick={() => copyText(m.id, `已复制 ${m.id}`)}
                         title="点击复制模型 ID"
@@ -213,22 +236,41 @@ export function ModelsPage() {
                         <span className="text-muted-foreground">—</span>
                       )}
                     </TD>
-                    <TD>
-                      <div className="flex justify-end gap-1">
+                    <TD className="whitespace-nowrap">
+                      <div className="flex items-center justify-end gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => navigateToPlayground(m.id)}
+                          aria-label={`试聊 ${m.id}`}
+                          title="在对话试炼场测试该模型"
+                        >
+                          <MessageSquare strokeWidth={1.75} />
+                          <span className="hidden sm:inline">试聊</span>
+                        </Button>
                         {!isAggregate(m.id) && !catalog.data?.fallback && (
                           <Button
                             variant="ghost"
                             size="sm"
+                            className="h-7 px-2 text-xs"
                             disabled={busy || !!batch}
                             onClick={() => probeOne(m)}
+                            aria-label={`检测 ${m.id} 资费`}
                             title="发一次 1 token 请求，看实际扣多少积分"
                           >
-                            {busy ? <Loader2 className="animate-spin" /> : <FlaskConical />}
-                            <span className="hidden sm:inline">测资费</span>
+                            {busy ? <Loader2 className="animate-spin" strokeWidth={1.75} /> : <FlaskConical strokeWidth={1.75} />}
+                            <span className="hidden lg:inline">测资费</span>
                           </Button>
                         )}
-                        <Button variant="ghost" size="icon-sm" onClick={() => copyText(m.id, `已复制 ${m.id}`)} aria-label="复制模型 ID">
-                          <Copy />
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => copyText(m.id, `已复制 ${m.id}`)}
+                          aria-label={`复制模型 ID ${m.id}`}
+                          title="复制模型 ID"
+                        >
+                          <Copy strokeWidth={1.75} />
                         </Button>
                       </div>
                     </TD>
@@ -239,7 +281,7 @@ export function ModelsPage() {
           </Table>
         )}
         {!!all.length && (
-          <div className="text-muted-foreground border-t px-5 py-3 text-xs">
+          <div className="text-muted-foreground border-t px-5 py-3 font-sans text-xs tabular-nums">
             共 {fmtInt(all.length)} 个模型，当前显示 {fmtInt(rows.length)} 个
             {catalog.data?.disabledCount ? `；另有 ${fmtInt(catalog.data.disabledCount)} 个已在供应商详情里关闭` : ''}
             {cachedCount ? `；已检测 ${fmtInt(cachedCount)} 个` : ''}

@@ -409,26 +409,29 @@ export function repackToolResultBlocks(messages: unknown[]): unknown[] {
       if (!isObj(mm)) break
       if (mm.role === 'tool') {
         const id = mm.tool_call_id
-        if (!(typeof id === 'string' && want.has(id))) break
-        results.push(mm)
-        i += 1
-        continue
+        if (typeof id === 'string' && want.has(id)) {
+          results.push(mm)
+          i += 1
+          continue
+        }
       }
       // 任何 assistant 都结束这一批
       if (mm.role === 'assistant') break
-      // 非结果消息只有在**后面还有本批结果**时才算「插队者」（挪到整批之后）；
-      // 否则是正常的后续消息，原样留给外层循环
-      let j = i
-      while (j < messages.length) {
-        const nx = messages[j]
-        if (!isObj(nx) || nx.role === 'tool' || nx.role === 'assistant') break
-        j += 1
+      // 非本批结果消息（含 developer/system/user 提示，或夹在批次中间的孤儿 tool 结果）：
+      // 只有在**下一个 assistant 之前还存在属于本批的合法结果**时才算「插队者」（挪到整批之后），
+      // 穿透孤儿结果继续向后扫描，防止孤儿结果把后续同批合法结果拦在 notice 后面（Issue #26）。
+      let hasMoreBatchResults = false
+      for (let k = i + 1; k < messages.length; k += 1) {
+        const nx = messages[k]
+        if (!isObj(nx) || nx.role === 'assistant') break
+        if (nx.role === 'tool' && typeof nx.tool_call_id === 'string' && want.has(nx.tool_call_id)) {
+          hasMoreBatchResults = true
+          break
+        }
       }
-      const nx = messages[j]
-      const moreResults =
-        isObj(nx) && nx.role === 'tool' && typeof nx.tool_call_id === 'string' && want.has(nx.tool_call_id)
-      if (!moreResults) break
-      for (; i < j; i += 1) between.push(messages[i])
+      if (!hasMoreBatchResults) break
+      between.push(mm)
+      i += 1
     }
     if (results.length > 0) {
       out.push(...results, ...between)
@@ -441,41 +444,69 @@ export function repackToolResultBlocks(messages: unknown[]): unknown[] {
 }
 
 /**
- * 两侧同时剪孤儿（移植自 workbuddy2api-hub `cleanup_orphan_tool_calls`）：
+ * 两侧同时剪孤儿 + 同批重复 `tool_call_id` 去重（移植自 workbuddy2api-hub `cleanup_orphan_tool_calls`，Issue #26）：
  * - 没有结果的 tool_call 删掉（工具调用失败/超时后客户端**永远不会**补结果，
  *   但这条声明会跟着历史每轮重发，上游每轮都 400 `code=11148`）；
- * - 没有声明的 tool 结果删掉。
- *
- * 两侧按**同一个 id 交集**修剪，不会留下半个配对。
+ * - 没有声明的 tool 结果删掉；
+ * - 同一 `assistant(tool_calls)` 批次内若出现相同 `tool_call_id` 的多条 `role: 'tool'` 消息，
+ *   只保留第一条，删除后续重复回放；跨轮合法复用同一 ID（如多轮 `call_0`）互不干扰。
  */
 export function cleanupOrphanToolCalls(messages: unknown[]): unknown[] {
-  const callIds = new Set<string>()
-  const resultIds = new Set<string>()
-  let sawTool = false
-  for (const m of messages) {
+  interface BatchTracker {
+    declared: Set<string>
+    matched: Set<string>
+  }
+  const batchesByAssistantIdx = new Map<number, BatchTracker>()
+  const keptToolIndices = new Set<number>()
+  let sawToolOrCall = false
+  let activeBatch: BatchTracker | undefined
+
+  for (let idx = 0; idx < messages.length; idx += 1) {
+    const m = messages[idx]
     if (!isObj(m)) continue
+    if (m.role === 'assistant') {
+      if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+        sawToolOrCall = true
+        const declared = new Set<string>()
+        for (const tc of m.tool_calls as unknown[]) {
+          if (isObj(tc) && typeof tc.id === 'string' && tc.id !== '') {
+            declared.add(tc.id)
+          }
+        }
+        activeBatch = { declared, matched: new Set<string>() }
+        batchesByAssistantIdx.set(idx, activeBatch)
+      } else {
+        activeBatch = undefined
+      }
+      continue
+    }
     if (m.role === 'tool') {
-      sawTool = true
+      sawToolOrCall = true
       const id = m.tool_call_id
-      if (typeof id === 'string' && id !== '') resultIds.add(id)
-    } else if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
-      for (const tc of m.tool_calls as unknown[]) {
-        if (isObj(tc) && typeof tc.id === 'string' && tc.id !== '') callIds.add(tc.id)
+      if (
+        activeBatch !== undefined &&
+        typeof id === 'string' &&
+        id !== '' &&
+        activeBatch.declared.has(id) &&
+        !activeBatch.matched.has(id)
+      ) {
+        activeBatch.matched.add(id)
+        keptToolIndices.add(idx)
       }
     }
   }
-  if (!sawTool && callIds.size === 0) return messages
+  if (!sawToolOrCall) return messages
 
   let changed = false
   const out: unknown[] = []
-  for (const m of messages) {
+  for (let idx = 0; idx < messages.length; idx += 1) {
+    const m = messages[idx]
     if (!isObj(m)) {
       out.push(m)
       continue
     }
     if (m.role === 'tool') {
-      const id = m.tool_call_id
-      if (typeof id === 'string' && callIds.has(id) && resultIds.has(id)) {
+      if (keptToolIndices.has(idx)) {
         out.push(m)
       } else {
         changed = true
@@ -483,8 +514,16 @@ export function cleanupOrphanToolCalls(messages: unknown[]): unknown[] {
       continue
     }
     if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const batch = batchesByAssistantIdx.get(idx)
+      const matched = batch?.matched ?? new Set<string>()
+      const seenDecl = new Set<string>()
       const calls = m.tool_calls as unknown[]
-      const kept = calls.filter((tc) => isObj(tc) && typeof tc.id === 'string' && resultIds.has(tc.id))
+      const kept = calls.filter((tc) => {
+        if (!isObj(tc) || typeof tc.id !== 'string' || !matched.has(tc.id)) return false
+        if (seenDecl.has(tc.id)) return false
+        seenDecl.add(tc.id)
+        return true
+      })
       if (kept.length !== calls.length) {
         changed = true
         const copy: Msg = { ...m }
@@ -1466,7 +1505,8 @@ const FINGERPRINT_LITERALS = [
   'Grok Build',
   'released by xAI',
 ]
-const FINGERPRINT_CI = /x-anthropic-billing-header|Sisyphus-Junior - Focused executor from OhMyOpenCode/i
+const FINGERPRINT_CI =
+  /x-anthropic-billing-header|x-anthropic-billing-hdr[ \t]*:|Sisyphus-Junior - Focused executor from OhMyOpenCode/i
 const FINGERPRINT_REWRITES: ReadonlyArray<readonly [string, string]> = [
   ['Main branch (you will usually use this for PRs)', 'Default branch (you will usually use this for PRs)'],
   [
@@ -1488,10 +1528,29 @@ const FINGERPRINT_REWRITES: ReadonlyArray<readonly [string, string]> = [
   ['Grok Build', 'WorkBuddy'],
 ]
 const OMO_JUNIOR_RE = /Sisyphus-Junior - Focused executor from OhMyOpenCode/gi
-const BILLING_HDR_RE = /x-anthropic-billing-header:[^;\r\n]*;?\s*/gi
+/**
+ * 精准剥离 `x-anthropic-billing-(?:header|hdr):` 前缀及其紧随的 `cc_*` 与 `cch=` 键值对（对标 `v2.2.2` Issue #25）。
+ *
+ * - 当整行只有计费元数据（甚至跨续行只有 `cc_*` 或 `cch=` 键值对）时，连同紧随的纯元数据续行与空行一起剥除；
+ * - 当子代理长提示词与计费头拼在同一行（整行 > 400 字符，且提示词不含或包含分号）时，
+ *   只精准剥掉计费头前缀与 `cc_*` 及 `cch=` 键值对，完整保留同行后续的提示词正文！
+ */
+const BILLING_PURE_LINE_RE =
+  /(^|\r?\n)[ \t]*x-anthropic-billing-(?:header|hdr)[ \t]*:[ \t]*(?:(?:cc_[a-z0-9_]+|cch)=[^\s;]*(?:[ \t]*;[ \t]*|[ \t]+))*(?:\r?\n[ \t]*(?:(?:cc_[a-z0-9_]+|cch)=[^\s;]*(?:[ \t]*;[ \t]*|[ \t]+)?)+)*(?=\r?\n|$)/gi
+const BILLING_INLINE_PREFIX_RE =
+  /x-anthropic-billing-(?:header|hdr)[ \t]*:[ \t]*(?:(?:cc_[a-z0-9_]+|cch)=[^\s;]*(?:[ \t]*;[ \t]*|[ \t]+|(?=\r?\n|$)))*/gi
 const BARE_BILLING_HDR_RE = /x-anthropic-billing-header/gi
-const CC_KV_RE = /\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*/gi
+const CC_KV_RE = /\bcc_[a-z0-9_]+=[^\s;]*(?:[ \t]*;[ \t]*|[ \t]+)?/gi
 const GROK_XAI_RE = /You are(?:[^\n]{0,256}?)released by xAI/gi
+
+/**
+ * Trae 客户端（`TraeCode`）自述短语消毒（对标 `workbuddy2api-hub` `v2.2.3` PR #30 `15425d5`）：
+ * 仅对 `system` / `developer` / `assistant` 角色将 `You are an interactive agent in TraeCode`
+ * 改写为 `You are an interactive agent`（`user` 与 `tool` 正文逐字节不碰，二次调用严格幂等）。
+ */
+const TRAECODE_PROBE = /interactive\s+agent\s+in\s+traecode\b/i
+const TRAECODE_RE = /You are an interactive agent in\s+TraeCode\b/gi
+export const TRAECODE_REPLACEMENT = 'You are an interactive agent'
 
 /**
  * 第三方 CLI「`<Vendor>'s official CLI for <Product>`」渠道自述句改写（同步自 `dsh-connect-workbuddy` `7513e88`，issue #293）。
@@ -1568,7 +1627,7 @@ function hasFingerprint(text: string, identity: boolean, officialCli = true): bo
   for (const f of FINGERPRINT_LITERALS) if (text.includes(f)) return true
   if (text.includes(FP_BARE)) return true
   if (FINGERPRINT_CI.test(text)) return true
-  if (officialCli && OFFICIAL_CLI_PROBE.test(text)) return true
+  if (officialCli && (OFFICIAL_CLI_PROBE.test(text) || TRAECODE_PROBE.test(text))) return true
   return identity && IDENTITY_PROBE.test(text)
 }
 
@@ -1577,7 +1636,7 @@ function hasFingerprint(text: string, identity: boolean, officialCli = true): bo
  *
  * @param identity 是否同时改写「自我介绍句 + 品牌」（只对 system / developer 开）。
  * @param trim 是否去除改写后文本的首尾空白（默认 `true`）。
- * @param officialCli 是否改写 `<Vendor>'s official CLI for <Product>` 自述句（对 system / developer / assistant 开，对 user / tool 关）。
+ * @param officialCli 是否改写 `<Vendor>'s official CLI for <Product>` 与 `TraeCode` 自述句（对 system / developer / assistant 开，对 user / tool 关）。
  */
 export function scrubFingerprintText(
   text: string,
@@ -1588,11 +1647,16 @@ export function scrubFingerprintText(
   if (text === '' || !hasFingerprint(text, identity, officialCli)) return text
   let out = text.replace(OMO_JUNIOR_RE, 'Sisyphus-Junior - Focused executor')
   out = out.replace(GROK_XAI_RE, 'You are WorkBuddy')
-  if (officialCli) out = out.replace(OFFICIAL_CLI_RE, `$1${OFFICIAL_CLI_REPLACEMENT}`)
+  if (officialCli) {
+    out = out.replace(OFFICIAL_CLI_RE, `$1${OFFICIAL_CLI_REPLACEMENT}`)
+    out = out.replace(TRAECODE_RE, TRAECODE_REPLACEMENT)
+  }
   if (identity) out = out.replace(IDENTITY_RE, IDENTITY_REPLACEMENT)
   for (const [from, to] of FINGERPRINT_REWRITES) out = out.replaceAll(from, to)
   out = out.replaceAll(FP_BARE, FP_SAFE)
-  out = out.replace(BILLING_HDR_RE, '')
+  // 先整行剥除纯计费元数据行（含多行 cc_*/cch= 续行），再对同行后跟长提示词的场景做精准前缀剥离
+  out = out.replace(BILLING_PURE_LINE_RE, '')
+  out = out.replace(BILLING_INLINE_PREFIX_RE, '')
   if (out.includes('cc_')) {
     for (let prev = ''; prev !== out;) {
       prev = out

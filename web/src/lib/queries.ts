@@ -128,8 +128,8 @@ export function useApiKeys() {
   })
 }
 
-/** 日志按分片写（国际版在 global），两边都读再按时间合并。 */
-export function useLogs() {
+/** 日志按分片写（国际版在 global），两边都读再按时间合并。支持可选定时轮询（Live Tail）。 */
+export function useLogs(options?: { refetchInterval?: number | false }) {
   return useQuery({
     queryKey: ['logs'],
     queryFn: async () => {
@@ -137,6 +137,7 @@ export function useLogs() {
       for (const realm of REALMS) all.push(...(await api<{ logs: LogEntry[] }>(`/admin/logs?realm=${realm}&limit=200`)).logs)
       return all.sort((x, y) => y.time - x.time).slice(0, 300)
     },
+    refetchInterval: options?.refetchInterval ?? false,
   })
 }
 
@@ -171,6 +172,80 @@ export const useToggleAccount = () =>
     ['accounts', 'pool'],
     '账号状态已更新',
   )
+
+export function useBatchToggleAccounts() {
+  const qc = useQueryClient()
+  return useMutation<
+    { okCount: number; failCount: number },
+    Error,
+    { accounts: Pick<Account, 'uid' | 'realm'>[]; disabled: boolean }
+  >({
+    mutationFn: async ({ accounts, disabled }) => {
+      let okCount = 0
+      let failCount = 0
+      for (const a of accounts) {
+        try {
+          await api('/admin/accounts/toggle', {
+            json: { uid: a.uid, realm: a.realm, disabled },
+          })
+          okCount++
+        } catch {
+          failCount++
+        }
+      }
+      return { okCount, failCount }
+    },
+    onSuccess: ({ okCount, failCount }, { disabled }) => {
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+      qc.invalidateQueries({ queryKey: ['pool'] })
+      const actionText = disabled ? '停用' : '启用'
+      if (failCount === 0) {
+        toast.success(`已批量${actionText} ${fmtInt(okCount)} 个账号`)
+      } else {
+        toast.warning(`批量${actionText}完成：成功 ${fmtInt(okCount)} 个，失败 ${fmtInt(failCount)} 个`)
+      }
+    },
+    onError: (e) => toast.error('批量操作失败', { description: e.message }),
+  })
+}
+
+export function useBatchRefreshBalance() {
+  const qc = useQueryClient()
+  return useMutation<
+    { okCount: number; failCount: number },
+    Error,
+    Pick<Account, 'uid' | 'realm' | 'nickname'>[]
+  >({
+    mutationFn: async (list) => {
+      let okCount = 0
+      let failCount = 0
+      for (const a of list) {
+        try {
+          const r = await api<{ results: { uid: string; ok: boolean }[] }>('/admin/accounts/balance', {
+            json: { realm: a.realm, uid: a.uid },
+            timeoutMs: 60_000,
+          })
+          const hit = r.results.find((x) => x.uid === a.uid)
+          if (hit?.ok) okCount++
+          else failCount++
+        } catch {
+          failCount++
+        }
+      }
+      return { okCount, failCount }
+    },
+    onSuccess: ({ okCount, failCount }, list) => {
+      qc.invalidateQueries({ queryKey: ['accounts'] })
+      qc.invalidateQueries({ queryKey: ['pool'] })
+      if (failCount === 0) {
+        toast.success(`已刷新 ${fmtInt(okCount)} 个账号的余额`)
+      } else {
+        toast.warning(`余额刷新完成：成功 ${fmtInt(okCount)} / ${fmtInt(list.length)} 个`)
+      }
+    },
+    onError: (e) => toast.error('批量刷新余额失败', { description: e.message }),
+  })
+}
 
 export const useRemoveAccount = () =>
   useAction(
